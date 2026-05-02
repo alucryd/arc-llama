@@ -9,7 +9,11 @@ Top-level commands:
   arc-llama add        Register a model — local file or HF download.
   arc-llama remove     Remove a model from the config.
   arc-llama serve      Run the OpenAI-compatible router.
+  arc-llama tui        Launch the terminal UI.
   arc-llama systemd    Print a systemd --user service unit for `arc-llama serve`.
+
+A small static web UI is bundled and served at `/` on the same port as
+`arc-llama serve` — open it in a browser for a model-picker + load/stop view.
 """
 from __future__ import annotations
 
@@ -541,6 +545,31 @@ WantedBy=default.target
         "Enable with: [bold]systemctl --user daemon-reload && "
         f"systemctl --user enable --now {service_name}[/bold]"
     )
+
+
+# ===========================================================================
+# tui
+# ===========================================================================
+
+@cli.command("tui")
+@click.option(
+    "--server", "server_url",
+    default=None,
+    help="Base URL of an arc-llama serve instance (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def tui_cmd(ctx: click.Context, server_url: str | None) -> None:
+    """Launch the terminal UI against a running `arc-llama serve`."""
+    if server_url is None:
+        cfg = load_config(ctx.obj["config_path"])
+        server_url = f"http://{cfg.server.host}:{cfg.server.port}"
+    try:
+        from arc_llama.tui import run_tui
+    except SystemExit as e:
+        # The tui module raises SystemExit if textual is missing; surface its message.
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    run_tui(server_url)
 
 
 def main() -> None:

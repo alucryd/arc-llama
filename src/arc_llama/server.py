@@ -3,16 +3,28 @@
 Mounts on `cfg.server.host:cfg.server.port` and forwards requests to whichever
 llama-server backend the router decides is the right one for the model id in
 the request body.
+
+Also exposes a small admin surface used by the bundled web UI and the TUI:
+
+    GET  /admin/status        — full snapshot (gpus, models, who's loaded)
+    POST /admin/load/{name}   — preload a model without sending a chat request
+    POST /admin/stop/{name}   — stop one model's llama-server
+    POST /admin/stop-all      — stop every running llama-server
+
+The web UI itself is a single static page mounted at `/` when the static dir
+ships with the install.
 """
 from __future__ import annotations
 
 import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from arc_llama.config import Config, load_config
 from arc_llama.router import Router
@@ -89,6 +101,81 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
         return await _proxy_post(request, "/v1/embeddings", streaming_ok=False)
+
+    # ------------------------------------------------------------------
+    # Admin (used by the web UI / TUI)
+    # ------------------------------------------------------------------
+
+    @app.get("/admin/status")
+    async def admin_status(request: Request) -> dict:
+        rt: Router = request.app.state.router
+        c: Config = request.app.state.cfg
+        models = []
+        for m in rt.all_models():
+            srv = rt._servers.get(m.name)
+            r = m.recipe or {}
+            models.append({
+                "name": m.name,
+                "display_name": m.display_name,
+                "path": m.path,
+                "gpu_pci_slot": m.gpu_pci_slot,
+                "port": m.port,
+                "loaded": bool(srv and srv.is_running),
+                "ctx": r.get("ctx"),
+                "cache_type_k": r.get("cache_type_k"),
+                "cache_type_v": r.get("cache_type_v"),
+                "kv_class": m.kv_class,
+                "aliases": list(m.aliases),
+            })
+        gpus = [{
+            "pci_slot": g.pci_slot,
+            "sycl_index": g.sycl_index,
+            "arch": g.arch,
+            "vram_mb": g.vram_mb,
+            "name": g.name,
+            "enabled": g.enabled,
+        } for g in c.gpus]
+        return {
+            "server": {
+                "host": c.server.host,
+                "port": c.server.port,
+                "single_resident": c.server.single_resident,
+            },
+            "gpus": gpus,
+            "models": models,
+        }
+
+    @app.post("/admin/load/{name}")
+    async def admin_load(name: str, request: Request) -> dict:
+        rt: Router = request.app.state.router
+        try:
+            model, srv = await rt.ensure_active(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        return {"name": model.name, "loaded": srv.is_running}
+
+    @app.post("/admin/stop/{name}")
+    async def admin_stop(name: str, request: Request) -> dict:
+        rt: Router = request.app.state.router
+        if name not in {m.name for m in rt.all_models()}:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
+        was_running = await rt.stop_one(name)
+        return {"name": name, "was_running": was_running, "loaded": False}
+
+    @app.post("/admin/stop-all")
+    async def admin_stop_all(request: Request) -> dict:
+        rt: Router = request.app.state.router
+        stopped = await rt.stop_all()
+        return {"stopped": stopped}
+
+    # ------------------------------------------------------------------
+    # Static web UI (optional; only mounted if the static dir is present)
+    # ------------------------------------------------------------------
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="ui")
 
     return app
 

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>arc-llama</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <h1>arc-llama</h1>
+  <div class="meta">
+    <span id="server-info">—</span>
+    <span class="dot"></span>
+    <span id="policy-info">—</span>
+    <span class="dot"></span>
+    <button id="refresh">Refresh</button>
+    <button id="stop-all">Stop all</button>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>GPUs</h2>
+    <table id="gpus">
+      <thead>
+        <tr>
+          <th>PCI</th><th>Arch</th><th>Name</th><th>SYCL</th><th>VRAM</th><th>Enabled</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Models</h2>
+    <table id="models">
+      <thead>
+        <tr>
+          <th>Status</th><th>Name</th><th>GPU</th><th>Port</th><th>ctx</th><th>K/V</th><th>Path</th><th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  <span id="last-updated">never refreshed</span>
+  <span class="dot"></span>
+  <span>polling every 5s</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -113,6 +113,25 @@ class Router:
                 log.info("evicting %s before starting %s", name, target.name)
                 srv.stop()
 
+    async def stop_one(self, name: str) -> bool:
+        """Stop a single model's llama-server. Returns True if it was running."""
+        async with self._lock:
+            srv = self._servers.get(name)
+            if srv is None or not srv.is_running:
+                return False
+            srv.stop()
+            return True
+
+    async def stop_all(self) -> int:
+        """Stop every running llama-server. Returns the count stopped."""
+        async with self._lock:
+            stopped = 0
+            for srv in self._servers.values():
+                if srv.is_running:
+                    srv.stop()
+                    stopped += 1
+            return stopped
+
     async def shutdown(self) -> None:
         async with self._lock:
             for srv in self._servers.values():

@@ -34,6 +34,10 @@ something useful before lunch.
   multi-resident if you have headroom.
 - **OpenAI-compatible API** at `http://127.0.0.1:11436/v1/...`. Plug it into
   Open WebUI, OpenCode, anything that speaks OpenAI.
+- **A web UI** at `http://127.0.0.1:11436/` — ships with the install. Model
+  picker, load/stop buttons, GPU + VRAM panel. Pure HTML/JS, no build step.
+- **A terminal UI** (`arc-llama tui`) using Textual — same load/stop controls,
+  no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
 - **No magic with your existing stack.** It uses your `llama-server` binary;
   you're never locked into a specific build.
 
@@ -56,10 +60,13 @@ arc-llama gpus
 arc-llama add /path/to/some-model.gguf
 arc-llama add unsloth/gemma-4-31B-it-GGUF:Q4_K_M --from-hf
 
-# 5. Run the OpenAI-compatible server
+# 5. Run the OpenAI-compatible server (also serves the web UI at /)
 arc-llama serve
 
-# 6. (Optional) Install a systemd --user unit
+# 6. (Optional) Open the terminal UI in another window
+arc-llama tui
+
+# 7. (Optional) Install a systemd --user unit
 arc-llama systemd --write
 systemctl --user daemon-reload
 systemctl --user enable --now arc-llama.service
@@ -198,12 +205,25 @@ SYCL JIT recompile that plain `llama.cpp` pays on each fresh launch.
 - **Plain `llama-server` + scripts:** what most Arc owners do today. arc-llama
   is the formalisation of those scripts, with the gotchas baked in.
 
+## UIs
+
+Two front-ends are bundled and both talk to the same admin endpoints
+(`/admin/status`, `/admin/load/{name}`, `/admin/stop/{name}`, `/admin/stop-all`):
+
+- **Web UI** at `http://<host>:<port>/` (default `127.0.0.1:11436`). Single
+  static page polled every 5 s. Status, GPUs, model list, per-model
+  Load/Stop buttons, "Stop all" panic button. No build step, no JS deps.
+- **Terminal UI** via `arc-llama tui` — Textual-based. Bindings: `r` refresh,
+  `l` load selected model, `s` stop selected, `S` stop all, `q` quit. Run it
+  alongside `arc-llama serve` (or against a remote one with `--server`).
+
+Both use brightness/dim for status (loaded vs idle) — no red/green palettes.
+
 ## Roadmap
 
 - Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
 - `arc-llama benchmark` — quick prompt-eval/gen tok/s harness.
 - IPEX-LLM Ollama as an optional backend for users who prefer it.
-- Web UI for the router (model picker + status, no chat).
 - Container image with `llama-server` + arc-llama prebuilt.
 
 ## Contributing
