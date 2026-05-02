@@ -32,9 +32,9 @@ something useful before lunch.
 - **One process per model**, swapped in/out by an internal router. Default
   policy is single-resident across all GPUs (good for thermals); flip it to
   multi-resident if you have headroom.
-- **OpenAI-compatible API** at `http://127.0.0.1:11436/v1/...`. Plug it into
+- **OpenAI-compatible API** at `http://127.0.0.1:11437/v1/...`. Plug it into
   Open WebUI, OpenCode, anything that speaks OpenAI.
-- **A web UI** at `http://127.0.0.1:11436/` — ships with the install. Model
+- **A web UI** at `http://127.0.0.1:11437/` — ships with the install. Model
   picker, load/stop buttons, GPU + VRAM panel. Pure HTML/JS, no build step.
 - **A terminal UI** (`arc-llama tui`) using Textual — same load/stop controls,
   no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
@@ -72,10 +72,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now arc-llama.service
 ```
 
-Then point any OpenAI-compatible client at `http://127.0.0.1:11436/v1`:
+Then point any OpenAI-compatible client at `http://127.0.0.1:11437/v1`:
 
 ```bash
-curl http://127.0.0.1:11436/v1/chat/completions \
+curl http://127.0.0.1:11437/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-31b-q4_k_m",
@@ -118,7 +118,7 @@ version = 1
 
 [server]
 host = "127.0.0.1"
-port = 11436
+port = 11437
 single_resident = true
 
 [paths]
@@ -167,7 +167,7 @@ pick a context length. Currently:
 ```
 ┌──────────────────────┐
 │  OpenAI client       │  Open WebUI, OpenCode, curl, ...
-│  (port 11436)        │
+│  (port 11437)        │
 └──────────┬───────────┘
            │
            ▼
@@ -210,7 +210,7 @@ SYCL JIT recompile that plain `llama.cpp` pays on each fresh launch.
 Two front-ends are bundled and both talk to the same admin endpoints
 (`/admin/status`, `/admin/load/{name}`, `/admin/stop/{name}`, `/admin/stop-all`):
 
-- **Web UI** at `http://<host>:<port>/` (default `127.0.0.1:11436`). Single
+- **Web UI** at `http://<host>:<port>/` (default `127.0.0.1:11437`). Single
   static page polled every 5 s. Status, GPUs, model list, per-model
   Load/Stop buttons, "Stop all" panic button. No build step, no JS deps.
 - **Terminal UI** via `arc-llama tui` — Textual-based. Bindings: `r` refresh,

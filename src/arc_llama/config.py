@@ -86,8 +86,11 @@ def default_state_dir() -> Path:
 @dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
-    port: int = 11436
+    port: int = 11437
     single_resident: bool = True
+    """Why 11437? Ollama owns 11434 by default, and IPEX-LLM-Ollama installs
+    sometimes use 11435/11436. 11437 is the first port in that neighbourhood
+    that nobody else seems to claim."""
     """If True, only one llama-server runs at a time. If False, models share VRAM
     on a best-effort basis — set this only if you have generous VRAM headroom."""
 

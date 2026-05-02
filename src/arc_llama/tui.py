@@ -4,8 +4,8 @@ Run alongside the server (or against a remote one over the network) to monitor
 GPUs, models, and load state, and to load/stop models without leaving the
 terminal.
 
-    arc-llama tui                          # against http://127.0.0.1:11436
-    arc-llama tui --server http://10.0.0.5:11436
+    arc-llama tui                          # against http://127.0.0.1:11437
+    arc-llama tui --server http://10.0.0.5:11437
 
 Color choices avoid red/green — status is signalled by brightness/dim, not hue.
 """
@@ -224,5 +224,5 @@ class ArcLlamaTUI(App):
         await self._refresh()
 
 
-def run_tui(server_url: str = "http://127.0.0.1:11436") -> None:
+def run_tui(server_url: str = "http://127.0.0.1:11437") -> None:
     ArcLlamaTUI(server_url).run()
