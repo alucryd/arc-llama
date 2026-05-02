@@ -12,7 +12,10 @@ const fmtPath = (p) => {
 let lastStatus = null;
 let inflight = false;
 
-async function fetchStatus() {
+async function fetchStatus(force) {
+  // Skip the auto-poll while a row is in edit mode so input values don't
+  // get clobbered by re-renders. Manual refresh (force=true) still works.
+  if (editingModel && !force) return;
   if (inflight) return;
   inflight = true;
   try {
@@ -42,6 +45,11 @@ async function postAction(path, label) {
   }
 }
 
+// Track which model is currently in inline-edit mode (only one at a time).
+let editingModel = null;
+
+const KV_OPTIONS = ["f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"];
+
 function render(s) {
   $("#server-info").textContent = `${s.server.host}:${s.server.port}`;
   $("#policy-info").textContent =
@@ -68,41 +76,123 @@ function render(s) {
   modelBody.innerHTML = "";
   for (const m of s.models) {
     const tr = document.createElement("tr");
-    tr.className = m.loaded ? "bright" : "dim";
-    const kv = `${m.cache_type_k || "?"}/${m.cache_type_v || "?"}`;
-    const pill = m.loaded
-      ? '<span class="pill loaded">loaded</span>'
-      : '<span class="pill idle">idle</span>';
-    tr.innerHTML = `
-      <td>${pill}</td>
-      <td>${m.name}</td>
-      <td>${m.gpu_pci_slot}</td>
-      <td>${m.port}</td>
-      <td>${m.ctx ?? "?"}</td>
-      <td>${kv}</td>
-      <td class="path" title="${m.path}">${fmtPath(m.path)}</td>
-      <td class="actions"></td>
-    `;
-    const actions = tr.querySelector(".actions");
-    const wrap = document.createElement("div");
-    wrap.className = "row-actions";
-    if (m.loaded) {
-      const stop = document.createElement("button");
-      stop.textContent = "Stop";
-      stop.onclick = () => postAction(`/admin/stop/${encodeURIComponent(m.name)}`, "stop");
-      wrap.appendChild(stop);
+    if (editingModel === m.name) {
+      renderEditRow(tr, m);
     } else {
-      const load = document.createElement("button");
-      load.textContent = "Load";
-      load.onclick = () => postAction(`/admin/load/${encodeURIComponent(m.name)}`, "load");
-      wrap.appendChild(load);
+      renderViewRow(tr, m);
     }
-    actions.appendChild(wrap);
     modelBody.appendChild(tr);
   }
 }
 
-$("#refresh").onclick = fetchStatus;
+function renderViewRow(tr, m) {
+  tr.className = m.loaded ? "bright" : "dim";
+  const kv = `${m.cache_type_k || "?"}/${m.cache_type_v || "?"}`;
+  const pill = m.loaded
+    ? '<span class="pill loaded">loaded</span>'
+    : '<span class="pill idle">idle</span>';
+  tr.innerHTML = `
+    <td>${pill}</td>
+    <td>${m.name}</td>
+    <td>${m.gpu_pci_slot}</td>
+    <td>${m.port}</td>
+    <td>${m.ctx ?? "?"}</td>
+    <td>${kv}</td>
+    <td class="path" title="${m.path}">${fmtPath(m.path)}</td>
+    <td class="actions"></td>
+  `;
+  const actions = tr.querySelector(".actions");
+  const wrap = document.createElement("div");
+  wrap.className = "row-actions";
+
+  const editBtn = document.createElement("button");
+  editBtn.textContent = "Edit";
+  editBtn.onclick = () => {
+    editingModel = m.name;
+    fetchStatus(true);
+  };
+  wrap.appendChild(editBtn);
+
+  if (m.loaded) {
+    const stop = document.createElement("button");
+    stop.textContent = "Stop";
+    stop.onclick = () => postAction(`/admin/stop/${encodeURIComponent(m.name)}`, "stop");
+    wrap.appendChild(stop);
+  } else {
+    const load = document.createElement("button");
+    load.textContent = "Load";
+    load.onclick = () => postAction(`/admin/load/${encodeURIComponent(m.name)}`, "load");
+    wrap.appendChild(load);
+  }
+  actions.appendChild(wrap);
+}
+
+function renderEditRow(tr, m) {
+  tr.className = "editing";
+  const optsK = KV_OPTIONS.map(o =>
+    `<option value="${o}"${o === m.cache_type_k ? " selected" : ""}>${o}</option>`
+  ).join("");
+  const optsV = KV_OPTIONS.map(o =>
+    `<option value="${o}"${o === m.cache_type_v ? " selected" : ""}>${o}</option>`
+  ).join("");
+  tr.innerHTML = `
+    <td><span class="pill warn">editing</span></td>
+    <td>${m.name}</td>
+    <td>${m.gpu_pci_slot}</td>
+    <td>${m.port}</td>
+    <td><input class="edit-field" type="number" min="256" max="1048576" step="1024" value="${m.ctx ?? 8192}" data-field="ctx"/></td>
+    <td>
+      <select class="edit-field" data-field="cache_type_k">${optsK}</select>
+      <select class="edit-field" data-field="cache_type_v" style="margin-top:2px">${optsV}</select>
+    </td>
+    <td class="path" title="${m.path}">${fmtPath(m.path)}</td>
+    <td class="actions"></td>
+  `;
+  const actions = tr.querySelector(".actions");
+  const wrap = document.createElement("div");
+  wrap.className = "row-actions";
+
+  const save = document.createElement("button");
+  save.textContent = "Save";
+  save.onclick = async () => {
+    const ctx = parseInt(tr.querySelector('[data-field="ctx"]').value, 10);
+    const k = tr.querySelector('[data-field="cache_type_k"]').value;
+    const v = tr.querySelector('[data-field="cache_type_v"]').value;
+    const wasLoaded = m.loaded;
+    if (wasLoaded && !confirm(
+      `${m.name} is currently loaded — saving will stop it. Continue?`
+    )) {
+      return;
+    }
+    save.disabled = true;
+    try {
+      const r = await fetch(`/admin/models/${encodeURIComponent(m.name)}/edit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ctx, cache_type_k: k, cache_type_v: v }),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        alert(`edit failed: ${r.status} ${t}`);
+        return;
+      }
+      editingModel = null;
+      await fetchStatus(true);
+    } finally {
+      save.disabled = false;
+    }
+  };
+  wrap.appendChild(save);
+
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  cancel.onclick = () => { editingModel = null; fetchStatus(true); };
+  wrap.appendChild(cancel);
+
+  actions.appendChild(wrap);
+}
+
+$("#refresh").onclick = () => fetchStatus(true);
 $("#stop-all").onclick = () => {
   if (confirm("Stop every running llama-server?")) {
     postAction("/admin/stop-all", "stop-all");

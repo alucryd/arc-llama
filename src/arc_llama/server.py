@@ -170,6 +170,86 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         stopped = await rt.stop_all()
         return {"stopped": stopped}
 
+    @app.post("/admin/models/{name}/edit")
+    async def admin_edit_model(name: str, request: Request) -> dict:
+        """Update a model's recipe in-place.
+
+        Body is a partial recipe dict — only provided fields change. Recognised
+        fields: `ctx`, `cache_type_k`, `cache_type_v`, `parallel`, `kv_class`.
+        If the model is currently loaded, the server is stopped first; callers
+        decide whether to reload it afterwards via /admin/load.
+        """
+        from arc_llama.config import default_config_path
+        from arc_llama.recipes import KVCacheType
+        c: Config = request.app.state.cfg
+        rt: Router = request.app.state.router
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        model = next((m for m in c.models if m.name == name), None)
+        if model is None:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
+        valid_kv = {kv.value for kv in KVCacheType}
+        valid_classes = {"default", "moe_a3b", "qwen3_27b_dense", "gemma_swa"}
+        recipe = dict(model.recipe or {})
+        changed: list[str] = []
+        if "ctx" in body:
+            try:
+                ctx = int(body["ctx"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="ctx must be an integer")
+            if not (256 <= ctx <= 1_048_576):
+                raise HTTPException(status_code=400, detail="ctx must be 256..1048576")
+            recipe["ctx"] = ctx
+            changed.append("ctx")
+        for fld in ("cache_type_k", "cache_type_v"):
+            if fld in body:
+                v = str(body[fld])
+                if v not in valid_kv:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{fld} must be one of {sorted(valid_kv)}",
+                    )
+                recipe[fld] = v
+                changed.append(fld)
+        if "parallel" in body:
+            try:
+                par = int(body["parallel"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="parallel must be an integer")
+            if not (1 <= par <= 32):
+                raise HTTPException(status_code=400, detail="parallel must be 1..32")
+            recipe["parallel"] = par
+            changed.append("parallel")
+        if "kv_class" in body:
+            v = str(body["kv_class"])
+            if v not in valid_classes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"kv_class must be one of {sorted(valid_classes)}",
+                )
+            model.kv_class = v
+            changed.append("kv_class")
+        if not changed:
+            raise HTTPException(status_code=400, detail="no recognised fields to edit")
+        model.recipe = recipe
+        try:
+            c.save(default_config_path())
+        except OSError as e:
+            log.warning("edit %s: persist failed: %s", name, e)
+        rebuilt, was_running = await rt.rebuild_model(name)
+        return {
+            "name": name,
+            "changed": changed,
+            "recipe": recipe,
+            "kv_class": model.kv_class,
+            "stopped_running_instance": was_running,
+            "rebuilt": rebuilt,
+        }
+
     @app.post("/admin/scan")
     async def admin_scan(request: Request) -> dict:
         """Re-walk scan paths for new GGUFs and auto-register them.

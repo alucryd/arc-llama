@@ -40,9 +40,10 @@ something useful before lunch.
 - **OpenAI-compatible API** at `http://127.0.0.1:11437/v1/...`. Plug it into
   Open WebUI, OpenCode, anything that speaks OpenAI.
 - **A web UI** at `http://127.0.0.1:11437/` — ships with the install. Model
-  picker, load/stop buttons, GPU + VRAM panel. Pure HTML/JS, no build step.
-- **A terminal UI** (`arc-llama tui`) using Textual — same load/stop controls,
-  no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
+  picker, load/stop buttons, **inline ctx + KV-quant editing**, GPU + VRAM
+  panel. Pure HTML/JS, no build step.
+- **A terminal UI** (`arc-llama tui`) using Textual — same load/stop/edit
+  controls, no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
 - **No magic with your existing stack.** It uses your `llama-server` binary;
   you're never locked into a specific build.
 

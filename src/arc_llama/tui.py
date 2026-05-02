@@ -20,15 +20,103 @@ try:
     from textual import on, work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Horizontal, Vertical
-    from textual.widgets import DataTable, Footer, Header, Static
+    from textual.containers import Grid, Horizontal, Vertical
+    from textual.screen import ModalScreen
+    from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Select, Static
 except ImportError as e:  # pragma: no cover
     raise SystemExit(
         "arc-llama TUI requires textual. Install with: pip install 'arc-llama[tui]'"
     ) from e
 
 
+KV_OPTIONS = ["f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]
+
+
 REFRESH_SECONDS = 2.5
+
+
+class EditRecipeScreen(ModalScreen[dict | None]):
+    """Modal that edits a model's ctx + K/V quant, returns a dict on Save."""
+
+    DEFAULT_CSS = """
+    EditRecipeScreen {
+        align: center middle;
+    }
+    EditRecipeScreen > Vertical {
+        background: #161b22;
+        border: solid #58a6ff;
+        padding: 1 2;
+        width: 60;
+        height: auto;
+    }
+    EditRecipeScreen Label.title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    EditRecipeScreen Label.field {
+        margin-top: 1;
+        color: #8b949e;
+    }
+    EditRecipeScreen Input { width: 100%; }
+    EditRecipeScreen Select { width: 100%; }
+    EditRecipeScreen .row { height: auto; margin-top: 1; }
+    EditRecipeScreen Horizontal.buttons { margin-top: 2; height: 3; }
+    EditRecipeScreen Button { margin-right: 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, model: dict) -> None:
+        super().__init__()
+        self.model = model
+
+    def compose(self) -> ComposeResult:
+        m = self.model
+        with Vertical():
+            yield Label(f"Edit recipe — {m['name']}", classes="title")
+            yield Label("Context length (tokens)", classes="field")
+            yield Input(value=str(m.get("ctx") or 8192), id="ctx", type="integer")
+            yield Label("KV cache type — keys", classes="field")
+            yield Select(
+                [(o, o) for o in KV_OPTIONS],
+                value=m.get("cache_type_k") or "f16",
+                id="kv-k",
+                allow_blank=False,
+            )
+            yield Label("KV cache type — values", classes="field")
+            yield Select(
+                [(o, o) for o in KV_OPTIONS],
+                value=m.get("cache_type_v") or "f16",
+                id="kv-v",
+                allow_blank=False,
+            )
+            with Horizontal(classes="buttons"):
+                yield Button("Save", id="save", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    @on(Button.Pressed, "#cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#save")
+    def _on_save(self) -> None:
+        try:
+            ctx = int(self.query_one("#ctx", Input).value or "0")
+        except ValueError:
+            ctx = 0
+        if ctx < 256:
+            self.query_one("#ctx", Input).focus()
+            return
+        self.dismiss({
+            "ctx": ctx,
+            "cache_type_k": self.query_one("#kv-k", Select).value,
+            "cache_type_v": self.query_one("#kv-v", Select).value,
+        })
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class StatusBar(Static):
@@ -74,6 +162,7 @@ class ArcLlamaTUI(App):
         Binding("l", "load_selected", "Load", show=True),
         Binding("s", "stop_selected", "Stop", show=True),
         Binding("S", "stop_all", "Stop all", show=True),
+        Binding("e", "edit_selected", "Edit", show=True),
         Binding("q", "quit", "Quit", show=True),
     ]
 
@@ -244,6 +333,45 @@ class ArcLlamaTUI(App):
             r.raise_for_status()
         except httpx.HTTPError:
             pass
+        await self._refresh()
+
+    def action_edit_selected(self) -> None:
+        """Pop the EditRecipeScreen for the currently selected model."""
+        if self._last_status is None or self._client is None:
+            return
+        models = self.query_one("#models", DataTable)
+        if models.cursor_row is None or models.cursor_row < 0:
+            return
+        try:
+            model = self._last_status["models"][models.cursor_row]
+        except (IndexError, KeyError):
+            return
+
+        def _after(result: dict | None) -> None:
+            if result is None:
+                return
+            self._submit_edit(model["name"], result, was_loaded=bool(model.get("loaded")))
+
+        self.push_screen(EditRecipeScreen(model), _after)
+
+    @work(exclusive=True)
+    async def _submit_edit(self, name: str, payload: dict, was_loaded: bool) -> None:
+        if self._client is None:
+            return
+        bar = self.query_one("#status-bar", StatusBar)
+        srv_info = self._last_status.get("server") if self._last_status else None
+        try:
+            r = await self._client.post(
+                f"/admin/models/{name}/edit", json=payload, timeout=15.0,
+            )
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            bar.update_status(srv_info, f"[#d29922]edit {name} failed: {e}[/]")
+            return
+        msg = f"updated {name}"
+        if was_loaded:
+            msg += " (was running — stopped)"
+        bar.update_status(srv_info, msg)
         await self._refresh()
 
 

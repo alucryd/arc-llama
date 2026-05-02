@@ -143,3 +143,24 @@ footer {
 /* dim rows for unloaded models, full brightness for loaded */
 tr.dim td:not(.actions) { color: var(--fg-dim); }
 tr.bright td { color: var(--fg); }
+
+/* inline edit form */
+tr.editing { background: rgba(88, 166, 255, 0.06); }
+tr.editing td { color: var(--fg); }
+.edit-field {
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font: inherit;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    width: 100%;
+    min-width: 70px;
+}
+.edit-field:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+select.edit-field { cursor: pointer; }

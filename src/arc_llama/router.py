@@ -140,6 +140,28 @@ class Router:
                     stopped += 1
             return stopped
 
+    async def rebuild_model(self, name: str) -> tuple[bool, bool]:
+        """Drop and rebuild the LlamaServer for one model after a config edit.
+
+        If the model is currently loaded, it's stopped first — the recipe is
+        consumed at process start, so an in-flight server can't pick up new
+        flags. Returns (rebuilt, was_running).
+        """
+        async with self._lock:
+            old = self._servers.pop(name, None)
+            was_running = bool(old and old.is_running)
+            if old is not None and old.is_running:
+                old.stop()
+            cfg_model = next((m for m in self.cfg.models if m.name == name), None)
+            if cfg_model is None:
+                return False, was_running
+            gpu = self.cfg.find_gpu(cfg_model.gpu_pci_slot)
+            if gpu is None:
+                return False, was_running
+            plan = build_plan(self.cfg, cfg_model, gpu, host=self.cfg.server.host)
+            self._servers[name] = LlamaServer(plan, name=name)
+            return True, was_running
+
     async def shutdown(self) -> None:
         async with self._lock:
             for srv in self._servers.values():
