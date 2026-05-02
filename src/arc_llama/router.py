@@ -34,7 +34,15 @@ class Router:
         self._build_servers()
 
     def _build_servers(self) -> None:
+        """(Re)build the per-model LlamaServer registry from cfg.
+
+        Idempotent — existing servers (running or not) are preserved by name,
+        only new model entries get fresh LlamaServer instances. Use after a
+        runtime config mutation (e.g. an admin scan).
+        """
         for m in self.cfg.models:
+            if m.name in self._servers:
+                continue
             gpu = self.cfg.find_gpu(m.gpu_pci_slot)
             if gpu is None:
                 log.warning(

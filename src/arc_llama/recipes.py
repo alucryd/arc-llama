@@ -24,13 +24,13 @@ class KVCacheType(str, Enum):
 
 
 # Approx KV bytes per token at f16 for a few well-known architectures.
-# Sources: empirical from `memory_breakdown_print` on this user's stack, plus
-# llama.cpp's per-arch hparams. These are *upper bounds for sizing* — actual
-# usage with sliding-window attention (Gemma) is several × smaller.
+# Numbers are tuned against `memory_breakdown_print` measurements on a real
+# Battlemage B60 stack. They're upper bounds for sizing; actual usage with
+# sliding-window attention (Gemma) is several × smaller again.
 KV_PER_TOKEN_F16_BYTES: dict[str, int] = {
-    "default": 80 * 1024,   # 80 KiB/token f16 — safe upper bound for ~30B dense
-    "moe_a3b": 24 * 1024,   # ~24 KiB — Qwen3 30B/35B-A3B-class MoE
-    "qwen3_27b_dense": 70 * 1024,
+    "default": 70 * 1024,   # 70 KiB/token f16 — covers ~30B dense models
+    "moe_a3b": 20 * 1024,   # ~20 KiB — Qwen3 30B/35B-A3B-class MoE
+    "qwen3_27b_dense": 67 * 1024,
     "gemma_swa": 16 * 1024, # interleaved sliding-window attention compresses heavily
 }
 
@@ -85,18 +85,25 @@ def estimate_kv_bytes(ctx: int, kv_type: KVCacheType, kv_class: str = "default")
     return int(ctx * f16_per_token * scale)
 
 
+DEFAULT_CTX_CAP = 131072
+"""Hard ceiling on auto-suggested context length. VRAM math will sometimes
+say a 500k+ ctx fits, but real models top out around 128k–256k and our
+KV-per-token estimates are inherently approximate. Cap the auto-suggestion
+at 131072 — users who want more can override the recipe per-model."""
+
+
 def suggest_ctx(
     vram_mb: int,
     model_file_mb: int,
     kv_type: KVCacheType,
     kv_class: str = "default",
-    compute_buffer_mb: int = 1024,
-    safety_margin_mb: int = 512,
+    compute_buffer_mb: int = 768,
+    safety_margin_mb: int = 256,
+    ctx_cap: int = DEFAULT_CTX_CAP,
 ) -> int:
     """Pick the largest power-of-2-ish context that fits comfortably in VRAM.
 
-    We round *down* to the nearest multiple of 4096 for tidier numbers and to
-    leave a bit of breathing room beyond the safety margin.
+    Rounds *down* to the nearest multiple of 4096 and clamps to `ctx_cap`.
     """
     free_for_kv = vram_mb - model_file_mb - compute_buffer_mb - safety_margin_mb
     if free_for_kv <= 0:
@@ -116,7 +123,7 @@ def suggest_ctx(
         return 4096
     max_tokens = (free_for_kv * 1024 * 1024) // bytes_per_token
     rounded = (max_tokens // 4096) * 4096
-    return max(4096, min(rounded, 1_048_576))  # cap at 1M tokens — sanity
+    return max(4096, min(rounded, ctx_cap))
 
 
 def default_recipe(

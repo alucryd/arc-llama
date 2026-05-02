@@ -108,6 +108,31 @@ $("#stop-all").onclick = () => {
     postAction("/admin/stop-all", "stop-all");
   }
 };
+$("#scan").onclick = async () => {
+  const btn = $("#scan");
+  btn.disabled = true;
+  btn.textContent = "Scanning…";
+  try {
+    const r = await fetch("/admin/scan", { method: "POST" });
+    if (!r.ok) {
+      const t = await r.text();
+      alert(`scan failed: ${r.status} ${t}`);
+      return;
+    }
+    const j = await r.json();
+    const added = j.added || [];
+    const msg = added.length
+      ? `Found ${j.found} GGUF(s); registered ${added.length} new: ${added.join(", ")}`
+      : `Found ${j.found} GGUF(s); nothing new to register.`;
+    $("#last-updated").textContent = msg;
+    await fetchStatus();
+  } catch (e) {
+    alert(`scan error: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan for models";
+  }
+};
 
 fetchStatus();
 setInterval(fetchStatus, 5000);

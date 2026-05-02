@@ -70,6 +70,7 @@ class ArcLlamaTUI(App):
 
     BINDINGS = [
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("d", "scan", "Discover", show=True),
         Binding("l", "load_selected", "Load", show=True),
         Binding("s", "stop_selected", "Stop", show=True),
         Binding("S", "stop_all", "Stop all", show=True),
@@ -181,6 +182,28 @@ class ArcLlamaTUI(App):
             return None
 
     async def action_refresh(self) -> None:
+        await self._refresh()
+
+    @work(exclusive=True)
+    async def action_scan(self) -> None:
+        if self._client is None:
+            return
+        bar = self.query_one("#status-bar", StatusBar)
+        bar.update_status(self._last_status.get("server") if self._last_status else None,
+                          "scanning…")
+        try:
+            r = await self._client.post("/admin/scan", timeout=30.0)
+            r.raise_for_status()
+            j = r.json()
+            added = j.get("added") or []
+            msg = (f"scanned {j.get('found', 0)} GGUF(s); "
+                   f"registered {len(added)} new"
+                   + (f": {', '.join(added)}" if added else ""))
+            bar.update_status(self._last_status.get("server") if self._last_status else None, msg)
+        except httpx.HTTPError as e:
+            bar.update_status(self._last_status.get("server") if self._last_status else None,
+                              f"[#d29922]scan failed: {e}[/]")
+            return
         await self._refresh()
 
     @work(exclusive=True)

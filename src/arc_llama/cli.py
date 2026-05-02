@@ -43,8 +43,10 @@ from arc_llama.config import (
 from arc_llama.detect import detect_gpus, lspci_intel_gpus
 from arc_llama.models import (
     add_local_model,
+    discover_ggufs,
     download_from_hf,
     parse_hf_spec,
+    register_discovered,
 )
 
 console = Console()
@@ -116,9 +118,23 @@ def cli(ctx: click.Context, verbose: bool, config_path: Path | None) -> None:
     help="Path to your built llama-server binary (SYCL backend).",
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing config.")
+@click.option(
+    "--scan/--no-scan", default=True,
+    help="After init, walk scan paths for .gguf files and auto-register them (default: on).",
+)
+@click.option(
+    "--scan-path", "scan_paths", multiple=True, type=click.Path(),
+    help="Extra directory to walk for GGUFs. Repeatable.",
+)
 @click.pass_context
-def init(ctx: click.Context, llama_server: str | None, force: bool) -> None:
-    """Detect GPUs and write a starter config."""
+def init(
+    ctx: click.Context,
+    llama_server: str | None,
+    force: bool,
+    scan: bool,
+    scan_paths: tuple[str, ...],
+) -> None:
+    """Detect GPUs and write a starter config; auto-register any GGUFs found."""
     config_path: Path = ctx.obj["config_path"]
     if config_path.exists() and not force:
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
@@ -131,6 +147,8 @@ def init(ctx: click.Context, llama_server: str | None, force: bool) -> None:
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
     cfg = init_config_from_detection(gpus, llama_server_path=server_path)
+    if scan_paths:
+        cfg.paths.scan_paths = list(scan_paths)
     _save_or_die(cfg, config_path)
     console.print(f"[green]Wrote config to {config_path}[/green]")
     _print_gpu_table(gpus)
@@ -139,6 +157,19 @@ def init(ctx: click.Context, llama_server: str | None, force: bool) -> None:
             "[yellow]llama-server binary not found; set 'paths.llama_server' "
             "in the config or pass --llama-server.[/yellow]"
         )
+    if scan:
+        added = _do_scan(cfg, [Path(p) for p in scan_paths])
+        if added:
+            _save_or_die(cfg, config_path)
+            console.print(
+                f"[green]Auto-registered {len(added)} model(s):[/green] "
+                + ", ".join(m.name for m in added)
+            )
+        else:
+            console.print(
+                "[dim]No GGUFs found in scan paths. "
+                "Drop one in `paths.models_dir` or pass --scan-path next time.[/dim]"
+            )
 
 
 # ===========================================================================
@@ -424,6 +455,68 @@ def _slugify_for_name(parent: str, file: str) -> str:
     if m:
         base = f"{base}-{m.group(1).lower()}"
     return base
+
+
+# ===========================================================================
+# scan
+# ===========================================================================
+
+def _do_scan(cfg: Config, extra_paths: list[Path]) -> list:
+    found = discover_ggufs(cfg, extra_paths=extra_paths)
+    if not found:
+        return []
+    return register_discovered(cfg, found)
+
+
+@cli.command("scan")
+@click.argument("paths", nargs=-1, type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--gpu", "gpu_pci_slot", default=None,
+    help="Bind newly discovered models to this PCI slot (default: first enabled GPU).",
+)
+@click.option(
+    "--persist/--no-persist", default=True,
+    help="Save the resulting config to disk (default: on). Disable for a dry-run.",
+)
+@click.pass_context
+def scan_cmd(
+    ctx: click.Context,
+    paths: tuple[str, ...],
+    gpu_pci_slot: str | None,
+    persist: bool,
+) -> None:
+    """Walk scan paths for GGUFs and auto-register anything new."""
+    cfg_path: Path = ctx.obj["config_path"]
+    cfg = load_config(cfg_path)
+    if not cfg.gpus:
+        console.print("[red]No GPUs in config — run [bold]arc-llama init[/bold] first.[/red]")
+        sys.exit(1)
+    extras = [Path(p) for p in paths]
+    found = discover_ggufs(cfg, extra_paths=extras)
+    if not found:
+        scanned = [cfg.paths.models_dir, *cfg.paths.scan_paths, *paths]
+        console.print(
+            "[yellow]No GGUFs found.[/yellow] Scanned: " + ", ".join(scanned)
+        )
+        return
+    try:
+        added = register_discovered(cfg, found, gpu_pci_slot=gpu_pci_slot)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    if not added:
+        console.print(
+            f"[dim]Found {len(found)} GGUF(s); all already registered.[/dim]"
+        )
+        return
+    if persist:
+        _save_or_die(cfg, cfg_path)
+    console.print(
+        f"[green]Registered {len(added)} new model(s):[/green] "
+        + ", ".join(m.name for m in added)
+    )
+    if not persist:
+        console.print("[dim]--no-persist: config NOT saved.[/dim]")
 
 
 # ===========================================================================

@@ -170,6 +170,36 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         stopped = await rt.stop_all()
         return {"stopped": stopped}
 
+    @app.post("/admin/scan")
+    async def admin_scan(request: Request) -> dict:
+        """Re-walk scan paths for new GGUFs and auto-register them.
+
+        Mutates the in-memory Config and persists it to disk so subsequent
+        restarts see the same registry. New models become loadable via
+        `/admin/load/{name}` immediately — the router rebuilds its server map.
+        """
+        from arc_llama.config import default_config_path
+        from arc_llama.models import discover_ggufs, register_discovered
+        c: Config = request.app.state.cfg
+        rt: Router = request.app.state.router
+        try:
+            found = discover_ggufs(c)
+            added = register_discovered(c, found)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        if added:
+            try:
+                c.save(default_config_path())
+            except OSError as e:
+                log.warning("scan: persist failed: %s", e)
+            # Rebuild the router's server map so new entries are immediately
+            # visible to /admin/load. We don't disturb running servers.
+            rt._build_servers()  # type: ignore[attr-defined]
+        return {
+            "found": len(found),
+            "added": [m.name for m in added],
+        }
+
     # ------------------------------------------------------------------
     # Static web UI (optional; only mounted if the static dir is present)
     # ------------------------------------------------------------------

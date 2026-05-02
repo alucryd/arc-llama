@@ -101,6 +101,9 @@ class PathsConfig:
     """Path to the llama-server binary. Plain `llama-server` resolves via PATH."""
     models_dir: str = field(default_factory=lambda: str(default_models_dir()))
     state_dir: str = field(default_factory=lambda: str(default_state_dir()))
+    scan_paths: list[str] = field(default_factory=list)
+    """Extra directories `arc-llama scan` walks looking for GGUFs. The
+    `models_dir` is always scanned in addition to these."""
 
 
 @dataclass

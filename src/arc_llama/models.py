@@ -2,9 +2,15 @@
 
 The downloader is intentionally a thin shim around `huggingface_hub.hf_hub_download`
 so users who already have models on disk never need network access.
+
+Discovery (`discover_ggufs` / `register_discovered`) is the plug-and-play
+entrypoint: walk a few directories, infer reasonable recipes from filename
+heuristics, and register everything found. Users on a fresh box should never
+need to type `arc-llama add` for a GGUF they already have on disk.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +21,8 @@ from arc_llama.config import (
     ModelConfig,
 )
 from arc_llama.recipes import KVCacheType, default_recipe
+
+log = logging.getLogger("arc_llama.models")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 HF_SPEC_RE = re.compile(
@@ -133,6 +141,199 @@ def add_local_model(
     )
     cfg.models.append(mc)
     return mc
+
+
+# ---------------------------------------------------------------------------
+# Auto-discovery
+# ---------------------------------------------------------------------------
+
+# Filename → kv_class hints, evaluated in order. First match wins.
+_KV_CLASS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"gemma[\W_-]*[34]", re.IGNORECASE), "gemma_swa"),
+    (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_27b_dense"),
+    (re.compile(r"(qwen[\W_-]*3.*a3b|qwen[\W_-]*3.*moe|carnice|huihui.*30b.*a3b)", re.IGNORECASE), "moe_a3b"),
+]
+
+# Common quant tier markers that look good in display names.
+_QUANT_TIER_RE = re.compile(
+    r"\b(IQ\d_[A-Z_]*|Q\d_[KS]_[A-Z]+|Q\d_K|Q\d_\d|Q8_0|UD-[A-Z0-9_]+)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_kv_class(filename: str) -> str:
+    """Guess the kv_class for VRAM estimation from the GGUF filename."""
+    for pattern, kv_class in _KV_CLASS_PATTERNS:
+        if pattern.search(filename):
+            return kv_class
+    return "default"
+
+
+def short_name_from_path(path: Path, used: set[str]) -> str:
+    """Generate a unique [a-z0-9._-]+ slug for a discovered GGUF.
+
+    We prefer the file *stem* (e.g. `Qwen3.6-27B-Q4_K_M`) over the parent
+    directory name — stems are more descriptive and survive the common case
+    where multiple GGUFs share a directory like `/mnt/storage/models/`.
+    """
+    base = re.sub(r"[^a-z0-9._-]+", "-", path.stem.lower()).strip(".-")
+    # Strip noise suffixes Unsloth/quanters tend to bolt on.
+    base = re.sub(r"[._-](gguf|imatrix)$", "", base)
+    if not base or not NAME_RE.match(base):
+        # Last-ditch fallback — parent dir + stem.
+        base = re.sub(r"[^a-z0-9._-]+", "-",
+                      f"{path.parent.name.lower()}-{path.stem.lower()}").strip("-")
+    if not base:
+        base = "model"
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}-{n}" in used:
+        n += 1
+    return f"{base}-{n}"
+
+
+def infer_display_name(path: Path) -> str:
+    """A friendlier display name from a GGUF filename — stem + quant tier."""
+    stem = path.stem
+    return stem.replace("_", " ").replace("-", " ").strip()
+
+
+def _resolve_scan_paths(cfg: Config, extra: list[Path] | None = None) -> list[Path]:
+    """Build the deduped, existing list of dirs to walk for GGUFs."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    candidates = [Path(cfg.paths.models_dir).expanduser()]
+    candidates.extend(Path(p).expanduser() for p in cfg.paths.scan_paths)
+    if extra:
+        candidates.extend(Path(p).expanduser() for p in extra)
+    for c in candidates:
+        try:
+            r = c.resolve()
+        except OSError:
+            continue
+        if r in seen or not r.is_dir():
+            continue
+        seen.add(r)
+        paths.append(r)
+    return paths
+
+
+def discover_ggufs(
+    cfg: Config, extra_paths: list[Path] | None = None, max_depth: int = 4
+) -> list[Path]:
+    """Walk the configured + extra scan paths and return every *.gguf file found.
+
+    Hidden dirs and symlinked dirs are skipped to avoid loops. Bounded depth
+    keeps a stray scan of `/` from running forever.
+    """
+    found: dict[Path, None] = {}
+    for root in _resolve_scan_paths(cfg, extra_paths):
+        for path in _walk_for_ggufs(root, max_depth):
+            found[path] = None
+    return list(found.keys())
+
+
+def _walk_for_ggufs(root: Path, max_depth: int) -> list[Path]:
+    out: list[Path] = []
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        try:
+            entries = list(cur.iterdir())
+        except (OSError, PermissionError):
+            continue
+        for e in entries:
+            name = e.name
+            if name.startswith("."):
+                continue
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir() and depth < max_depth:
+                    stack.append((e, depth + 1))
+                elif e.is_file() and name.endswith(".gguf"):
+                    out.append(e.resolve())
+            except OSError:
+                continue
+    return out
+
+
+def register_discovered(
+    cfg: Config,
+    paths: list[Path],
+    *,
+    gpu_pci_slot: str | None = None,
+    port_start: int = 18080,
+) -> list[ModelConfig]:
+    """Auto-register every newly-found GGUF in `paths` against the cfg.
+
+    Skips files already registered (by absolute path). Picks a recipe via
+    `default_recipe(arch, vram, file_size, kv_class)` so context length is
+    sized to the bound GPU's VRAM. Returns the list of newly-added entries.
+    """
+    if not cfg.gpus:
+        raise ValueError("No GPUs in config — run `arc-llama init` first.")
+    if gpu_pci_slot is None:
+        enabled = next((g for g in cfg.gpus if g.enabled), None)
+        if enabled is None:
+            enabled = cfg.gpus[0]
+        gpu_pci_slot = enabled.pci_slot
+    gpu = cfg.find_gpu(gpu_pci_slot)
+    if gpu is None:
+        raise ValueError(f"Unknown GPU: {gpu_pci_slot}")
+    from arc_llama.arch import Arch
+    arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
+    existing_paths = {Path(m.path).resolve() for m in cfg.models}
+    used_names = {m.name for m in cfg.models}
+    used_ports = {m.port for m in cfg.models}
+    added: list[ModelConfig] = []
+    for p in paths:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp in existing_paths:
+            continue
+        if not rp.exists():
+            continue
+        kv_class = infer_kv_class(rp.name)
+        recipe = default_recipe(
+            arch=arch,
+            vram_mb=gpu.vram_mb or 8192,
+            model_file_mb=rp.stat().st_size // (1024 * 1024),
+            kv_class=kv_class,
+        )
+        name = short_name_from_path(rp, used_names)
+        used_names.add(name)
+        port = port_start
+        while port in used_ports:
+            port += 1
+        used_ports.add(port)
+        mc = ModelConfig(
+            name=name,
+            path=str(rp),
+            port=port,
+            gpu_pci_slot=gpu_pci_slot,
+            display_name=infer_display_name(rp),
+            kv_class=kv_class,
+            recipe={
+                "n_gpu_layers": recipe.n_gpu_layers,
+                "ctx": recipe.ctx,
+                "parallel": recipe.parallel,
+                "cache_type_k": recipe.cache_type_k.value,
+                "cache_type_v": recipe.cache_type_v.value,
+            },
+            aliases=[rp.name],
+        )
+        cfg.models.append(mc)
+        added.append(mc)
+        existing_paths.add(rp)
+        log.info(
+            "discovered %s → %s (kv=%s, ctx=%d, port=%d)",
+            rp.name, name, kv_class, recipe.ctx, port,
+        )
+    return added
 
 
 def download_from_hf(

@@ -18,6 +18,11 @@ something useful before lunch.
 
 ## What you get
 
+- **Auto-discovery of GPUs *and models*.** `arc-llama init` finds your Intel
+  card and walks the configured scan paths for `.gguf` files, registering
+  every one with a sensible recipe — context length sized to your VRAM,
+  KV-cache class inferred from the filename. You should never need
+  `arc-llama add` for a GGUF that's already on disk.
 - **Auto-discovery** of every Intel GPU on the host (`Alchemist`, `Battlemage`,
   Lunar Lake iGPU). PCI device-ID table covers the common SKUs and falls back
   to OpenCL device-name parsing for the rest.
@@ -56,9 +61,11 @@ arc-llama init --llama-server /path/to/your/built/llama-server
 arc-llama doctor
 arc-llama gpus
 
-# 4. Add a model — local file or HF spec
-arc-llama add /path/to/some-model.gguf
-arc-llama add unsloth/gemma-4-31B-it-GGUF:Q4_K_M --from-hf
+# 4. Auto-register every GGUF found under your scan paths.
+#    `init` ran this once; rerun any time you drop new files in.
+arc-llama scan
+# (or for one-offs: arc-llama add /path/to/some.gguf,
+#  or HF: arc-llama add unsloth/gemma-4-31B-it-GGUF:Q4_K_M --from-hf)
 
 # 5. Run the OpenAI-compatible server (also serves the web UI at /)
 arc-llama serve
