@@ -1,0 +1,223 @@
+# arc-llama
+
+> Plug-and-play `llama.cpp` runtime for Intel Arc GPUs.
+
+`arc-llama` is a single command-line tool that detects your Intel Arc card,
+applies the right SYCL/oneAPI environment for your generation, downloads or
+registers GGUF models, and runs an OpenAI-compatible server in front of them.
+It encodes the gotchas (SIGSEGVs in the persistent device-code cache, IPEX-LLM
+bundle env-var traps, KV-cache quant behaviour per architecture) so you don't
+have to discover them the hard way.
+
+It's built for the day you unbox an Arc card, install drivers, and want
+something useful before lunch.
+
+> [!IMPORTANT]
+> **Status: 0.1 alpha.** Core code is in place. End-to-end runs and tests
+> haven't been exercised yet — issue and PR feedback welcome.
+
+## What you get
+
+- **Auto-discovery** of every Intel GPU on the host (`Alchemist`, `Battlemage`,
+  Lunar Lake iGPU). PCI device-ID table covers the common SKUs and falls back
+  to OpenCL device-name parsing for the rest.
+- **Per-arch SYCL profiles** — env vars like `SYCL_CACHE_PERSISTENT=0` are
+  applied automatically, and known-bad ones (e.g. `GGML_SYCL_DISABLE_OPT`,
+  `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS`) are stripped from the
+  inherited shell environment.
+- **Smart defaults** for `-ctx`, `--cache-type-k/v`, and `-ngl` based on the
+  detected VRAM and the model file size — never starts a model you can't fit.
+- **Model registry** in TOML at `$XDG_CONFIG_HOME/arc-llama/config.toml`,
+  trivially editable.
+- **One process per model**, swapped in/out by an internal router. Default
+  policy is single-resident across all GPUs (good for thermals); flip it to
+  multi-resident if you have headroom.
+- **OpenAI-compatible API** at `http://127.0.0.1:11436/v1/...`. Plug it into
+  Open WebUI, OpenCode, anything that speaks OpenAI.
+- **No magic with your existing stack.** It uses your `llama-server` binary;
+  you're never locked into a specific build.
+
+## Quick start
+
+```bash
+# 1. Install (editable, while we're in alpha)
+git clone https://github.com/offbyonebit/arc-llama
+cd arc-llama
+pip install -e .
+
+# 2. Detect GPUs and write a starter config
+arc-llama init --llama-server /path/to/your/built/llama-server
+
+# 3. Look at what was found
+arc-llama doctor
+arc-llama gpus
+
+# 4. Add a model — local file or HF spec
+arc-llama add /path/to/some-model.gguf
+arc-llama add unsloth/gemma-4-31B-it-GGUF:Q4_K_M --from-hf
+
+# 5. Run the OpenAI-compatible server
+arc-llama serve
+
+# 6. (Optional) Install a systemd --user unit
+arc-llama systemd --write
+systemctl --user daemon-reload
+systemctl --user enable --now arc-llama.service
+```
+
+Then point any OpenAI-compatible client at `http://127.0.0.1:11436/v1`:
+
+```bash
+curl http://127.0.0.1:11436/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-31b-q4_k_m",
+    "messages": [{"role": "user", "content": "hi"}]
+  }'
+```
+
+## Requirements
+
+- Linux, kernel **6.8+** for Battlemage (`xe` driver) or 5.17+ for Alchemist
+  (`i915`).
+- ReBAR enabled in BIOS — without it llama.cpp falls back to slow paths on Arc.
+- A `llama-server` built with the SYCL backend. The Intel oneAPI Base Toolkit
+  is the supported build path:
+  ```bash
+  source /opt/intel/oneapi/setvars.sh
+  cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+  cmake --build build --config Release -j
+  ```
+- User in the `render` and `video` groups (`arc-llama doctor` will tell you).
+
+## Multi-GPU
+
+`arc-llama init` registers every Intel GPU it finds. Each model in the config
+is bound to a specific PCI slot, and the SYCL device selector
+(`ONEAPI_DEVICE_SELECTOR=level_zero:N`) is set per-model. Add your second card,
+re-run `arc-llama init --force` to refresh `[[gpus]]`, then add models against
+either GPU.
+
+The default swap policy is **single-resident across all GPUs** — pick a model,
+the router stops anything else first. Flip `server.single_resident = false` in
+the config if you want different-GPU models to coexist.
+
+## Configuration reference
+
+`$XDG_CONFIG_HOME/arc-llama/config.toml`:
+
+```toml
+version = 1
+
+[server]
+host = "127.0.0.1"
+port = 11436
+single_resident = true
+
+[paths]
+llama_server = "/usr/local/bin/llama-server"
+models_dir   = "~/.local/share/arc-llama/models"
+state_dir    = "~/.local/state/arc-llama"
+
+[[gpus]]
+pci_slot   = "0000:03:00.0"
+sycl_index = 0
+arch       = "battlemage"
+vram_mb    = 24480
+enabled    = true
+name       = "Arc Pro B60"
+
+[[models]]
+name             = "qwen3-7b"
+display_name     = "Qwen 3 7B"
+path             = "/home/me/models/qwen3-7b-q4_k_m.gguf"
+gpu_pci_slot     = "0000:03:00.0"
+port             = 18080
+kv_class         = "default"
+aliases          = ["qwen3-7b-q4_k_m.gguf"]
+
+[models.recipe]
+ctx              = 32768
+cache_type_k     = "q8_0"
+cache_type_v     = "q8_0"
+n_gpu_layers     = 999
+parallel         = 1
+extra_flags      = []
+```
+
+`kv_class` controls the KV-cache size estimate that `arc-llama add` uses to
+pick a context length. Currently:
+
+| value             | per-token f16 KV | typical for                                  |
+|-------------------|------------------|----------------------------------------------|
+| `default`         | ~80 KiB          | most ≤30B dense models, conservative ceiling |
+| `qwen3_27b_dense` | ~70 KiB          | Qwen 3 27B dense                             |
+| `moe_a3b`         | ~24 KiB          | Qwen 3 30B/35B-A3B MoE                       |
+| `gemma_swa`       | ~16 KiB          | Gemma 3/4 (interleaved sliding-window attn)  |
+
+## Architecture
+
+```
+┌──────────────────────┐
+│  OpenAI client       │  Open WebUI, OpenCode, curl, ...
+│  (port 11436)        │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  arc-llama serve     │  FastAPI, /v1/chat/completions etc.
+│   (router + state)   │
+└──────────┬───────────┘
+           │ ensure_active(model)
+           ▼
+┌──────────────────────┐
+│  Router              │  swaps llama-server subprocesses per request
+│  (single/multi-res)  │  applies arch SYCL env, picks safe ctx/KV
+└──────────┬───────────┘
+           │ subprocess.Popen
+           ▼
+┌──────────────────────┐
+│  llama-server (SYCL) │  one per registered model, on demand
+│  bound to GPU N      │
+└──────────────────────┘
+```
+
+The router serialises swaps with an `asyncio.Lock`, so concurrent requests for
+the same model fan out to one warm backend. Health is polled at
+`{backend_url}/health`; cold-start budget is 120 s by default to absorb the
+SYCL JIT recompile that plain `llama.cpp` pays on each fresh launch.
+
+## Why not just use Ollama / vLLM?
+
+- **Ollama (IPEX-LLM bundle):** the Intel-supported port has reproducible
+  inference bugs on Battlemage with Qwen2.5-class models — sequential calls
+  collapse to NaN-derived gibberish. arc-llama runs `llama-server` directly so
+  you avoid that path entirely.
+- **vLLM-XPU:** still maturing on Arc; weaker quant support. Worth trying for
+  dense >30B if you want throughput, but not yet a one-command experience.
+- **Plain `llama-server` + scripts:** what most Arc owners do today. arc-llama
+  is the formalisation of those scripts, with the gotchas baked in.
+
+## Roadmap
+
+- Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
+- `arc-llama benchmark` — quick prompt-eval/gen tok/s harness.
+- IPEX-LLM Ollama as an optional backend for users who prefer it.
+- Web UI for the router (model picker + status, no chat).
+- Container image with `llama-server` + arc-llama prebuilt.
+
+## Contributing
+
+PRs and issues welcome. The most useful contributions today are:
+
+1. Confirming or fixing PCI device-ID → arch mappings for your card. If
+   `arc-llama gpus` shows `unknown` for a working Arc card, please open an
+   issue with `lspci -nn` output.
+2. Reporting architectures where the default SYCL env profile crashes or
+   underperforms.
+3. Trying the smoke tests on hardware other than the maintainer's Battlemage
+   B60 development box.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
