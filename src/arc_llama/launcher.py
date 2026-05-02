@@ -3,10 +3,15 @@
 A `LlamaServer` owns one llama-server process bound to one model on one GPU.
 It builds the command line from an arch profile + recipe + model config so the
 SYCL gotchas are applied uniformly.
+
+Subprocesses are launched with `setsid` (so they own a fresh process group we
+can `killpg`) AND `PR_SET_PDEATHSIG=SIGTERM` so the kernel reaps the child if
+the arc-llama parent dies hard — no orphan llama-servers holding VRAM.
 """
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import signal
@@ -24,6 +29,55 @@ log = logging.getLogger("arc_llama.launcher")
 
 DEFAULT_HEALTH_TIMEOUT = 120  # seconds — generous for cold-start SYCL JIT
 HEALTH_POLL_INTERVAL = 1.5
+
+# Linux prctl(2) constant. We don't import a real binding — one syscall.
+_PR_SET_PDEATHSIG = 1
+
+
+_libc: ctypes.CDLL | None = None
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    global _libc
+    if _libc is not None:
+        return _libc
+    try:
+        lib = ctypes.CDLL("libc.so.6", use_errno=True)
+        # int prctl(int option, unsigned long arg2, ...arg5)
+        lib.prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        lib.prctl.restype = ctypes.c_int
+        _libc = lib
+    except OSError:
+        _libc = None
+    return _libc
+
+
+def _preexec_isolate_and_pdeathsig() -> None:
+    """preexec_fn: detach into a new session and tie our lifetime to the parent's.
+
+    Runs in the child between fork and exec. setsid() makes the child a new
+    process-group/session leader (so we can `killpg` it cleanly), prctl with
+    PR_SET_PDEATHSIG ensures the kernel sends us SIGTERM the moment the parent
+    arc-llama process exits — covers crashes, SIGKILL, oom-killer, etc.
+
+    NOTE: PDEATHSIG tracks the *thread* that did the fork, not the whole parent
+    process. If Python's main thread dies but a worker thread is what spawned us,
+    we wouldn't get the signal. arc-llama spawns from the asyncio loop running
+    in the main thread, so this is a non-issue today, but a future move to a
+    thread-pool launcher would need rework.
+    """
+    os.setsid()
+    libc = _load_libc()
+    if libc is None:
+        return
+    rc = libc.prctl(_PR_SET_PDEATHSIG, ctypes.c_ulong(int(signal.SIGTERM)), 0, 0, 0)
+    if rc != 0:
+        # Can't really log here — preexec_fn runs in a fragile post-fork state.
+        # The child will simply not receive PDEATHSIG; not fatal.
+        pass
 
 
 @dataclass
@@ -102,7 +156,7 @@ class LlamaServer:
             env=self.plan.env,
             stdout=stdout,
             stderr=stderr,
-            start_new_session=True,
+            preexec_fn=_preexec_isolate_and_pdeathsig,
         )
         self.started_at = time.time()
 

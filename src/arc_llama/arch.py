@@ -86,7 +86,8 @@ BATTLEMAGE_IDS: dict[int, str] = {
     0xE20C: "Arc B570",
     0xE20D: "Arc B-series (variant)",
     0xE210: "Arc B-series (variant)",
-    0xE212: "Arc Pro B60",
+    0xE211: "Arc Pro B60",      # confirmed on real hardware 2026-05-02
+    0xE212: "Arc Pro B-series", # tentative; reserved
     0xE215: "Arc Pro B-series",
     0xE216: "Arc Pro B-series",
 }

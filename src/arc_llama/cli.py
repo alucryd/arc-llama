@@ -155,8 +155,8 @@ def doctor(ctx: click.Context) -> None:
     console.print(f"  xe driver:     {'loaded' if has_xe else 'not loaded'}")
     console.print(f"  i915 driver:   {'loaded' if has_i915 else 'not loaded'}")
 
-    # GPU detection
-    gpus = detect_gpus(enrich=False)
+    # GPU detection (enrich=True so clinfo populates VRAM where xe doesn't via sysfs)
+    gpus = detect_gpus(enrich=True)
     if gpus:
         console.print(f"\n  detected {len(gpus)} Intel GPU(s):")
         for g in gpus:
@@ -468,6 +468,39 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         sys.exit(1)
     from arc_llama.server import create_app
     app = create_app(cfg)
+
+    # Belt-and-suspenders for graceful shutdown: even if uvicorn's lifespan
+    # handling misfires (e.g. on SIGTERM during a busy event loop), atexit
+    # gives us one more chance to stop subprocesses before the parent dies.
+    import atexit
+    import signal as _signal
+
+    def _shutdown_subprocesses() -> None:
+        rt = getattr(app.state, "router", None)
+        if rt is None:
+            return
+        # Async shutdown isn't possible from atexit if the loop is gone; call
+        # the underlying LlamaServer.stop() synchronously instead.
+        for srv in rt._servers.values():
+            try:
+                srv.stop()
+            except Exception:
+                pass
+
+    atexit.register(_shutdown_subprocesses)
+
+    def _on_signal(signum: int, _frame) -> None:  # noqa: ANN001
+        _shutdown_subprocesses()
+        # Re-raise as default so uvicorn's own handler (or python) finishes the job.
+        _signal.signal(signum, _signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for s in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(s, _on_signal)
+        except (OSError, ValueError):
+            pass
+
     uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="info")
 
 
@@ -481,7 +514,9 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 @click.option("--write", is_flag=True, help="Write the unit to ~/.config/systemd/user/")
 def systemd_unit(service_name: str, description: str, write: bool) -> None:
     """Print (or write) a systemd --user unit for `arc-llama serve`."""
-    arc = shutil.which("arc-llama") or sys.argv[0]
+    arc = shutil.which("arc-llama")
+    if not arc:
+        arc = str(Path(sys.argv[0]).resolve())
     unit = f"""[Unit]
 Description={description}
 After=network.target

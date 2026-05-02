@@ -147,30 +147,69 @@ def _scan_pci() -> list[DetectedGPU]:
     return found
 
 
-def _enrich_with_clinfo(gpus: list[DetectedGPU]) -> None:
-    """Best-effort: pull OpenCL device names from `clinfo -l` and attach to notes.
+_CLINFO_DEVICE_RE = re.compile(r"^\s*Device Name\s+(.+?)\s*$", re.MULTILINE)
+_CLINFO_GMEM_RE = re.compile(r"^\s*Global memory size\s+(\d+)", re.MULTILINE)
 
-    This *does* spawn a subprocess, but `clinfo -l` is read-only and lightweight.
-    Skips silently if clinfo isn't installed.
+
+def _parse_clinfo_devices(text: str) -> list[tuple[str, int | None]]:
+    """Split clinfo full output into per-device blocks and extract (name, gmem_bytes).
+
+    clinfo prints each device's properties in a contiguous block. We split on
+    `Device Name` boundaries and look for `Global memory size` within each block.
+    """
+    matches = list(_CLINFO_DEVICE_RE.finditer(text))
+    out: list[tuple[str, int | None]] = []
+    for i, m in enumerate(matches):
+        name = m.group(1).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        block = text[start:end]
+        gmem_match = _CLINFO_GMEM_RE.search(block)
+        gmem = int(gmem_match.group(1)) if gmem_match else None
+        out.append((name, gmem))
+    return out
+
+
+def _enrich_with_clinfo(gpus: list[DetectedGPU]) -> None:
+    """Best-effort: pull OpenCL device names + global memory size from clinfo.
+
+    Runs the full `clinfo` (read-only, but heavier than `-l`). Skips silently
+    if clinfo isn't installed.
     """
     try:
         out = subprocess.run(
-            ["clinfo", "-l"], capture_output=True, text=True, timeout=5,
+            ["clinfo"], capture_output=True, text=True, timeout=15,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return
     if out.returncode != 0:
         return
-    intel_devices = [
-        line.strip() for line in out.stdout.splitlines()
-        if "Intel" in line and "Device" in line
+    devices = _parse_clinfo_devices(out.stdout)
+    intel_arc_devices = [
+        (n, g) for (n, g) in devices
+        if "Intel" in n and ("Arc" in n or "Graphics" in n)
     ]
-    if not intel_devices:
+    if not intel_arc_devices:
         return
-    for g in gpus:
-        for d in intel_devices:
-            if g.name.split()[0] in d or f"0x{g.device_id:04X}" in d:
-                g.notes.append(f"OpenCL: {d}")
+    for gpu in gpus:
+        # Match on a meaningful substring of the name. We deliberately keep this
+        # forgiving because Intel marketing names drift across driver versions.
+        keys = [
+            gpu.name,
+            f"0x{gpu.device_id:04X}",
+            "Arc",  # last-resort: assume the first remaining Arc entry is ours
+        ]
+        for k in keys:
+            for i, (n, gmem) in enumerate(intel_arc_devices):
+                if k.lower() in n.lower():
+                    gpu.notes.append(f"OpenCL: {n}")
+                    if gpu.vram_mb is None and gmem:
+                        gpu.vram_mb = gmem // (1024 * 1024)
+                    intel_arc_devices.pop(i)
+                    break
+            else:
+                continue
+            break
 
 
 def detect_gpus(enrich: bool = True) -> list[DetectedGPU]:
