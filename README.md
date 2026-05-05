@@ -14,24 +14,24 @@ something useful before lunch.
 
 > [!IMPORTANT]
 > **Status: 0.1 alpha.** Core code is in place. End-to-end runs and tests
-> haven't been exercised yet — issue and PR feedback welcome.
+> haven't been exercised yet , issue and PR feedback welcome.
 
 ## What you get
 
 - **Auto-discovery of GPUs *and models*.** `arc-llama init` finds your Intel
   card and walks the configured scan paths for `.gguf` files, registering
-  every one with a sensible recipe — context length sized to your VRAM,
+  every one with a sensible recipe , context length sized to your VRAM,
   KV-cache class inferred from the filename. You should never need
   `arc-llama add` for a GGUF that's already on disk.
 - **Auto-discovery** of every Intel GPU on the host (`Alchemist`, `Battlemage`,
   Lunar Lake iGPU). PCI device-ID table covers the common SKUs and falls back
   to OpenCL device-name parsing for the rest.
-- **Per-arch SYCL profiles** — env vars like `SYCL_CACHE_PERSISTENT=0` are
+- **Per-arch SYCL profiles** , env vars like `SYCL_CACHE_PERSISTENT=0` are
   applied automatically, and known-bad ones (e.g. `GGML_SYCL_DISABLE_OPT`,
   `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS`) are stripped from the
   inherited shell environment.
 - **Smart defaults** for `-ctx`, `--cache-type-k/v`, and `-ngl` based on the
-  detected VRAM and the model file size — never starts a model you can't fit.
+  detected VRAM and the model file size , never starts a model you can't fit.
 - **Model registry** in TOML at `$XDG_CONFIG_HOME/arc-llama/config.toml`,
   trivially editable.
 - **One process per model**, swapped in/out by an internal router. Default
@@ -39,10 +39,10 @@ something useful before lunch.
   multi-resident if you have headroom.
 - **OpenAI-compatible API** at `http://127.0.0.1:11437/v1/...`. Plug it into
   Open WebUI, OpenCode, anything that speaks OpenAI.
-- **A web UI** at `http://127.0.0.1:11437/` — ships with the install. Model
+- **A web UI** at `http://127.0.0.1:11437/` , ships with the install. Model
   picker, load/stop buttons, **inline ctx + KV-quant editing**, GPU + VRAM
   panel. Pure HTML/JS, no build step.
-- **A terminal UI** (`arc-llama tui`) using Textual — same load/stop/edit
+- **A terminal UI** (`arc-llama tui`) using Textual , same load/stop/edit
   controls, no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
 - **No magic with your existing stack.** It uses your `llama-server` binary;
   you're never locked into a specific build.
@@ -95,7 +95,7 @@ curl http://127.0.0.1:11437/v1/chat/completions \
 
 - Linux, kernel **6.8+** for Battlemage (`xe` driver) or 5.17+ for Alchemist
   (`i915`).
-- ReBAR enabled in BIOS — without it llama.cpp falls back to slow paths on Arc.
+- ReBAR enabled in BIOS , without it llama.cpp falls back to slow paths on Arc.
 - A `llama-server` built with the SYCL backend. The Intel oneAPI Base Toolkit
   is the supported build path:
   ```bash
@@ -113,7 +113,7 @@ is bound to a specific PCI slot, and the SYCL device selector
 re-run `arc-llama init --force` to refresh `[[gpus]]`, then add models against
 either GPU.
 
-The default swap policy is **single-resident across all GPUs** — pick a model,
+The default swap policy is **single-resident across all GPUs** , pick a model,
 the router stops anything else first. Flip `server.single_resident = false` in
 the config if you want different-GPU models to coexist.
 
@@ -205,7 +205,7 @@ SYCL JIT recompile that plain `llama.cpp` pays on each fresh launch.
 ## Why not just use Ollama / vLLM?
 
 - **Ollama (IPEX-LLM bundle):** the Intel-supported port has reproducible
-  inference bugs on Battlemage with Qwen2.5-class models — sequential calls
+  inference bugs on Battlemage with Qwen2.5-class models , sequential calls
   collapse to NaN-derived gibberish. arc-llama runs `llama-server` directly so
   you avoid that path entirely.
 - **vLLM-XPU:** still maturing on Arc; weaker quant support. Worth trying for
@@ -221,16 +221,16 @@ Two front-ends are bundled and both talk to the same admin endpoints
 - **Web UI** at `http://<host>:<port>/` (default `127.0.0.1:11437`). Single
   static page polled every 5 s. Status, GPUs, model list, per-model
   Load/Stop buttons, "Stop all" panic button. No build step, no JS deps.
-- **Terminal UI** via `arc-llama tui` — Textual-based. Bindings: `r` refresh,
+- **Terminal UI** via `arc-llama tui` , Textual-based. Bindings: `r` refresh,
   `l` load selected model, `s` stop selected, `S` stop all, `q` quit. Run it
   alongside `arc-llama serve` (or against a remote one with `--server`).
 
-Both use brightness/dim for status (loaded vs idle) — no red/green palettes.
+Both use brightness/dim for status (loaded vs idle) , no red/green palettes.
 
 ## Roadmap
 
 - Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
-- `arc-llama benchmark` — quick prompt-eval/gen tok/s harness.
+- `arc-llama benchmark` , quick prompt-eval/gen tok/s harness.
 - IPEX-LLM Ollama as an optional backend for users who prefer it.
 - Container image with `llama-server` + arc-llama prebuilt.
 
@@ -248,4 +248,4 @@ PRs and issues welcome. The most useful contributions today are:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT , see [LICENSE](LICENSE).
