@@ -246,6 +246,15 @@ PRs and issues welcome. The most useful contributions today are:
 3. Trying the smoke tests on hardware other than the maintainer's Battlemage
    B60 development box.
 
+## Support
+
+This project is free and I don't ask for anything. If it's useful to you,
+a star on the repo is appreciated, and if you want to follow along with
+other things I'm building, you can find them under
+[@offbyonebit](https://github.com/offbyonebit).
+
+If you'd like to support development, you can [sponsor me on GitHub](https://github.com/sponsors/offbyonebit).
+
 ## License
 
 MIT , see [LICENSE](LICENSE).
