@@ -308,14 +308,25 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     want_stream = streaming_ok and bool(body.get("stream"))
     fwd_headers = {"Content-Type": "application/json"}
     if want_stream:
+        client = httpx.AsyncClient(timeout=None)
+        upstream = await client.stream(
+            "POST", target_url, content=body_bytes, headers=fwd_headers,
+        ).__aenter__()
+
         async def gen():
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream(
-                    "POST", target_url, content=body_bytes, headers=fwd_headers,
-                ) as r:
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-        return StreamingResponse(gen(), media_type="text/event-stream")
+            try:
+                async for chunk in upstream.aiter_raw():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            gen(),
+            status_code=upstream.status_code,
+            headers=_strip_response_headers(dict(upstream.headers)),
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
     async with httpx.AsyncClient(timeout=600.0) as client:
         r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
         return Response(
