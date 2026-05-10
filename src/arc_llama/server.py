@@ -25,6 +25,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from arc_llama.config import Config, load_config
 from arc_llama.router import Router
@@ -309,23 +310,21 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     fwd_headers = {"Content-Type": "application/json"}
     if want_stream:
         client = httpx.AsyncClient(timeout=None)
-        upstream = await client.stream(
+        req = client.build_request(
             "POST", target_url, content=body_bytes, headers=fwd_headers,
-        ).__aenter__()
+        )
+        upstream = await client.send(req, stream=True)
 
-        async def gen():
-            try:
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
+        async def close_upstream() -> None:
+            await upstream.aclose()
+            await client.aclose()
 
         return StreamingResponse(
-            gen(),
+            upstream.aiter_raw(),
             status_code=upstream.status_code,
             headers=_strip_response_headers(dict(upstream.headers)),
             media_type=upstream.headers.get("content-type", "text/event-stream"),
+            background=BackgroundTask(close_upstream),
         )
     async with httpx.AsyncClient(timeout=600.0) as client:
         r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
