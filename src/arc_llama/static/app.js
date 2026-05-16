@@ -86,45 +86,59 @@ function render(s) {
 }
 
 function renderViewRow(tr, m) {
+  const isUpstream = m.source && m.source !== "local";
   tr.className = m.loaded ? "bright" : "dim";
   const kv = `${m.cache_type_k || "?"}/${m.cache_type_v || "?"}`;
-  const pill = m.loaded
-    ? '<span class="pill loaded">loaded</span>'
-    : '<span class="pill idle">idle</span>';
+  const pill = isUpstream
+    ? `<span class="pill upstream">${m.source}</span>`
+    : m.loaded
+      ? '<span class="pill loaded">loaded</span>'
+      : '<span class="pill idle">idle</span>';
+  const nameCell = isUpstream
+    ? `${m.name} <span class="upstream-hint" title="${m.upstream_url}">${m.upstream_name}</span>`
+    : m.name;
   tr.innerHTML = `
     <td>${pill}</td>
-    <td>${m.name}</td>
-    <td>${m.gpu_pci_slot}</td>
-    <td>${m.port}</td>
+    <td>${nameCell}</td>
+    <td>${m.gpu_pci_slot || "—"}${isUpstream ? " *" : ""}</td>
+    <td>${m.port || "—"}</td>
     <td>${m.ctx ?? "?"}</td>
     <td>${kv}</td>
-    <td class="path" title="${m.path}">${fmtPath(m.path)}</td>
+    <td class="path" title="${m.path || ""}">${isUpstream ? "— " : fmtPath(m.path)}</td>
     <td class="actions"></td>
   `;
   const actions = tr.querySelector(".actions");
   const wrap = document.createElement("div");
   wrap.className = "row-actions";
 
-  const editBtn = document.createElement("button");
-  editBtn.textContent = "Edit";
-  editBtn.onclick = () => {
-    editingModel = m.name;
-    fetchStatus(true);
-  };
-  wrap.appendChild(editBtn);
-
-  if (m.loaded) {
-    const stop = document.createElement("button");
-    stop.textContent = "Stop";
-    stop.onclick = () => postAction(`/admin/stop/${encodeURIComponent(m.name)}`, "stop");
-    wrap.appendChild(stop);
+  if (isUpstream) {
+    // Upstream models show a "via" link instead of load/stop
+    const via = document.createElement("span");
+    via.className = "upstream-link";
+    via.textContent = m.upstream_name;
+    actions.appendChild(via);
   } else {
-    const load = document.createElement("button");
-    load.textContent = "Load";
-    load.onclick = () => postAction(`/admin/load/${encodeURIComponent(m.name)}`, "load");
-    wrap.appendChild(load);
+    const editBtn = document.createElement("button");
+    editBtn.textContent = "Edit";
+    editBtn.onclick = () => {
+      editingModel = m.name;
+      fetchStatus(true);
+    };
+    wrap.appendChild(editBtn);
+
+    if (m.loaded) {
+      const stop = document.createElement("button");
+      stop.textContent = "Stop";
+      stop.onclick = () => postAction(`/admin/stop/${encodeURIComponent(m.name)}`, "stop");
+      wrap.appendChild(stop);
+    } else {
+      const load = document.createElement("button");
+      load.textContent = "Load";
+      load.onclick = () => postAction(`/admin/load/${encodeURIComponent(m.name)}`, "load");
+      wrap.appendChild(load);
+    }
+    actions.appendChild(wrap);
   }
-  actions.appendChild(wrap);
 }
 
 function renderEditRow(tr, m) {

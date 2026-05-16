@@ -127,9 +127,27 @@ td.path { color: var(--fg-dim); font-family: ui-monospace, SFMono-Regular, Menlo
     color: var(--warn);
     border-color: var(--warn);
 }
+.pill.upstream {
+    background: rgba(88,166,255,0.10);
+    color: var(--accent);
+    border-color: rgba(88,166,255,0.4);
+}
 
 .row-actions { display: flex; gap: 6px; }
 .row-actions button { padding: 4px 10px; font-size: 12px; }
+
+.upstream-hint {
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 4px;
+    cursor: help;
+}
+.upstream-link {
+    color: var(--fg-mute);
+    font-size: 12px;
+    font-style: italic;
+}
 
 footer {
     padding: 12px 24px;

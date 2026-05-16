@@ -88,11 +88,29 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 11437
     single_resident: bool = True
+    admin_token: str | None = None
+    """Bearer token required for destructive admin endpoints (load, stop, edit, scan).
+    Set via `arc-llama serve --admin-token` or env var ARC_LLAMA_ADMIN_TOKEN."""
     """Why 11437? Ollama owns 11434 by default, and IPEX-LLM-Ollama installs
     sometimes use 11435/11436. 11437 is the first port in that neighbourhood
     that nobody else seems to claim."""
     """If True, only one llama-server runs at a time. If False, models share VRAM
     on a best-effort basis — set this only if you have generous VRAM headroom."""
+
+
+@dataclass
+class UpstreamConfig:
+    """An OpenAI-compatible API endpoint whose models are merged into
+    arc-llama's model list and forwarded transparently.
+
+    Models from upstreams are shown in the web UI with an "upstream" source
+    tag. When a request targets an upstream model, arc-llama proxies it to
+    the upstream instead of starting a local llama-server.
+    """
+    url: str
+    """Base URL of the upstream, e.g. 'http://127.0.0.1:11435' or 'http://192.168.1.50:8080'."""
+    name: str = ""
+    """Short label for the UI (e.g. 'ollama', 'proxy'). Default: hostname from url."""
 
 
 @dataclass
@@ -151,6 +169,7 @@ class Config:
     paths: PathsConfig = field(default_factory=PathsConfig)
     gpus: list[GPUConfig] = field(default_factory=list)
     models: list[ModelConfig] = field(default_factory=list)
+    upstreams: list[UpstreamConfig] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Lookup helpers
@@ -200,8 +219,9 @@ class Config:
             "paths": asdict(self.paths),
             "gpus": [asdict(g) for g in self.gpus],
             "models": [asdict(m) for m in self.models],
+            "upstreams": [asdict(u) for u in self.upstreams],
         }
-        return d
+        return _strip_none(d)
 
     def save(self, path: Path | None = None) -> Path:
         path = path or default_config_path()
@@ -209,6 +229,19 @@ class Config:
         with open(path, "wb") as f:
             tomli_w.dump(self.to_toml_dict(), f)
         return path
+
+
+def _strip_none(obj: Any) -> Any:
+    """Recursively remove dict keys whose value is None.
+
+    TOML has no null type, so None values crash tomli_w. This is applied
+    to the whole config tree before persistence.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(v) for v in obj]
+    return obj
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -223,6 +256,7 @@ def load_config(path: Path | None = None) -> Config:
         paths=PathsConfig(**raw.get("paths", {})),
         gpus=[GPUConfig(**g) for g in raw.get("gpus", [])],
         models=[ModelConfig(**m) for m in raw.get("models", [])],
+        upstreams=[UpstreamConfig(**u) for u in raw.get("upstreams", [])],
     )
 
 

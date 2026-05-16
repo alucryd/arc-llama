@@ -31,6 +31,7 @@ class Router:
         self.log_dir = log_dir
         self._servers: dict[str, LlamaServer] = {}  # keyed by model.name
         self._lock = asyncio.Lock()
+        self._loading_futures: dict[str, asyncio.Future[tuple[ModelConfig, LlamaServer]]] = {}
         self._build_servers()
 
     def _build_servers(self) -> None:
@@ -84,14 +85,45 @@ class Router:
         """Make sure the requested model is the resident one (per policy) and
         return its (config, LlamaServer). Caller forwards the request to
         `srv.plan.backend_url`.
+
+        Fast-path: if the model is already running and no eviction is needed,
+        return immediately without acquiring the swap lock.
+
+        Concurrent requests for the same model that is currently loading will
+        wait on a shared future instead of each trying to start a new process.
         """
+        # Fast-path: already running → no lock, no eviction, no start.
+        fast = self.resolve(query)
+        if fast is not None:
+            target_model, target_gpu, target_srv = fast
+            if target_srv.is_running:
+                # Verify policy: if single-resident, we are the one; if multi,
+                # same-GPU contention would have been resolved when we started.
+                return target_model, target_srv
+
+        # Slow path: may need to swap / start. Serialize with the lock.
         async with self._lock:
+            # Another task may have finished loading while we waited.
             resolved = self.resolve(query)
             if resolved is None:
                 raise KeyError(f"Unknown model: {query!r}")
             target_model, target_gpu, target_srv = resolved
+
+            # If someone else is already loading this model, wait on them.
+            existing_future = self._loading_futures.get(target_model.name)
+            if existing_future is not None:
+                return await existing_future
+
             await self._evict_for(target_model, target_gpu)
-            if not target_srv.is_running:
+
+            if target_srv.is_running:
+                return target_model, target_srv
+
+            # We are the one responsible for starting.
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[tuple[ModelConfig, LlamaServer]] = loop.create_future()
+            self._loading_futures[target_model.name] = future
+            try:
                 target_srv.start(log_dir=self.log_dir)
                 ready = await target_srv.wait_ready()
                 if not ready:
@@ -103,7 +135,16 @@ class Router:
                     raise RuntimeError(
                         f"llama-server for {target_model.name} did not become healthy"
                     )
-            return target_model, target_srv
+                result = (target_model, target_srv)
+                future.set_result(result)
+                return result
+            except Exception:
+                future.set_exception(RuntimeError(
+                    f"llama-server for {target_model.name} did not become healthy"
+                ))
+                raise
+            finally:
+                self._loading_futures.pop(target_model.name, None)
 
     async def _evict_for(self, target: ModelConfig, target_gpu: GPUConfig) -> None:
         """Stop the right neighbours so the target can have its GPU."""

@@ -19,6 +19,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -134,6 +135,7 @@ class LlamaServer:
         self.name = name
         self.process: subprocess.Popen[bytes] | None = None
         self.started_at: float | None = None
+        self._log_file: Any = None  # file handle opened in start(), closed in stop()
 
     @property
     def is_running(self) -> bool:
@@ -148,7 +150,8 @@ class LlamaServer:
         if log_dir is not None:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / f"{self.name}.log"
-            stdout = open(log_path, "ab")
+            self._log_file = open(log_path, "ab")
+            stdout = self._log_file
             stderr = subprocess.STDOUT
         log.info("[%s] starting: %s", self.name, " ".join(self.plan.argv))
         self.process = subprocess.Popen(
@@ -200,3 +203,9 @@ class LlamaServer:
                 pass
         self.process = None
         self.started_at = None
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
