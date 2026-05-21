@@ -26,6 +26,7 @@ dependencies = [
     "tomli-w>=1.0",
     "rich>=13.0",
     "huggingface-hub>=0.20",
+    "gguf>=0.10",
 ]
 
 [project.optional-dependencies]

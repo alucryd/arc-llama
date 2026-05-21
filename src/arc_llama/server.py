@@ -248,7 +248,8 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         """Update a model's recipe in-place.
 
         Body is a partial recipe dict — only provided fields change. Recognised
-        fields: `ctx`, `cache_type_k`, `cache_type_v`, `parallel`, `kv_class`.
+        fields: `ctx`, `cache_type_k`, `cache_type_v`, `parallel`, `kv_class`,
+        `spec_type`, `ubatch_size`.
         If the model is currently loaded, the server is stopped first; callers
         decide whether to reload it afterwards via /admin/load.
         """
@@ -306,6 +307,19 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                 )
             model.kv_class = v
             changed.append("kv_class")
+        if "spec_type" in body:
+            v = str(body["spec_type"])
+            recipe["spec_type"] = v
+            changed.append("spec_type")
+        if "ubatch_size" in body:
+            try:
+                ub = int(body["ubatch_size"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="ubatch_size must be an integer")
+            if not (1 <= ub <= 4096):
+                raise HTTPException(status_code=400, detail="ubatch_size must be 1..4096")
+            recipe["ubatch_size"] = ub
+            changed.append("ubatch_size")
         if not changed:
             raise HTTPException(status_code=400, detail="no recognised fields to edit")
         model.recipe = recipe

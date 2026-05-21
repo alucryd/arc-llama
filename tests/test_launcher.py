@@ -69,6 +69,71 @@ class TestBuildPlan:
         plan = build_plan(cfg, model, gpu)
         assert plan.env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:2"
 
+    def test_fake_path_no_mtp_no_ub_injected(self):
+        """Non-existent GGUF → no MTP heads → -ub should NOT appear."""
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0")
+        gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
+        plan = build_plan(cfg, model, gpu)
+        assert "-ub" not in plan.argv
+
+
+# Real GGUF fixtures for MTP integration tests.
+_MTP_QWEN = Path("/mnt/storage/models/qwen3.6-27b/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf")
+
+
+def _have_mtp_fixture() -> bool:
+    return _MTP_QWEN.exists()
+
+
+class TestBuildPlanMtp:
+    @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
+    def test_auto_injects_ub_8_for_mtp(self):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="mtp-qwen",
+            path=str(_MTP_QWEN),
+            port=18080,
+            gpu_pci_slot="00:00.0",
+        )
+        gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
+        plan = build_plan(cfg, model, gpu)
+        assert "-ub" in plan.argv
+        idx = plan.argv.index("-ub")
+        assert plan.argv[idx + 1] == "8"
+
+    @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
+    def test_user_ubatch_size_not_overridden(self):
+        """If the recipe already has ubatch_size, don't stomp it."""
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="mtp-qwen",
+            path=str(_MTP_QWEN),
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={"ubatch_size": 16},
+        )
+        gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
+        plan = build_plan(cfg, model, gpu)
+        idx = plan.argv.index("-ub")
+        assert plan.argv[idx + 1] == "16"
+
+    @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
+    def test_mtp_on_lunar_lake_also_gets_ub_8(self):
+        """Xe2 iGPU (Lunar Lake) is the same generation as Battlemage — same fix."""
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="mtp-qwen",
+            path=str(_MTP_QWEN),
+            port=18080,
+            gpu_pci_slot="00:00.0",
+        )
+        gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="lunar_lake")
+        plan = build_plan(cfg, model, gpu)
+        assert "-ub" in plan.argv
+        idx = plan.argv.index("-ub")
+        assert plan.argv[idx + 1] == "8"
+
 
 class TestLlamaServerLifecycle:
     def test_not_running_before_start(self):

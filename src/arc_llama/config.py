@@ -158,6 +158,8 @@ class ModelConfig:
             temp=r.get("temp"),
             top_p=r.get("top_p"),
             top_k=r.get("top_k"),
+            spec_type=r.get("spec_type"),
+            ubatch_size=r.get("ubatch_size"),
             extra_flags=list(r.get("extra_flags", [])),
         )
 

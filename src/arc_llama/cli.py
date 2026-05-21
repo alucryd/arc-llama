@@ -313,16 +313,21 @@ def list_models(ctx: click.Context) -> None:
     table.add_column("Port")
     table.add_column("ctx")
     table.add_column("KV")
+    table.add_column("Spec")
     table.add_column("Path")
     for m in cfg.models:
         r = m.recipe or {}
         kv = f"{r.get('cache_type_k','f16')}/{r.get('cache_type_v','f16')}"
+        spec = r.get("spec_type", "—")
+        if r.get("ubatch_size"):
+            spec += f" (ub={r['ubatch_size']})"
         table.add_row(
             m.name,
             m.gpu_pci_slot,
             str(m.port),
             str(r.get("ctx", "?")),
             kv,
+            spec,
             m.path,
         )
     console.print(table)
@@ -358,6 +363,14 @@ def list_models(ctx: click.Context) -> None:
 )
 @click.option("--alias", "aliases", multiple=True, help="Extra match strings (repeatable).")
 @click.option(
+    "--spec-type", "spec_type", default=None,
+    help="Speculative decoding type (e.g. draft-mtp). Auto-detected for MTP models.",
+)
+@click.option(
+    "--ubatch-size", "ubatch_size", type=int, default=None,
+    help="Ubatch size (-ub). Auto-set to 8 for MTP models.",
+)
+@click.option(
     "--from-hf", is_flag=True,
     help="Treat SOURCE as a Hugging Face spec (`org/repo` or `org/repo:Q4_K_M`).",
 )
@@ -374,6 +387,8 @@ def add(
     display_name: str,
     kv_class: str,
     aliases: tuple[str, ...],
+    spec_type: str | None,
+    ubatch_size: int | None,
     from_hf: bool,
     hf_token: str | None,
 ) -> None:
@@ -423,6 +438,10 @@ def add(
     if kv_type is not None:
         overrides["cache_type_k"] = kv_type
         overrides["cache_type_v"] = kv_type
+    if spec_type is not None:
+        overrides["spec_type"] = spec_type
+    if ubatch_size is not None:
+        overrides["ubatch_size"] = ubatch_size
 
     try:
         mc = add_local_model(
@@ -723,6 +742,24 @@ WantedBy=default.target
         "Enable with: [bold]systemctl --user daemon-reload && "
         f"systemctl --user enable --now {service_name}[/bold]"
     )
+
+
+# ===========================================================================
+# mtp-info
+# ===========================================================================
+
+@cli.command("mtp-info")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def mtp_info_cmd(path: Path) -> None:
+    """Inspect a GGUF file for MTP-relevant metadata."""
+    from arc_llama.gguf_meta import mtp_info
+    info = mtp_info(path)
+    console.print(f"[bold]GGUF:[/bold] {info['path']}")
+    console.print(f"  architecture:          {info['architecture']}")
+    console.print(f"  block_count:           {info['block_count']}")
+    console.print(f"  nextn_predict_layers:  {info['nextn_predict_layers']}")
+    console.print(f"  has_mtp_heads:         {info['has_mtp_heads']}")
+    console.print(f"  is_hybrid_ssm:         {info['is_hybrid_ssm']}")
 
 
 # ===========================================================================

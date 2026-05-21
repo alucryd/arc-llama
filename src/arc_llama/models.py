@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from arc_llama.config import Config, ModelConfig
+from arc_llama.gguf_meta import has_mtp_heads
 from arc_llama.recipes import default_recipe
 
 log = logging.getLogger("arc_llama.models")
@@ -129,6 +130,14 @@ def add_local_model(
         "cache_type_k": recipe.cache_type_k.value,
         "cache_type_v": recipe.cache_type_v.value,
     }
+    # Auto-enable draft-mtp for models that actually carry MTP heads.
+    if has_mtp_heads(p):
+        recipe_dict["spec_type"] = "draft-mtp"
+        recipe_dict["ubatch_size"] = 8
+        log.info(
+            "model %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
+            name,
+        )
     if recipe_overrides:
         recipe_dict.update(recipe_overrides)
     mc = ModelConfig(
@@ -306,6 +315,21 @@ def register_discovered(
             model_file_mb=rp.stat().st_size // (1024 * 1024),
             kv_class=kv_class,
         )
+        recipe_dict: dict[str, Any] = {
+            "n_gpu_layers": recipe.n_gpu_layers,
+            "ctx": recipe.ctx,
+            "parallel": recipe.parallel,
+            "cache_type_k": recipe.cache_type_k.value,
+            "cache_type_v": recipe.cache_type_v.value,
+        }
+        # Auto-enable draft-mtp for discovered models that carry MTP heads.
+        if has_mtp_heads(rp):
+            recipe_dict["spec_type"] = "draft-mtp"
+            recipe_dict["ubatch_size"] = 8
+            log.info(
+                "discovered %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
+                rp.name,
+            )
         name = short_name_from_path(rp, used_names)
         used_names.add(name)
         port = port_start
@@ -319,13 +343,7 @@ def register_discovered(
             gpu_pci_slot=gpu_pci_slot,
             display_name=infer_display_name(rp),
             kv_class=kv_class,
-            recipe={
-                "n_gpu_layers": recipe.n_gpu_layers,
-                "ctx": recipe.ctx,
-                "parallel": recipe.parallel,
-                "cache_type_k": recipe.cache_type_k.value,
-                "cache_type_v": recipe.cache_type_v.value,
-            },
+            recipe=recipe_dict,
             aliases=[rp.name],
         )
         cfg.models.append(mc)

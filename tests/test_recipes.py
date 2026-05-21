@@ -179,3 +179,16 @@ class TestLaunchRecipeArgv:
         assert "--temp" not in argv
         assert "--top-p" not in argv
         assert "--top-k" not in argv
+        assert "--spec-type" not in argv
+        assert "-ub" not in argv
+
+    def test_spec_type_and_ubatch_size(self):
+        r = LaunchRecipe(
+            spec_type="draft-mtp",
+            ubatch_size=8,
+        )
+        argv = r.to_argv()
+        assert "--spec-type" in argv
+        assert argv[argv.index("--spec-type") + 1] == "draft-mtp"
+        assert "-ub" in argv
+        assert argv[argv.index("-ub") + 1] == "8"
