@@ -19,14 +19,14 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
-from arc_llama.config import Config, default_config_path, load_config
+from arc_llama.config import Config, load_config
 from arc_llama.router import Router
 
 log = logging.getLogger("arc_llama.server")
@@ -41,19 +41,7 @@ def _strip_response_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _require_admin(request: Request) -> None:
-    """FastAPI dependency that gates destructive admin endpoints."""
-    token = getattr(request.app.state.cfg.server, "admin_token", None)
-    if not token:
-        return
-    auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    if auth[7:] != token:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-
-def create_app(cfg: Config | None = None, config_path: Path | None = None) -> FastAPI:
+def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     state_dir = None
     if cfg.paths.state_dir:
@@ -64,34 +52,6 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
     async def lifespan(app: FastAPI):
         app.state.router = Router(cfg, log_dir=state_dir)
         app.state.cfg = cfg
-        app.state.config_path = config_path or default_config_path()
-        app.state.upstream_cache: dict[str, list] = {}
-        app.state.upstream_cache_ts: float = 0.0
-        # Warm the upstream cache on startup so the first /v1/models
-        # request doesn't block while probing ports.
-        try:
-            from arc_llama.models import discover_upstreams as _du
-            discovered = _du(cfg, scan_openai_ports=bool(cfg.upstreams))
-            app.state.upstream_cache = {"models": [
-                {
-                    "id": m.id,
-                    "object": "model",
-                    "owned_by": m.upstream_name,
-                    "created": 0,
-                    "source": m.source,
-                    "upstream_url": m.upstream_url,
-                    "upstream_name": m.upstream_name,
-                    "metadata": m.details,
-                }
-                for m in discovered
-            ]}
-            import time as _time
-            app.state.upstream_cache_ts = _time.monotonic()
-            log.info("upstream cache warmed: %d model(s) from %d server(s)",
-                      len(discovered),
-                      len({m.upstream_url for m in discovered}))
-        except Exception as exc:
-            log.warning("upstream cache warm-up failed: %s", exc)
         try:
             yield
         finally:
@@ -107,7 +67,6 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
     async def list_models(request: Request) -> dict:
         rt: Router = request.app.state.router
         data = []
-        seen_ids: set[str] = set()
         for m in rt.all_models():
             srv = rt._servers.get(m.name)
             data.append({
@@ -123,7 +82,6 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                     "aliases": list(m.aliases),
                 },
             })
-            seen_ids.add(m.name)
             for alias in m.aliases:
                 if alias != m.name:
                     data.append({
@@ -133,13 +91,6 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                         "created": 0,
                         "metadata": {"canonical": m.name},
                     })
-                    seen_ids.add(alias)
-        # Merge upstream models
-        upstreams = await _get_upstream_models(request)
-        for um in upstreams:
-            if um["id"] not in seen_ids:
-                data.append(um)
-                seen_ids.add(um["id"])
         return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
@@ -175,31 +126,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                 "cache_type_v": r.get("cache_type_v"),
                 "kv_class": m.kv_class,
                 "aliases": list(m.aliases),
-                "source": "local",
             })
-        # Merge upstream models
-        upstream_models = await _get_upstream_models(request)
-        seen = {m["name"] for m in models}
-        for um in upstream_models:
-            mid = um["id"]
-            if mid not in seen:
-                models.append({
-                    "name": mid,
-                    "display_name": um.get("metadata", {}).get("display_name", mid),
-                    "path": "",
-                    "gpu_pci_slot": "",
-                    "port": 0,
-                    "loaded": True,
-                    "ctx": None,
-                    "cache_type_k": None,
-                    "cache_type_v": None,
-                    "kv_class": "",
-                    "aliases": [],
-                    "source": um.get("source", "upstream"),
-                    "upstream_url": um.get("upstream_url", ""),
-                    "upstream_name": um.get("upstream_name", ""),
-                })
-                seen.add(mid)
         gpus = [{
             "pci_slot": g.pci_slot,
             "sycl_index": g.sycl_index,
@@ -219,18 +146,18 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         }
 
     @app.post("/admin/load/{name}")
-    async def admin_load(name: str, request: Request, _=Depends(_require_admin)) -> dict:
+    async def admin_load(name: str, request: Request) -> dict:
         rt: Router = request.app.state.router
         try:
             model, srv = await rt.ensure_active(name)
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
+            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}") from None
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
         return {"name": model.name, "loaded": srv.is_running}
 
     @app.post("/admin/stop/{name}")
-    async def admin_stop(name: str, request: Request, _=Depends(_require_admin)) -> dict:
+    async def admin_stop(name: str, request: Request) -> dict:
         rt: Router = request.app.state.router
         if name not in {m.name for m in rt.all_models()}:
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
@@ -238,13 +165,13 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         return {"name": name, "was_running": was_running, "loaded": False}
 
     @app.post("/admin/stop-all")
-    async def admin_stop_all(request: Request, _=Depends(_require_admin)) -> dict:
+    async def admin_stop_all(request: Request) -> dict:
         rt: Router = request.app.state.router
         stopped = await rt.stop_all()
         return {"stopped": stopped}
 
     @app.post("/admin/models/{name}/edit")
-    async def admin_edit_model(name: str, request: Request, _=Depends(_require_admin)) -> dict:
+    async def admin_edit_model(name: str, request: Request) -> dict:
         """Update a model's recipe in-place.
 
         Body is a partial recipe dict — only provided fields change. Recognised
@@ -253,10 +180,10 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         If the model is currently loaded, the server is stopped first; callers
         decide whether to reload it afterwards via /admin/load.
         """
+        from arc_llama.config import default_config_path
         from arc_llama.recipes import KVCacheType
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
-        config_path: Path = request.app.state.config_path
         try:
             body = await request.json()
         except Exception as e:
@@ -274,7 +201,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             try:
                 ctx = int(body["ctx"])
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="ctx must be an integer")
+                raise HTTPException(status_code=400, detail="ctx must be an integer") from None
             if not (256 <= ctx <= 1_048_576):
                 raise HTTPException(status_code=400, detail="ctx must be 256..1048576")
             recipe["ctx"] = ctx
@@ -293,7 +220,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             try:
                 par = int(body["parallel"])
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="parallel must be an integer")
+                raise HTTPException(status_code=400, detail="parallel must be an integer") from None
             if not (1 <= par <= 32):
                 raise HTTPException(status_code=400, detail="parallel must be 1..32")
             recipe["parallel"] = par
@@ -324,7 +251,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             raise HTTPException(status_code=400, detail="no recognised fields to edit")
         model.recipe = recipe
         try:
-            c.save(config_path)
+            c.save(default_config_path())
         except OSError as e:
             log.warning("edit %s: persist failed: %s", name, e)
         rebuilt, was_running = await rt.rebuild_model(name)
@@ -338,17 +265,17 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         }
 
     @app.post("/admin/scan")
-    async def admin_scan(request: Request, _=Depends(_require_admin)) -> dict:
+    async def admin_scan(request: Request) -> dict:
         """Re-walk scan paths for new GGUFs and auto-register them.
 
         Mutates the in-memory Config and persists it to disk so subsequent
         restarts see the same registry. New models become loadable via
         `/admin/load/{name}` immediately — the router rebuilds its server map.
         """
+        from arc_llama.config import default_config_path
         from arc_llama.models import discover_ggufs, register_discovered
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
-        config_path: Path = request.app.state.config_path
         try:
             found = discover_ggufs(c)
             added = register_discovered(c, found)
@@ -356,7 +283,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             raise HTTPException(status_code=400, detail=str(e)) from e
         if added:
             try:
-                c.save(config_path)
+                c.save(default_config_path())
             except OSError as e:
                 log.warning("scan: persist failed: %s", e)
             # Rebuild the router's server map so new entries are immediately
@@ -385,34 +312,9 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
     model_query = body.get("model", "")
-
-    # Try local model first
     try:
         model, srv = await rt.ensure_active(model_query)
     except KeyError:
-        # Not a local model — try upstreams
-        upstream_url = await _resolve_upstream(request, model_query)
-        if upstream_url is not None:
-            target_url = f"{upstream_url}{target_path}"
-            want_stream = streaming_ok and bool(body.get("stream"))
-            fwd_headers = {"Content-Type": "application/json"}
-            if want_stream:
-                async def gen():
-                    async with httpx.AsyncClient(timeout=None) as client:
-                        async with client.stream(
-                            "POST", target_url, content=body_bytes, headers=fwd_headers,
-                        ) as r:
-                            async for chunk in r.aiter_raw():
-                                yield chunk
-                return StreamingResponse(gen(), media_type="text/event-stream")
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
-                return Response(
-                    content=r.content,
-                    status_code=r.status_code,
-                    headers=_strip_response_headers(dict(r.headers)),
-                    media_type=r.headers.get("content-type", "application/json"),
-                )
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_query!r}") from None
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
@@ -420,14 +322,23 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     want_stream = streaming_ok and bool(body.get("stream"))
     fwd_headers = {"Content-Type": "application/json"}
     if want_stream:
-        async def gen():
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream(
-                    "POST", target_url, content=body_bytes, headers=fwd_headers,
-                ) as r:
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        client = httpx.AsyncClient(timeout=None)
+        req = client.build_request(
+            "POST", target_url, content=body_bytes, headers=fwd_headers,
+        )
+        upstream = await client.send(req, stream=True)
+
+        async def close_upstream() -> None:
+            await upstream.aclose()
+            await client.aclose()
+
+        return StreamingResponse(
+            upstream.aiter_raw(),
+            status_code=upstream.status_code,
+            headers=_strip_response_headers(dict(upstream.headers)),
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+            background=BackgroundTask(close_upstream),
+        )
     async with httpx.AsyncClient(timeout=600.0) as client:
         r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
         return Response(
@@ -436,53 +347,3 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             headers=_strip_response_headers(dict(r.headers)),
             media_type=r.headers.get("content-type", "application/json"),
         )
-
-
-_UPSTREAM_CACHE_TTL = 30.0  # seconds
-
-
-async def _get_upstream_models(request: Request) -> list[dict]:
-    """Fetch upstream model lists, caching for _UPSTREAM_CACHE_TTL seconds."""
-    import time
-    c: Config = request.app.state.cfg
-    now = time.monotonic()
-    cache_ts = getattr(request.app.state, "upstream_cache_ts", 0.0)
-    cache = getattr(request.app.state, "upstream_cache", {})
-    if now - cache_ts < _UPSTREAM_CACHE_TTL and cache:
-        return cache.get("models", [])
-    from arc_llama.models import discover_upstreams
-    try:
-        discovered = discover_upstreams(c, scan_openai_ports=bool(c.upstreams))
-    except Exception as e:
-        log.warning("upstream discovery failed: %s", e)
-        return cache.get("models", [])
-    result = []
-    for m in discovered:
-        entry = {
-            "id": m.id,
-            "object": "model",
-            "owned_by": m.upstream_name,
-            "created": 0,
-            "source": m.source,
-            "upstream_url": m.upstream_url,
-            "upstream_name": m.upstream_name,
-            "metadata": m.details,
-        }
-        result.append(entry)
-    request.app.state.upstream_cache = {"models": result}
-    request.app.state.upstream_cache_ts = now
-    return result
-
-
-async def _resolve_upstream(request: Request, model_query: str) -> str | None:
-    """Find which upstream serves a model, returning its base URL."""
-    upstreams = await _get_upstream_models(request)
-    for um in upstreams:
-        if um["id"] == model_query:
-            return um["upstream_url"].rstrip("")
-    # Fuzzy match on id substring
-    ql = model_query.lower()
-    for um in upstreams:
-        if ql in um["id"].lower():
-            return um["upstream_url"].rstrip("")
-    return None

@@ -7,21 +7,19 @@ Discovery (`discover_ggufs` / `register_discovered`) is the plug-and-play
 entrypoint: walk a few directories, infer reasonable recipes from filename
 heuristics, and register everything found. Users on a fresh box should never
 need to type `arc-llama add` for a GGUF they already have on disk.
-
-Upstream discovery (`discover_ollama` / `discover_openai_endpoints`) probes
-nearby Ollama and OpenAI-compatible servers for their model lists and returns
-metadata so arc-llama can merge them into its own `/v1/models` surface and
-forward requests transparently.
 """
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from arc_llama.config import Config, ModelConfig
+from arc_llama.config import (
+    Config,
+    ModelConfig,
+)
 from arc_llama.gguf_meta import has_mtp_heads
 from arc_llama.recipes import default_recipe
 
@@ -410,202 +408,3 @@ def download_from_hf(
         local_dir=str(target_dir),
         token=token,
     ))
-
-
-# ---------------------------------------------------------------------------
-# Upstream discovery (Ollama + OpenAI-compatible endpoints)
-# ---------------------------------------------------------------------------
-
-# Common ports where Ollama instances tend to run. Users rarely change these.
-DEFAULT_OLLAMA_PORTS = [11434, 11435, 11436]
-
-# Common ports where llama-server / other OpenAI-compatible servers might live.
-DEFAULT_OPENAI_PORTS = [8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 18080]
-
-# Skip the arc-llama server's own port — we don't want to discover ourselves.
-_localhost = "127.0.0.1"
-
-
-@dataclass
-class UpstreamModel:
-    """A model discovered on an upstream server (Ollama or OpenAI-compatible)."""
-    id: str
-    source: str          # "ollama" or "openai"
-    upstream_url: str    # base URL, e.g. "http://127.0.0.1:11434"
-    upstream_name: str   # short label, e.g. "ollama-b60"
-    details: dict[str, Any] = field(default_factory=dict)
-
-
-def discover_ollama(host: str = _localhost, ports: list[int] | None = None) -> list[UpstreamModel]:
-    """Probe common Ollama ports for locally running instances and return their models.
-
-    Ollama exposes GET /api/tags which lists all locally available models.
-    We also skip the arc-llama server's own port if it matches.
-    """
-    import logging as _logging
-
-    import httpx
-    _logging.getLogger("httpx").setLevel(_logging.WARNING)
-    ports = ports or DEFAULT_OLLAMA_PORTS
-    models: list[UpstreamModel] = []
-    for port in ports:
-        url = f"http://{host}:{port}"
-        try:
-            r = httpx.get(f"{url}/api/tags", timeout=2.0)
-            r.raise_for_status()
-        except (httpx.HTTPError, OSError):
-            continue
-        try:
-            data = r.json()
-        except (ValueError, KeyError):
-            continue
-        name = f"ollama-{port}"
-        for m in data.get("models", []):
-            model_id = m.get("name", m.get("model", ""))
-            if not model_id:
-                continue
-            models.append(UpstreamModel(
-                id=model_id,
-                source="ollama",
-                upstream_url=url,
-                upstream_name=name,
-                details={
-                    "size": m.get("size"),
-                    "quantization": m.get("quantization_level"),
-                    "modified_at": m.get("modified_at", ""),
-                },
-            ))
-    return models
-
-
-def discover_openai_endpoints(
-    host: str = _localhost,
-    ports: list[int] | None = None,
-    skip_ports: set[int] | None = None,
-) -> list[UpstreamModel]:
-    """Probe common ports for OpenAI-compatible /v1/models endpoints.
-
-    Skips any port in `skip_ports` (typically the arc-llama server's own port).
-    """
-    import logging as _logging
-
-    import httpx
-    _logging.getLogger("httpx").setLevel(_logging.WARNING)
-    ports = ports or DEFAULT_OPENAI_PORTS
-    skip_ports = skip_ports or set()
-    models: list[UpstreamModel] = []
-    for port in ports:
-        if port in skip_ports:
-            continue
-        url = f"http://{host}:{port}"
-        try:
-            r = httpx.get(f"{url}/v1/models", timeout=2.0)
-            r.raise_for_status()
-        except (httpx.HTTPError, OSError):
-            continue
-        try:
-            data = r.json()
-        except (ValueError, KeyError):
-            continue
-        name = f"openai-{port}"
-        for m in data.get("data", []):
-            model_id = m.get("id", "")
-            if not model_id:
-                continue
-            models.append(UpstreamModel(
-                id=model_id,
-                source="openai",
-                upstream_url=url,
-                upstream_name=name,
-                details=m.get("metadata", {}),
-            ))
-    return models
-
-
-def discover_upstreams(
-    cfg: Config,
-    host: str = _localhost,
-    *,
-    scan_openai_ports: bool = False,
-) -> list[UpstreamModel]:
-    """Discover models from configured upstreams and nearby servers.
-
-    Queries in order:
-    1. Configured ``[[upstreams]]`` entries (user-specified URLs).
-    2. Common Ollama ports (11434-11436) — always probed.
-    3. Common llama-server / OpenAI ports — only if *scan_openai_ports* is True
-       or at least one ``[[upstreams]]`` is configured.
-
-    Auto-scanning OpenAI ports is off by default because a headless box with
-    nothing listening on 8080-8088 would burn ~14 connection timeouts (2s
-    each) on every request. Users who have explicit upstreams or pass
-    ``--discover-openai`` get that scan.
-    """
-    import logging as _logging
-
-    import httpx
-    _logging.getLogger("httpx").setLevel(_logging.WARNING)
-    seen: set[tuple[str, str, str]] = set()
-    models: list[UpstreamModel] = []
-    skip_ports = {cfg.server.port}
-
-    def _add(m: UpstreamModel) -> None:
-        key = (m.id, m.source, m.upstream_url)
-        if key not in seen:
-            seen.add(key)
-            models.append(m)
-
-    # 1. configured upstreams
-    for upstream in cfg.upstreams:
-        url = upstream.url.rstrip("/")
-        label = upstream.name or url.replace("http://", "").replace("https://", "")
-        try:
-            r = httpx.get(f"{url}/v1/models", timeout=5.0)
-            r.raise_for_status()
-            data = r.json()
-        except (httpx.HTTPError, OSError, ValueError):
-            log.warning("upstream %s did not respond to /v1/models", url)
-            continue
-        # Detect whether this is Ollama by trying /api/tags too.
-        is_ollama = False
-        try:
-            tr = httpx.get(f"{url}/api/tags", timeout=2.0)
-            if tr.status_code == 200:
-                is_ollama = True
-        except (httpx.HTTPError, OSError):
-            pass
-        if is_ollama:
-            parsed = _host_port(url)
-            for m in discover_ollama(host=parsed[0], ports=[parsed[1]]):
-                m.upstream_name = label
-                _add(m)
-        else:
-            for m in data.get("data", []):
-                mid = m.get("id", "")
-                if not mid:
-                    continue
-                _add(UpstreamModel(
-                    id=mid,
-                    source="upstream",
-                    upstream_url=url,
-                    upstream_name=label,
-                    details=m.get("metadata", {}),
-                ))
-
-    # 2. auto-discover Ollama instances (fast, well-known ports)
-    for m in discover_ollama(host=host):
-        _add(m)
-
-    # 3. auto-discover OpenAI-compatible endpoints (opt-in — can be slow)
-    if scan_openai_ports or cfg.upstreams:
-        for m in discover_openai_endpoints(host=host, skip_ports=skip_ports):
-            _add(m)
-
-    return models
-
-
-def _host_port(url: str) -> tuple[str, int]:
-    """Extract (host, port) from http URL; defaults to port 80."""
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    return p.hostname or "127.0.0.1", p.port or 80

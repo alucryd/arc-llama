@@ -17,7 +17,6 @@ A small static web UI is bundled and served at `/` on the same port as
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -32,17 +31,14 @@ from rich.table import Table
 from arc_llama import __version__
 from arc_llama.config import (
     Config,
-    UpstreamConfig,
     default_config_path,
     init_config_from_detection,
     load_config,
 )
 from arc_llama.detect import detect_gpus, lspci_intel_gpus
 from arc_llama.models import (
-    UpstreamModel,
     add_local_model,
     discover_ggufs,
-    discover_upstreams,
     download_from_hf,
     parse_hf_spec,
     register_discovered,
@@ -476,36 +472,6 @@ def _slugify_for_name(parent: str, file: str) -> str:
 
 
 # ===========================================================================
-# add-upstream
-# ===========================================================================
-
-@cli.command("add-upstream")
-@click.argument("url")
-@click.option("--name", default=None, help="Short label for this upstream (default: hostname).")
-@click.pass_context
-def add_upstream(ctx: click.Context, url: str, name: str | None) -> None:
-    """Add an OpenAI-compatible upstream server. URL is the base, e.g. http://127.0.0.1:11435."""
-    cfg_path: Path = ctx.obj["config_path"]
-    cfg = load_config(cfg_path)
-    url = url.rstrip("/")
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        console.print(f"[red]Invalid URL: {url!r} — include scheme, e.g. http://127.0.0.1:11435[/red]")
-        sys.exit(1)
-    name = name or parsed.hostname or url
-    for u in cfg.upstreams:
-        if u.url.rstrip("/") == url:
-            console.print(f"[yellow]Upstream {url} already registered as '{u.name}'.[/yellow]")
-            sys.exit(1)
-    uc = UpstreamConfig(url=url, name=name)
-    cfg.upstreams.append(uc)
-    _save_or_die(cfg, cfg_path)
-    console.print(f"[green]Added upstream '{name}' → {url}[/green]")
-    console.print("[dim]Run `arc-llama scan --upstreams` to verify it responds.[/dim]")
-
-
-# ===========================================================================
 # scan
 # ===========================================================================
 
@@ -526,96 +492,45 @@ def _do_scan(cfg: Config, extra_paths: list[Path]) -> list:
     "--persist/--no-persist", default=True,
     help="Save the resulting config to disk (default: on). Disable for a dry-run.",
 )
-@click.option(
-    "--upstreams/--no-upstreams", default=True,
-    help="Also probe for upstream models (Ollama, OpenAI-compatible endpoints).",
-)
-@click.option(
-    "--discover-openai", is_flag=True,
-    help="Also scan common OpenAI-compatible ports (8080-8088, 18080). Slow on headless boxes.",
-)
 @click.pass_context
 def scan_cmd(
     ctx: click.Context,
     paths: tuple[str, ...],
     gpu_pci_slot: str | None,
     persist: bool,
-    upstreams: bool,
-    discover_openai: bool,
 ) -> None:
-    """Walk scan paths for GGUFs and auto-register anything new.
-
-    Also probes Ollama ports (11434-11436) unless --no-upstreams is passed.
-    OpenAI-compatible port scanning (8080-8088) is off by default; use
-    --discover-openai to enable it.
-    """
+    """Walk scan paths for GGUFs and auto-register anything new."""
     cfg_path: Path = ctx.obj["config_path"]
     cfg = load_config(cfg_path)
     if not cfg.gpus:
         console.print("[red]No GPUs in config — run [bold]arc-llama init[/bold] first.[/red]")
         sys.exit(1)
     extras = [Path(p) for p in paths]
-
-    # --- GGUF scan (existing) ---
     found = discover_ggufs(cfg, extra_paths=extras)
-    if found:
-        try:
-            added = register_discovered(cfg, found, gpu_pci_slot=gpu_pci_slot)
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            sys.exit(1)
-        if added:
-            if persist:
-                _save_or_die(cfg, cfg_path)
-            console.print(
-                f"[green]Registered {len(added)} new model(s):[/green] "
-                + ", ".join(m.name for m in added)
-            )
-            if not persist:
-                console.print("[dim]--no-persist: config NOT saved.[/dim]")
-        else:
-            console.print(
-                f"[dim]Found {len(found)} GGUF(s); all already registered.[/dim]"
-            )
-    else:
+    if not found:
         scanned = [cfg.paths.models_dir, *cfg.paths.scan_paths, *paths]
         console.print(
             "[yellow]No GGUFs found.[/yellow] Scanned: " + ", ".join(scanned)
         )
-
-    # --- Upstream discovery ---
-    if upstreams:
-        console.print("\n[bold]Probing for upstream models…[/bold]")
-        upstream_models = discover_upstreams(cfg, scan_openai_ports=discover_openai)
-        if upstream_models:
-            by_source: dict[str, list[UpstreamModel]] = {}
-            for m in upstream_models:
-                by_source.setdefault(m.upstream_name, []).append(m)
-            for label, models in sorted(by_source.items()):
-                console.print(
-                    f"  [green]{label}[/green]: "
-                    + ", ".join(m.id for m in models)
-                )
-            console.print(
-                f"[dim]Found {len(upstream_models)} upstream model(s) across "
-                f"{len(by_source)} server(s). These appear in `arc-llama serve` "
-                f"automatically — no registration needed.[/dim]"
-            )
-        elif cfg.upstreams:
-            console.print(
-                "[yellow]No upstream servers responded.[/yellow] "
-                "Check the URLs in [[upstreams]]."
-            )
-        else:
-            console.print(
-                "[dim]No upstream servers found on common ports. "
-                "Add [[upstreams]] entries to your config or use "
-                "`arc-llama add-upstream`.[/dim]"
-            )
-    elif not found:
+        return
+    try:
+        added = register_discovered(cfg, found, gpu_pci_slot=gpu_pci_slot)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    if not added:
         console.print(
-            "[dim]Use --upstreams to also probe for Ollama and OpenAI endpoints.[/dim]"
+            f"[dim]Found {len(found)} GGUF(s); all already registered.[/dim]"
         )
+        return
+    if persist:
+        _save_or_die(cfg, cfg_path)
+    console.print(
+        f"[green]Registered {len(added)} new model(s):[/green] "
+        + ", ".join(m.name for m in added)
+    )
+    if not persist:
+        console.print("[dim]--no-persist: config NOT saved.[/dim]")
 
 
 # ===========================================================================
@@ -645,19 +560,14 @@ def remove(ctx: click.Context, name: str) -> None:
 @cli.command("serve")
 @click.option("--host", default=None, help="Override server host.")
 @click.option("--port", type=int, default=None, help="Override server port.")
-@click.option("--admin-token", default=None, help="Bearer token for destructive admin endpoints.")
 @click.pass_context
-def serve(ctx: click.Context, host: str | None, port: int | None, admin_token: str | None) -> None:
+def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Run the OpenAI-compatible router."""
     cfg = load_config(ctx.obj["config_path"])
     if host:
         cfg.server.host = host
     if port:
         cfg.server.port = port
-    if admin_token:
-        cfg.server.admin_token = admin_token
-    elif os.environ.get("ARC_LLAMA_ADMIN_TOKEN"):
-        cfg.server.admin_token = os.environ.get("ARC_LLAMA_ADMIN_TOKEN")
     if not cfg.models:
         console.print(
             "[yellow]No models registered yet — `arc-llama add` something first.[/yellow]"
@@ -668,7 +578,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None, admin_token: s
         console.print("[red]uvicorn not installed.[/red]")
         sys.exit(1)
     from arc_llama.server import create_app
-    app = create_app(cfg, config_path=ctx.obj["config_path"])
+    app = create_app(cfg)
 
     # Belt-and-suspenders for graceful shutdown: even if uvicorn's lifespan
     # handling misfires (e.g. on SIGTERM during a busy event loop), atexit
@@ -703,6 +613,24 @@ def serve(ctx: click.Context, host: str | None, port: int | None, admin_token: s
             pass
 
     uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="info")
+
+
+# ===========================================================================
+# mtp-info
+# ===========================================================================
+
+@cli.command("mtp-info")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def mtp_info_cmd(path: Path) -> None:
+    """Inspect a GGUF file for MTP-relevant metadata."""
+    from arc_llama.gguf_meta import mtp_info
+    info = mtp_info(path)
+    console.print(f"[bold]GGUF:[/bold] {info['path']}")
+    console.print(f"  architecture:          {info['architecture']}")
+    console.print(f"  block_count:           {info['block_count']}")
+    console.print(f"  nextn_predict_layers:  {info['nextn_predict_layers']}")
+    console.print(f"  has_mtp_heads:         {info['has_mtp_heads']}")
+    console.print(f"  is_hybrid_ssm:         {info['is_hybrid_ssm']}")
 
 
 # ===========================================================================
@@ -742,96 +670,6 @@ WantedBy=default.target
         "Enable with: [bold]systemctl --user daemon-reload && "
         f"systemctl --user enable --now {service_name}[/bold]"
     )
-
-
-# ===========================================================================
-# mtp-info
-# ===========================================================================
-
-@cli.command("mtp-info")
-@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def mtp_info_cmd(path: Path) -> None:
-    """Inspect a GGUF file for MTP-relevant metadata."""
-    from arc_llama.gguf_meta import mtp_info
-    info = mtp_info(path)
-    console.print(f"[bold]GGUF:[/bold] {info['path']}")
-    console.print(f"  architecture:          {info['architecture']}")
-    console.print(f"  block_count:           {info['block_count']}")
-    console.print(f"  nextn_predict_layers:  {info['nextn_predict_layers']}")
-    console.print(f"  has_mtp_heads:         {info['has_mtp_heads']}")
-    console.print(f"  is_hybrid_ssm:         {info['is_hybrid_ssm']}")
-
-
-# ===========================================================================
-# benchmark
-# ===========================================================================
-
-@cli.command("benchmark")
-@click.argument("name")
-@click.option("--server", "server_url", default=None, help="Base URL of arc-llama serve.")
-@click.option("--prompt-tokens", default=512, show_default=True, help="Prompt length to benchmark.")
-@click.option("--gen-tokens", default=128, show_default=True, help="Generation length to benchmark.")
-@click.option(
-    "--sweep-ctx", default=None,
-    help="Comma-separated ctx values to sweep (e.g. 4096,8192,16384).",
-)
-@click.option(
-    "--sweep-kv", default=None,
-    help="Comma-separated KV types to sweep (e.g. q8_0,f16).",
-)
-@click.option("--json", "json_out", is_flag=True, help="Emit JSON instead of pretty tables.")
-@click.pass_context
-def benchmark_cmd(
-    ctx: click.Context,
-    name: str,
-    server_url: str | None,
-    prompt_tokens: int,
-    gen_tokens: int,
-    sweep_ctx: str | None,
-    sweep_kv: str | None,
-    json_out: bool,
-) -> None:
-    """Benchmark prompt-eval and generation speed for a registered model."""
-    import asyncio
-
-    from arc_llama.benchmark import (
-        benchmark_model,
-        benchmark_sweep,
-        print_result,
-        print_sweep_table,
-    )
-    cfg = load_config(ctx.obj["config_path"])
-    if server_url is None:
-        server_url = f"http://{cfg.server.host}:{cfg.server.port}"
-
-    model = cfg.find_model(name)
-    if model is None:
-        console.print(f"[red]Model '{name}' not found in config.[/red]")
-        sys.exit(1)
-
-    if sweep_ctx or sweep_kv:
-        ctx_values = [int(x.strip()) for x in sweep_ctx.split(",")] if sweep_ctx else [model.launch_recipe().ctx]
-        kv_types = [x.strip() for x in sweep_kv.split(",")] if sweep_kv else [model.launch_recipe().cache_type_k.value]
-        results = asyncio.run(benchmark_sweep(
-            server_url, name,
-            ctx_values=ctx_values, kv_types=kv_types,
-            prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
-            cfg=cfg,
-        ))
-        if json_out:
-            click.echo(json.dumps([r.to_dict() for r in results], indent=2))
-        else:
-            print_sweep_table(results)
-    else:
-        result = asyncio.run(benchmark_model(
-            server_url, name,
-            prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
-            cfg=cfg,
-        ))
-        if json_out:
-            click.echo(json.dumps(result.to_dict(), indent=2))
-        else:
-            print_result(result)
 
 
 # ===========================================================================
