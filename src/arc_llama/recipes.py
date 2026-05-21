@@ -47,6 +47,10 @@ class LaunchRecipe:
     temp: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    spec_type: str | None = None
+    """Speculative decoding type, e.g. 'draft-mtp'."""
+    ubatch_size: int | None = None
+    """Ubatch size (-ub). Auto-set to 8 for MTP models to avoid SSM compute-buffer OOM."""
     extra_flags: list[str] = field(default_factory=list)
     """Anything else the user wants appended to the command line verbatim."""
 
@@ -66,6 +70,10 @@ class LaunchRecipe:
             argv += ["--top-p", str(self.top_p)]
         if self.top_k is not None:
             argv += ["--top-k", str(self.top_k)]
+        if self.spec_type:
+            argv += ["--spec-type", self.spec_type]
+        if self.ubatch_size is not None:
+            argv += ["-ub", str(self.ubatch_size)]
         argv += list(self.extra_flags)
         return argv
 

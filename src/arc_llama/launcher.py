@@ -24,6 +24,7 @@ import httpx
 
 from arc_llama.arch import Arch, ArchProfile, profile_for
 from arc_llama.config import Config, GPUConfig, ModelConfig
+from arc_llama.gguf_meta import has_mtp_heads, is_hybrid_ssm
 
 log = logging.getLogger("arc_llama.launcher")
 
@@ -110,6 +111,41 @@ def build_plan(
     profile = profile_for(arch)
     env = build_env(profile, gpu.sycl_index)
     recipe = model.launch_recipe()
+
+    # --- MTP head detection & safety wiring ---
+    mtp_present = has_mtp_heads(model.path)
+    hybrid_ssm = is_hybrid_ssm(model.path)
+
+    # 1. Auto-inject -ub 8 for MTP models (prevents SSM compute-buffer OOM).
+    if mtp_present and recipe.ubatch_size is None:
+        recipe.ubatch_size = 8
+        log.info(
+            "[%s] MTP heads detected; auto-setting ubatch_size=8",
+            model.name,
+        )
+
+    # 2. Warn if the user explicitly asked for draft-mtp on a model that
+    #    does not actually contain MTP heads.
+    if recipe.spec_type == "draft-mtp" and not mtp_present:
+        log.warning(
+            "[%s] recipe.spec_type='draft-mtp' but GGUF has no MTP heads "
+            "(nextn_predict_layers == 0). Speculative decoding will likely "
+            "degenerate or crash.",
+            model.name,
+        )
+
+    # 3. Backend recommendation for hybrid SSM + MTP on Xe2 (Battlemage,
+    #    Lunar Lake). GDN sequential state passes make SYCL MTP net-negative.
+    if mtp_present and hybrid_ssm and arch in (Arch.BATTLEMAGE, Arch.LUNAR_LAKE):
+        log.info(
+            "[%s] Hybrid SSM+attention model with MTP heads on Xe2 (%s): "
+            "SYCL MTP speculative decoding is net-negative here because GDN "
+            "layers force serial state passes. Consider a Vulkan backend "
+            "build for ~+9%% throughput with --spec-type draft-mtp.",
+            model.name,
+            arch.value,
+        )
+
     argv: list[str] = [
         cfg.paths.llama_server,
         "-m", model.path,
