@@ -50,10 +50,13 @@ something useful before lunch.
 ## Quick start
 
 ```bash
-# 1. Install (editable, while we're in alpha)
-git clone https://github.com/offbyonebit/arc-llama
-cd arc-llama
-pip install -e .
+# 1. Install
+pip install arc-llama
+
+# Or install in editable mode for development:
+# git clone https://github.com/offbyonebit/arc-llama
+# cd arc-llama
+# pip install -e .
 
 # 2. Detect GPUs and write a starter config
 arc-llama init --llama-server /path/to/your/built/llama-server
