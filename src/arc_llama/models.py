@@ -74,7 +74,7 @@ def _short_name_from(repo: str, file: str | None) -> str:
     base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-")
     if file:
         # Append the quant tier if obvious from the filename
-        m = re.search(r"(IQ\d[A-Z_]*|Q\d[A-Z_]*|UD-[A-Z0-9_]+)", file, re.IGNORECASE)
+        m = re.search(r"(IQ\d[A-Z0-9_]*|Q\d[A-Z0-9_]*|UD-[A-Z0-9_]+)", file, re.IGNORECASE)
         if m:
             base = f"{base}-{m.group(1).lower()}"
     return base or "model"

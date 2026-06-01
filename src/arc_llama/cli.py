@@ -465,7 +465,7 @@ def _slugify_for_name(parent: str, file: str) -> str:
     base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-")
     if not base:
         base = "model"
-    m = re.search(r"(IQ\d[A-Z_]*|Q\d[A-Z_]*|UD-[A-Z0-9_]+)", file, re.IGNORECASE)
+    m = re.search(r"(IQ\d[A-Z0-9_]*|Q\d[A-Z0-9_]*|UD-[A-Z0-9_]+)", file, re.IGNORECASE)
     if m:
         base = f"{base}-{m.group(1).lower()}"
     return base
