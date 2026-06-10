@@ -178,6 +178,8 @@ class ArcLlamaTUI(App):
             yield DataTable(id="gpus", zebra_stripes=False, cursor_type="row")
             yield Static("Models", classes="panel-title")
             yield DataTable(id="models", zebra_stripes=False, cursor_type="row")
+            yield Static("Upstreams", classes="panel-title")
+            yield DataTable(id="upstreams", zebra_stripes=False, cursor_type="row")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -186,6 +188,8 @@ class ArcLlamaTUI(App):
         gpus.add_columns("PCI", "Arch", "Name", "SYCL", "VRAM", "Enabled")
         models = self.query_one("#models", DataTable)
         models.add_columns("Status", "Name", "GPU", "Port", "ctx", "K/V", "Path")
+        upstreams = self.query_one("#upstreams", DataTable)
+        upstreams.add_columns("Name", "URL", "Models", "Last Fetch")
         await self._refresh()
         self.set_interval(REFRESH_SECONDS, self._refresh)
 
@@ -253,6 +257,18 @@ class ArcLlamaTUI(App):
                 models.move_cursor(row=min(prev_cursor, models.row_count - 1))
             except Exception:
                 pass
+
+        upstreams = self.query_one("#upstreams", DataTable)
+        upstreams.clear()
+        for u in s.get("upstreams", []):
+            last = u.get("last_fetch")
+            last_str = "never" if last is None else f"{last:.0f}s ago"
+            upstreams.add_row(
+                u.get("name", "?"),
+                u.get("url", "?"),
+                str(u.get("model_count", "?")),
+                last_str,
+            )
 
     # ------------------------------------------------------------------
     # Actions

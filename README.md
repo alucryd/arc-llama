@@ -120,6 +120,27 @@ The default swap policy is **single-resident across all GPUs** , pick a model,
 the router stops anything else first. Flip `server.single_resident = false` in
 the config if you want different-GPU models to coexist.
 
+## Upstreams
+
+arc-llama can merge models from other OpenAI-compatible endpoints (e.g. Ollama,
+vLLM, or another arc-llama instance) into its own model list and proxy requests
+to them transparently:
+
+```bash
+# Add an upstream
+arc-llama upstream add ollama http://127.0.0.1:11434
+
+# List upstreams
+arc-llama upstream list
+
+# Remove
+arc-llama upstream remove ollama
+```
+
+Upstream models appear in `/v1/models` with `owned_by: "upstream:NAME"` and are
+routed directly to the upstream endpoint — no local llama-server is started.
+The model list is cached for 30 seconds and refreshed on demand.
+
 ## Configuration reference
 
 `$XDG_CONFIG_HOME/arc-llama/config.toml`:
@@ -161,6 +182,10 @@ cache_type_v     = "q8_0"
 n_gpu_layers     = 999
 parallel         = 1
 extra_flags      = []
+
+[[upstreams]]
+name = "ollama"
+url  = "http://127.0.0.1:11434"
 ```
 
 `kv_class` controls the KV-cache size estimate that `arc-llama add` uses to
@@ -230,12 +255,39 @@ Two front-ends are bundled and both talk to the same admin endpoints
 
 Both use brightness/dim for status (loaded vs idle) , no red/green palettes.
 
+## Container
+
+A Dockerfile is included that builds llama-server with the SYCL backend and
+installs arc-llama in a single image:
+
+```bash
+# Build
+docker build -t arc-llama:latest .
+
+# Run (GPU access required)
+docker run --rm -it \
+  --device /dev/dri:/dev/dri \
+  --group-add video --group-add render \
+  -p 11437:11437 \
+  -v $HOME/models:/models:ro \
+  arc-llama:latest
+```
+
+The entrypoint auto-runs `arc-llama init` on first launch if no config exists,
+then starts `arc-llama serve`. Mount your own `config.toml` for full control:
+
+```bash
+docker run ... \
+  -v $PWD/config.toml:/root/.config/arc-llama/config.toml:ro \
+  arc-llama:latest
+```
+
 ## Roadmap
 
 - Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
 - `arc-llama benchmark` , quick prompt-eval/gen tok/s harness.
 - IPEX-LLM Ollama as an optional backend for users who prefer it.
-- Container image with `llama-server` + arc-llama prebuilt.
+- ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅
 
 ## Contributing
 

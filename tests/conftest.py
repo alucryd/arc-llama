@@ -2,7 +2,39 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from arc_llama.config import Config, GPUConfig, ModelConfig
+
+
+@pytest.fixture
+def make_sysfs_gpu(tmp_path: Path):
+    """Factory fixture that creates fake sysfs PCI device entries."""
+    def _make(slot: str, device_id: int = 0xE211, vram_bytes: int | None = None, driver: str = "xe"):
+        base = tmp_path / "sys" / "bus" / "pci" / "devices" / slot
+        base.mkdir(parents=True)
+        (base / "vendor").write_text("0x8086\n")
+        (base / "device").write_text(f"0x{device_id:04X}\n")
+        (base / "class").write_text("0x030000\n")
+        if driver:
+            drv = base / "driver"
+            drv.mkdir()
+            (drv / "name").write_text(f"{driver}\n")
+            # symlink from driver to device is created by the kernel; we don't need it
+        else:
+            # No driver bound
+            pass
+        if vram_bytes is not None:
+            # Create a fake drm card with VRAM info
+            drm = base / "drm" / "card0"
+            drm.mkdir(parents=True)
+            (drm / "device").mkdir(parents=True, exist_ok=True)
+            (drm / "device" / "mem_info_vram_total").write_text(f"{vram_bytes}\n")
+            (drm / "device" / "mem_info_vram_used").write_text("0\n")
+            # detect.py also looks at the PCI device path directly
+            (base / "mem_info_vram_total").write_text(f"{vram_bytes}\n")
+        return base
+    return _make
 
 
 def make_config(tmp_path: Path, *, single_resident: bool = True) -> Config:

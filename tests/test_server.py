@@ -26,6 +26,7 @@ class FakeRouter:
             display_name="Qwen",
             aliases=["qwen.gguf"],
         )
+        self._servers = {"qwen": FakeBackend()}
 
     def all_models(self):
         return [self.model]
@@ -103,10 +104,97 @@ class FakeAsyncClient:
         self.closed = True
 
 
+class FakeUpstreamManager:
+    def __init__(self, upstreams=None):
+        self._upstreams = upstreams or []
+        self._models = []
+
+    async def models(self):
+        return self._models
+
+    def find_model(self, model_id):
+        return None
+
+    async def proxy(self, upstream, path, body, headers, streaming_ok=True):
+        raise RuntimeError("should not be called")
+
+    def upstreams_status(self):
+        return []
+
+
+class FakeUpstreamModel:
+    def __init__(self, model_id, upstream_name, upstream_url):
+        self.id = model_id
+        self.upstream_name = upstream_name
+        self.upstream_url = upstream_url
+        self.metadata = {}
+
+
+class FakeUpstreamResponse:
+    status_code = 200
+    headers = {"content-type": "application/json", "x-upstream": "upstream-ok"}
+    _content = b'{"upstream": true}'
+    closed = False
+
+    async def aread(self):
+        return self._content
+
+    async def aclose(self):
+        self.closed = True
+
+    async def aiter_raw(self):
+        yield self._content
+
+
+class FakeUpstreamManagerWithModels:
+    def __init__(self, upstreams=None):
+        self._upstreams = upstreams or []
+        self._models = [FakeUpstreamModel("llama3.1", "ollama", "http://127.0.0.1:11434")]
+
+    async def models(self):
+        return self._models
+
+    def find_model(self, model_id):
+        for m in self._models:
+            if m.id == model_id:
+                return m
+        return None
+
+    async def proxy(self, upstream, path, body, headers, streaming_ok=True):
+        resp = FakeUpstreamResponse()
+        return resp
+
+    def upstreams_status(self):
+        return [{"name": "ollama", "url": "http://127.0.0.1:11434", "model_count": 1, "last_fetch": 123.0}]
+
+
+class FakeAsyncClientUpstream:
+    """httpx.AsyncClient that simulates upstream proxy responses."""
+    def __init__(self, timeout=None):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def build_request(self, method, url, content=None, headers=None):
+        return {"method": method, "url": url, "content": content, "headers": headers}
+
+    async def send(self, request, stream=False):
+        resp = FakeUpstreamResponse()
+        return resp
+
+    async def aclose(self):
+        pass
+
+
 def test_non_streaming_proxy_strips_hop_by_hop_headers(monkeypatch):
     import arc_llama.server as server_mod
 
     monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
     monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
     app = create_app()
 
@@ -127,6 +215,7 @@ def test_streaming_proxy_forwards_raw_sse_chunks_and_closes_upstream(monkeypatch
     import arc_llama.server as server_mod
 
     monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
     monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
     app = create_app()
 
@@ -144,3 +233,75 @@ def test_streaming_proxy_forwards_raw_sse_chunks_and_closes_upstream(monkeypatch
     assert response.headers["x-upstream"] == "ok"
     assert "transfer-encoding" not in response.headers
     assert FakeAsyncClient.last_stream.closed is True
+
+
+def test_upstream_model_proxy(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManagerWithModels)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClientUpstream)
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "llama3.1", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"upstream": True}
+    assert response.headers["x-upstream"] == "upstream-ok"
+
+
+def test_list_models_includes_upstream(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManagerWithModels)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    ids = {m["id"] for m in data}
+    assert "qwen" in ids
+    assert "llama3.1" in ids
+    upstream = next(m for m in data if m["id"] == "llama3.1")
+    assert upstream["owned_by"] == "upstream:ollama"
+
+
+def test_admin_status_includes_upstreams(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManagerWithModels)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.get("/admin/status")
+
+    assert response.status_code == 200
+    status = response.json()
+    assert "upstreams" in status
+    assert len(status["upstreams"]) == 1
+    assert status["upstreams"][0]["name"] == "ollama"
+
+
+def test_admin_load_rejects_upstream(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManagerWithModels)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        response = client.post("/admin/load/llama3.1")
+
+    assert response.status_code == 400
+    assert "Upstream model" in response.json()["detail"]

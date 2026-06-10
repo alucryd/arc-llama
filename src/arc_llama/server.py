@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 
 from arc_llama.config import Config, load_config
 from arc_llama.router import Router
+from arc_llama.upstream import UpstreamManager
 
 log = logging.getLogger("arc_llama.server")
 
@@ -51,6 +52,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.router = Router(cfg, log_dir=state_dir)
+        app.state.upstream_mgr = UpstreamManager(cfg.upstreams)
         app.state.cfg = cfg
         try:
             yield
@@ -66,7 +68,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict:
         rt: Router = request.app.state.router
+        mgr: UpstreamManager = request.app.state.upstream_mgr
         data = []
+        # Local models
         for m in rt.all_models():
             srv = rt._servers.get(m.name)
             data.append({
@@ -91,6 +95,22 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                         "created": 0,
                         "metadata": {"canonical": m.name},
                     })
+        # Upstream models
+        try:
+            upstream_models = await mgr.models()
+        except Exception:
+            upstream_models = []
+        for u in upstream_models:
+            data.append({
+                "id": u.id,
+                "object": "model",
+                "owned_by": f"upstream:{u.upstream_name}",
+                "created": 0,
+                "metadata": {
+                    "upstream": u.upstream_name,
+                    **u.metadata,
+                },
+            })
         return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
@@ -135,6 +155,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "name": g.name,
             "enabled": g.enabled,
         } for g in c.gpus]
+        mgr: UpstreamManager = request.app.state.upstream_mgr
         return {
             "server": {
                 "host": c.server.host,
@@ -143,11 +164,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             },
             "gpus": gpus,
             "models": models,
+            "upstreams": mgr.upstreams_status(),
         }
 
     @app.post("/admin/load/{name}")
     async def admin_load(name: str, request: Request) -> dict:
         rt: Router = request.app.state.router
+        mgr: UpstreamManager = request.app.state.upstream_mgr
+        if mgr.find_model(name) is not None:
+            raise HTTPException(status_code=400, detail=f"Upstream model cannot be loaded locally: {name!r}")
         try:
             model, srv = await rt.ensure_active(name)
         except KeyError:
@@ -159,6 +184,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/admin/stop/{name}")
     async def admin_stop(name: str, request: Request) -> dict:
         rt: Router = request.app.state.router
+        mgr: UpstreamManager = request.app.state.upstream_mgr
+        if mgr.find_model(name) is not None:
+            raise HTTPException(status_code=400, detail=f"Upstream model cannot be stopped locally: {name!r}")
         if name not in {m.name for m in rt.all_models()}:
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
         was_running = await rt.stop_one(name)
@@ -184,6 +212,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         from arc_llama.recipes import KVCacheType
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
+        mgr: UpstreamManager = request.app.state.upstream_mgr
+        if mgr.find_model(name) is not None:
+            raise HTTPException(status_code=400, detail=f"Upstream model cannot be edited locally: {name!r}")
         try:
             body = await request.json()
         except Exception as e:
@@ -306,12 +337,48 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
 async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = True):
     rt: Router = request.app.state.router
+    mgr: UpstreamManager = request.app.state.upstream_mgr
     body_bytes = await request.body()
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
     model_query = body.get("model", "")
+
+    # Check upstreams first — they are passive proxies, no llama-server to start.
+    upstream_model = mgr.find_model(model_query)
+    if upstream_model is not None:
+        try:
+            upstream_resp = await mgr.proxy(
+                upstream_model,
+                target_path,
+                body_bytes,
+                {"Content-Type": "application/json"},
+                streaming_ok=streaming_ok,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Upstream error: {e}") from e
+        want_stream = streaming_ok and bool(body.get("stream"))
+        if want_stream:
+            async def close_upstream() -> None:
+                await upstream_resp.aclose()
+            return StreamingResponse(
+                upstream_resp.aiter_raw(),
+                status_code=upstream_resp.status_code,
+                headers=_strip_response_headers(dict(upstream_resp.headers)),
+                media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
+                background=BackgroundTask(close_upstream),
+            )
+        content = await upstream_resp.aread()
+        await upstream_resp.aclose()
+        return Response(
+            content=content,
+            status_code=upstream_resp.status_code,
+            headers=_strip_response_headers(dict(upstream_resp.headers)),
+            media_type=upstream_resp.headers.get("content-type", "application/json"),
+        )
+
+    # Local model — router manages llama-server lifecycle.
     try:
         model, srv = await rt.ensure_active(model_query)
     except KeyError:
