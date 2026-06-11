@@ -190,6 +190,49 @@ class FakeAsyncClientUpstream:
         pass
 
 
+class FakeUpstreamStreamResponse:
+    status_code = 200
+    headers = {
+        "content-type": "text/event-stream",
+        "content-length": "999",
+        "transfer-encoding": "chunked",
+        "x-upstream": "stream-ok",
+    }
+    closed = False
+
+    async def aiter_raw(self):
+        yield b"data: upstream chunk 1\n\n"
+        yield b"data: upstream chunk 2\n\n"
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeUpstreamManagerStreaming:
+    def __init__(self, upstreams=None):
+        self._upstreams = upstreams or []
+        self._models = [FakeUpstreamModel("llama3.1", "ollama", "http://127.0.0.1:11434")]
+        self.last_stream = None
+        self.last_streaming_ok = None
+
+    async def models(self):
+        return self._models
+
+    def find_model(self, model_id):
+        for m in self._models:
+            if m.id == model_id:
+                return m
+        return None
+
+    async def proxy(self, upstream, path, body, headers, streaming_ok=True):
+        self.last_streaming_ok = streaming_ok
+        self.last_stream = FakeUpstreamStreamResponse()
+        return self.last_stream
+
+    def upstreams_status(self):
+        return []
+
+
 def test_non_streaming_proxy_strips_hop_by_hop_headers(monkeypatch):
     import arc_llama.server as server_mod
 
@@ -305,3 +348,30 @@ def test_admin_load_rejects_upstream(monkeypatch):
 
     assert response.status_code == 400
     assert "Upstream model" in response.json()["detail"]
+
+
+def test_upstream_streaming_proxy_forwards_sse_and_closes_upstream(monkeypatch):
+    import arc_llama.server as server_mod
+
+    mgr = FakeUpstreamManagerStreaming()
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", lambda upstreams=None: mgr)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "llama3.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    assert response.status_code == 200
+    assert body == b"data: upstream chunk 1\n\ndata: upstream chunk 2\n\n"
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-upstream"] == "stream-ok"
+    assert "transfer-encoding" not in response.headers
+    assert "content-length" not in response.headers
+    assert mgr.last_streaming_ok is True
+    assert mgr.last_stream.closed is True
