@@ -541,6 +541,8 @@ async function sendMessage() {
   generating = true;
   sendButton.disabled = true;
   inputWrap.classList.add("generating");
+  const streamingDot = $("#streaming-indicator");
+  if (streamingDot) streamingDot.style.opacity = "1";
 
   try {
     await ensureModelLoaded();
