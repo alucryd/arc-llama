@@ -12,9 +12,11 @@ have to discover them the hard way.
 It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
-> [!IMPORTANT]
-> **Status: 0.1 alpha.** Core code is in place. End-to-end runs and tests
-> haven't been exercised yet , issue and PR feedback welcome.
+> [!NOTE]
+> **Status: 0.2 beta.** Tested end-to-end on Battlemage B60. HF download,
+> streaming, and the OpenAI-compatible API all pass. Other SKUs (A770, A380,
+> B580) need community confirmation -- open an issue if something breaks on
+> your card.
 
 ## What you get
 
@@ -285,9 +287,11 @@ docker run ... \
 ## Roadmap
 
 - Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
-- `arc-llama benchmark` , quick prompt-eval/gen tok/s harness.
 - IPEX-LLM Ollama as an optional backend for users who prefer it.
+- ~~HF model download (`arc-llama add org/repo:quant --from-hf`).~~ ✅
+- ~~Streaming response forwarding (`stream: true`).~~ ✅
 - ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅
+- ~~`arc-llama benchmark` , quick prompt-eval/gen tok/s harness.~~ ✅
 
 ## Contributing
 

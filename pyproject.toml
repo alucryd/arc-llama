@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arc-llama"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plug-and-play llama.cpp runtime for Intel Arc GPUs. Auto-detects your card, picks safe SYCL defaults, and exposes an OpenAI-compatible API."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 keywords = ["llama.cpp", "intel", "arc", "sycl", "llm", "inference", "battlemage", "alchemist"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3 :: Only",
