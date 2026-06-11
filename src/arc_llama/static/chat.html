@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chat — arc-llama</title>
+<style>
+:root {
+  --bg: #0d0d12;
+  --bg-elev: #13131a;
+  --bg-code: #0a0a0f;
+  --fg: #e8eaf0;
+  --fg-dim: #9aa3b2;
+  --fg-mute: #5e6675;
+  --accent-deep: #1a6b8a;
+  --accent-bright: #2ab6ff;
+  --accent-gradient: linear-gradient(135deg, #1a6b8a 0%, #2ab6ff 100%);
+  --user-tint: rgba(255, 245, 230, 0.06);
+  --glass: rgba(20, 24, 36, 0.55);
+  --glass-border: rgba(120, 180, 255, 0.10);
+  --radius: 18px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background:
+    radial-gradient(circle at 10% 20%, rgba(26, 107, 138, 0.08) 0%, transparent 35%),
+    radial-gradient(circle at 90% 80%, rgba(42, 182, 255, 0.05) 0%, transparent 30%),
+    var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+a { color: var(--fg-dim); text-decoration: none; }
+a:hover { color: var(--accent-bright); }
+
+header {
+  width: 100%;
+  max-width: 880px;
+  padding: 18px 20px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.brand {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+
+.manager-link {
+  font-size: 13px;
+  color: var(--fg-mute);
+}
+
+.model-bar {
+  width: 100%;
+  max-width: 880px;
+  padding: 8px 20px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.model-select {
+  appearance: none;
+  background: var(--glass);
+  color: var(--fg);
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  padding: 8px 34px 8px 16px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239aa3b2' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  min-width: 220px;
+}
+
+.model-select:focus {
+  outline: none;
+  border-color: var(--accent-bright);
+  box-shadow: 0 0 0 2px rgba(42, 182, 255, 0.15);
+}
+
+.model-select option {
+  background: var(--bg-elev);
+  color: var(--fg);
+}
+
+.model-status {
+  font-size: 12px;
+  color: var(--fg-mute);
+  text-transform: lowercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-status .name {
+  font-weight: 500;
+  color: var(--accent-bright);
+}
+
+.model-status .indicator {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-mute);
+}
+
+.model-status.ready .indicator { background: var(--accent-bright); box-shadow: 0 0 8px var(--accent-bright); }
+.model-status.loading .indicator { background: var(--accent-bright); animation: pulse 1.2s infinite; }
+.model-status.swapping .indicator { background: var(--accent-deep); animation: pulse 1.5s infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+main {
+  flex: 1;
+  width: 100%;
+  max-width: 880px;
+  overflow-y: auto;
+  padding: 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.empty-state {
+  margin: auto;
+  text-align: center;
+  color: var(--fg-mute);
+  font-size: 14px;
+}
+
+.empty-state .glyph {
+  font-size: 32px;
+  margin-bottom: 12px;
+  opacity: 0.35;
+}
+
+.message {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  max-width: 100%;
+  animation: message-in 0.25s ease-out;
+}
+
+@keyframes message-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.message.user {
+  background: linear-gradient(180deg, var(--user-tint) 0%, rgba(20, 24, 36, 0.55) 100%);
+  border-color: rgba(255, 245, 230, 0.08);
+  align-self: flex-end;
+  max-width: 85%;
+}
+
+.message .role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-mute);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.message.user .role { color: rgba(255, 245, 230, 0.55); }
+
+.message .content {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.message.assistant .content {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.message.user .content {
+  font-weight: 350;
+  font-size: 15px;
+}
+
+.token-chunk {
+  opacity: 0.35;
+  transition: opacity 0.25s ease;
+}
+
+.token-chunk.revealed { opacity: 1; }
+
+.message pre {
+  background: var(--bg-code);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 12px 0;
+}
+
+.message pre code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #d4e3f3;
+  background: transparent;
+  padding: 0;
+}
+
+.message code {
+  background: rgba(255,255,255,0.06);
+  padding: 2px 5px;
+  border-radius: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+}
+
+.message p { margin: 0 0 10px; }
+.message p:last-child { margin-bottom: 0; }
+
+.error-card {
+  background: rgba(210, 80, 80, 0.08);
+  border-color: rgba(210, 80, 80, 0.25);
+  color: #e8b0b0;
+}
+
+.error-card .role { color: #e8a0a0; }
+
+.input-area {
+  width: 100%;
+  max-width: 880px;
+  padding: 14px 20px 22px;
+}
+
+.input-wrap {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 22px;
+  padding: 8px 10px 8px 18px;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  transition: box-shadow 0.35s ease, border-color 0.35s ease;
+}
+
+.input-wrap:focus-within {
+  border-color: rgba(42, 182, 255, 0.35);
+}
+
+.input-wrap.generating {
+  animation: input-glow 2s infinite;
+}
+
+@keyframes input-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(42, 182, 255, 0); }
+  50% { box-shadow: 0 0 18px 2px rgba(42, 182, 255, 0.12); }
+}
+
+#message-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.45;
+  resize: none;
+  outline: none;
+  min-height: 24px;
+  max-height: 96px;
+  padding: 8px 0;
+  field-sizing: content;
+}
+
+#send-button {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent-gradient);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.15s ease, filter 0.2s ease;
+}
+
+#send-button:hover { filter: brightness(1.1); }
+#send-button:active { transform: scale(0.95); }
+#send-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.5);
+}
+
+#send-button svg { width: 18px; height: 18px; fill: currentColor; }
+
+.hint {
+  text-align: center;
+  font-size: 12px;
+  color: var(--fg-mute);
+  margin-top: 8px;
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">arc-llama</div>
+  <a class="manager-link" href="/">Model Manager &rarr;</a>
+</header>
+
+<div class="model-bar">
+  <select id="model-select" class="model-select"></select>
+  <div id="model-status" class="model-status swapping">
+    <span class="indicator"></span>
+    <span id="status-text">swapping</span>
+  </div>
+</div>
+
+<main id="chat-log">
+  <div class="empty-state" id="empty-state">
+    <div class="glyph">&#10026;</div>
+    <div>Select a model and send a message to start.</div>
+  </div>
+</main>
+
+<div class="input-area">
+  <div class="input-wrap" id="input-wrap">
+    <textarea id="message-input" rows="1" placeholder="Message arc-llama…"></textarea>
+    <button id="send-button" aria-label="Send">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+    </button>
+  </div>
+  <div class="hint">Enter to send · Shift+Enter for a new line</div>
+</div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const chatLog = $("#chat-log");
+const emptyState = $("#empty-state");
+const modelSelect = $("#model-select");
+const modelStatus = $("#model-status");
+const statusText = $("#status-text");
+const input = $("#message-input");
+const sendButton = $("#send-button");
+const inputWrap = $("#input-wrap");
+
+let models = [];
+let selectedModel = null;
+let loadingModel = null;
+let generating = false;
+let statusPoller = null;
+const conversation = [];
+
+async function fetchModels() {
+  try {
+    const r = await fetch("/v1/models");
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const data = await r.json();
+    const local = (data.data || []).filter(m => m.object === "model" && m.owned_by !== "arc-llama-alias" && !m.owned_by.startsWith("upstream:"));
+    models = local;
+    renderModelPicker();
+  } catch (e) {
+    showError("Could not fetch models: " + e.message);
+  }
+}
+
+function renderModelPicker() {
+  const current = selectedModel || modelSelect.value;
+  modelSelect.innerHTML = "";
+  if (models.length === 0) {
+    const opt = document.createElement("option");
+    opt.textContent = "No models available";
+    opt.disabled = true;
+    opt.selected = true;
+    modelSelect.appendChild(opt);
+    selectedModel = null;
+    updateStatus("swapping");
+    return;
+  }
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.id;
+    modelSelect.appendChild(opt);
+  }
+  if (current && models.some(m => m.id === current)) {
+    modelSelect.value = current;
+    selectedModel = current;
+  } else {
+    selectedModel = models[0].id;
+    modelSelect.value = selectedModel;
+  }
+}
+
+async function fetchStatus() {
+  try {
+    const r = await fetch("/admin/status");
+    if (!r.ok) return;
+    const data = await r.json();
+    const modelMap = new Map((data.models || []).map(m => [m.name, m]));
+    models = models.map(m => {
+      const s = modelMap.get(m.id);
+      if (s) m.loaded = s.loaded;
+      return m;
+    });
+    updatePickerStatus();
+  } catch (e) {
+    // silent — the chat endpoint will surface real errors
+  }
+}
+
+function updatePickerStatus() {
+  const m = models.find(m => m.id === selectedModel);
+  if (!m) {
+    updateStatus("swapping");
+    return;
+  }
+  if (loadingModel === selectedModel) {
+    updateStatus("loading");
+  } else if (m.loaded) {
+    updateStatus("ready");
+  } else {
+    updateStatus("swapping");
+  }
+}
+
+function updateStatus(state) {
+  modelStatus.className = "model-status " + state;
+  statusText.textContent = state;
+}
+
+modelSelect.addEventListener("change", () => {
+  selectedModel = modelSelect.value;
+  loadingModel = null;
+  updatePickerStatus();
+});
+
+function createMessage(role, text = "") {
+  if (emptyState) emptyState.style.display = "none";
+  const div = document.createElement("div");
+  div.className = "message " + role;
+  const roleLabel = document.createElement("div");
+  roleLabel.className = "role";
+  roleLabel.textContent = role === "user" ? "You" : "Assistant";
+  if (role === "assistant") {
+    const indicator = document.createElement("span");
+    indicator.id = "streaming-indicator";
+    indicator.textContent = "●";
+    indicator.style.color = "var(--accent-bright)";
+    indicator.style.opacity = "0";
+    roleLabel.appendChild(indicator);
+  }
+  const content = document.createElement("div");
+  content.className = "content";
+  content.textContent = text;
+  div.appendChild(roleLabel);
+  div.appendChild(content);
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return { div, content };
+}
+
+function showError(text) {
+  const { content } = createMessage("error", text);
+  content.parentElement.classList.add("error-card");
+  content.parentElement.querySelector(".role").textContent = "Error";
+}
+
+async function ensureModelLoaded() {
+  const m = models.find(m => m.id === selectedModel);
+  if (!m) throw new Error("No model selected");
+  if (m.loaded) return;
+  loadingModel = selectedModel;
+  updatePickerStatus();
+  try {
+    const r = await fetch(`/admin/load/${encodeURIComponent(selectedModel)}`, { method: "POST" });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`Load failed: ${r.status} ${t}`);
+    }
+    m.loaded = true;
+  } catch (e) {
+    throw e;
+  } finally {
+    loadingModel = null;
+    updatePickerStatus();
+  }
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || generating || !selectedModel) return;
+
+  input.value = "";
+  input.style.height = "auto";
+  conversation.push({ role: "user", content: text });
+  createMessage("user", text);
+
+  generating = true;
+  sendButton.disabled = true;
+  inputWrap.classList.add("generating");
+
+  try {
+    await ensureModelLoaded();
+  } catch (e) {
+    showError(e.message);
+    finishGeneration();
+    return;
+  }
+
+  const assistantMsg = createMessage("assistant");
+  conversation.push({ role: "assistant", content: "" });
+  const convoIndex = conversation.length - 1;
+
+  let fullText = "";
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: conversation.slice(0, -1),
+        stream: true,
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`${r.status} ${t}`);
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        const chunkText = processSseLine(line);
+        if (chunkText != null) {
+          fullText += chunkText;
+          conversation[convoIndex].content = fullText;
+          appendChunk(assistantMsg.content, chunkText);
+          chatLog.scrollTop = chatLog.scrollHeight;
+        }
+      }
+    }
+    renderMarkdown(assistantMsg.content, fullText);
+  } catch (e) {
+    assistantMsg.div.remove();
+    conversation.pop();
+    showError("Generation failed: " + e.message);
+  } finally {
+    finishGeneration();
+  }
+}
+
+function processSseLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.startsWith("data:")) return null;
+  const payload = trimmed.slice(5).trim();
+  if (payload === "[DONE]") return null;
+  try {
+    const obj = JSON.parse(payload);
+    const delta = obj.choices?.[0]?.delta;
+    if (delta && delta.content != null) return delta.content;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function appendChunk(container, text) {
+  const span = document.createElement("span");
+  span.className = "token-chunk";
+  span.textContent = text;
+  container.appendChild(span);
+  requestAnimationFrame(() => span.classList.add("revealed"));
+}
+
+function renderMarkdown(container, text) {
+  const parts = text.split("```");
+  let html = "";
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      html += escapeHtml(parts[i])
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .split(/\n\n+/)
+        .map(p => p.trim() ? `<p>${p}</p>` : "")
+        .join("");
+    } else {
+      const code = parts[i];
+      const firstBreak = code.indexOf("\n");
+      const lang = firstBreak > 0 ? code.slice(0, firstBreak).trim() : "";
+      const body = firstBreak >= 0 ? code.slice(firstBreak + 1) : code;
+      html += `<pre><code${lang ? ` class="language-${escapeHtml(lang)}"` : ""}>${escapeHtml(body)}</code></pre>`;
+    }
+  }
+  container.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function finishGeneration() {
+  generating = false;
+  sendButton.disabled = false;
+  inputWrap.classList.remove("generating");
+  const indicator = $("#streaming-indicator");
+  if (indicator) indicator.style.opacity = "0";
+  input.focus();
+}
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+sendButton.addEventListener("click", sendMessage);
+
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 96) + "px";
+});
+
+fetchModels();
+statusPoller = setInterval(fetchStatus, 3000);
+</script>
+</body>
+</html>

@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -329,6 +329,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # Static web UI (optional; only mounted if the static dir is present)
     # ------------------------------------------------------------------
     static_dir = Path(__file__).parent / "static"
+
+    @app.get("/chat")
+    async def chat_page() -> Response:
+        return FileResponse(static_dir / "chat.html")
+
     if static_dir.is_dir():
         app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="ui")
 
