@@ -83,6 +83,10 @@ def default_state_dir() -> Path:
     return _xdg_state_home() / "arc-llama"
 
 
+def default_skills_dir() -> Path:
+    return _xdg_config_home() / "arc-llama" / "skills"
+
+
 @dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
@@ -119,6 +123,8 @@ class PathsConfig:
     """Path to the llama-server binary. Plain `llama-server` resolves via PATH."""
     models_dir: str = field(default_factory=lambda: str(default_models_dir()))
     state_dir: str = field(default_factory=lambda: str(default_state_dir()))
+    skills_dir: str = field(default_factory=lambda: str(default_skills_dir()))
+    """Directory containing user skill Python files."""
     scan_paths: list[str] = field(default_factory=list)
     """Extra directories `arc-llama scan` walks looking for GGUFs. The
     `models_dir` is always scanned in addition to these."""

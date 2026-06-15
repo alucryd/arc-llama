@@ -16,18 +16,27 @@ ships with the install.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import logging
+import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
+from arc_llama.agent import run_agent
+from arc_llama.chat_store import ChatMessage, ChatStore
 from arc_llama.config import Config, load_config
 from arc_llama.router import Router
+from arc_llama.skills import load_skills
 from arc_llama.upstream import UpstreamManager
 
 log = logging.getLogger("arc_llama.server")
@@ -46,7 +55,6 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     state_dir = None
     if cfg.paths.state_dir:
-        from pathlib import Path
         state_dir = Path(cfg.paths.state_dir).expanduser()
 
     @asynccontextmanager
@@ -54,6 +62,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         app.state.router = Router(cfg, log_dir=state_dir)
         app.state.upstream_mgr = UpstreamManager(cfg.upstreams)
         app.state.cfg = cfg
+        app.state.pending_confirmations: dict[str, tuple[asyncio.Event, dict[str, bool]]] = {}
+        if state_dir:
+            app.state.chat_store = ChatStore(state_dir / "chats")
+        else:
+            app.state.chat_store = ChatStore(Path(".arc_llama_chats"))
+        load_skills(cfg.paths.skills_dir)
         try:
             yield
         finally:
@@ -121,6 +135,230 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
         return await _proxy_post(request, "/v1/embeddings", streaming_ok=False)
+
+    @app.post("/v1/agent")
+    async def agent_endpoint(request: Request):
+        """Run the local coding agent and stream tool-execution events.
+
+        Request body:
+            {
+                "model": "model-id",
+                "task": "user task",
+                "auto_confirm": false,
+                "max_turns": 30,
+                "root": "/optional/project/root"
+            }
+
+        Returns a text/event-stream of JSON objects:
+            {"type": "status", "message": "..."}
+            {"type": "assistant", "content": "..."}
+            {"type": "tool_call", "id": "...", "name": "...", "arguments": {...}}
+            {"type": "tool_result", "id": "...", "name": "...", "content": "...", "error": false}
+            {"type": "confirm_required", "id": "...", "run_id": "...", "tool": "...", "arguments": {...}}
+            {"type": "error", "message": "..."}
+            {"type": "done"}
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+        model = body.get("model")
+        task = body.get("task")
+        if not model or not task:
+            raise HTTPException(status_code=400, detail="'model' and 'task' are required")
+
+        auto_confirm = bool(body.get("auto_confirm", False))
+        max_turns = int(body.get("max_turns", 30))
+        root = Path(body.get("root", ".")).resolve()
+
+        run_id = str(uuid.uuid4())
+        pending = request.app.state.pending_confirmations
+        confirm_event = asyncio.Event()
+        confirm_result: dict[str, bool] = {"approved": False}
+        pending[run_id] = (confirm_event, confirm_result)
+
+        base_url = f"http://{cfg.server.host}:{cfg.server.port}"
+        chat_store: ChatStore = request.app.state.chat_store
+
+        async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
+            await confirm_event.wait()
+            return confirm_result["approved"]
+
+        async def event_stream() -> AsyncIterator[str]:
+            try:
+                async for event in run_agent(
+                    task=task,
+                    model=model,
+                    base_url=base_url,
+                    root=root,
+                    auto_confirm=auto_confirm,
+                    confirm_callback=confirm_callback,
+                    max_turns=max_turns,
+                    chat_store=chat_store,
+                ):
+                    if event.get("type") == "confirm_required":
+                        event = {**event, "run_id": run_id}
+                    yield f"data: {json.dumps(event)}\n\n"
+            finally:
+                pending.pop(run_id, None)
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    @app.post("/v1/agent/{run_id}/confirm")
+    async def confirm_agent_run(run_id: str, request: Request) -> dict[str, bool]:
+        """Approve or deny a pending agent tool confirmation.
+
+        Request body: {"approved": true|false}
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+        entry = request.app.state.pending_confirmations.get(run_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Run not found or not awaiting confirmation")
+
+        event, result = entry
+        result["approved"] = bool(body.get("approved", False))
+        event.set()
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Chat history persistence
+    # ------------------------------------------------------------------
+
+    @app.get("/v1/chats")
+    async def list_chats(request: Request) -> dict[str, Any]:
+        """Return a list of chat summaries ordered by most recently updated first."""
+        store: ChatStore = request.app.state.chat_store
+        chats = store.list_chats()
+        return {"object": "list", "data": [c.summary() for c in chats]}
+
+    @app.post("/v1/chats")
+    async def create_chat(request: Request) -> dict[str, Any]:
+        """Create a new chat.
+
+        Body: {"id": "optional-id", "title": "optional title"}
+        If no id is provided a UUID is generated.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+        chat_id = body.get("id") or str(uuid.uuid4())
+        title = body.get("title") or "Untitled chat"
+        store: ChatStore = request.app.state.chat_store
+        try:
+            chat = store.create(chat_id, title)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail=f"Chat already exists: {chat_id}") from None
+        return chat.to_dict()
+
+    @app.get("/v1/chats/{chat_id}")
+    async def get_chat(chat_id: str, request: Request) -> dict[str, Any]:
+        """Return a full chat including all messages."""
+        store: ChatStore = request.app.state.chat_store
+        chat = store.get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return chat.to_dict()
+
+    @app.put("/v1/chats/{chat_id}")
+    async def update_chat(chat_id: str, request: Request) -> dict[str, Any]:
+        """Replace an entire chat (title and/or messages)."""
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+        store: ChatStore = request.app.state.chat_store
+        chat = store.get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        if "title" in body:
+            chat.title = str(body["title"])
+        if "messages" in body and isinstance(body["messages"], list):
+            chat.messages = [ChatMessage.from_dict(m) for m in body["messages"]]
+        store.save(chat)
+        return chat.to_dict()
+
+    @app.patch("/v1/chats/{chat_id}")
+    async def patch_chat(chat_id: str, request: Request) -> dict[str, Any]:
+        """Append messages or update a chat's title without replacing everything.
+
+        Body:
+            {
+                "title": "new title",          // optional
+                "messages": [                  // optional; appended to existing
+                    {"role": "user", "content": "..."},
+                    ...
+                ]
+            }
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        store: ChatStore = request.app.state.chat_store
+        chat = store.get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        if "title" in body:
+            chat.title = str(body["title"])
+        if "messages" in body and isinstance(body["messages"], list):
+            for m in body["messages"]:
+                chat.messages.append(ChatMessage.from_dict(m))
+        store.save(chat)
+        return chat.to_dict()
+
+    @app.delete("/v1/chats/{chat_id}")
+    async def delete_chat(chat_id: str, request: Request) -> dict[str, Any]:
+        """Delete a chat permanently."""
+        store: ChatStore = request.app.state.chat_store
+        if not store.delete(chat_id):
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return {"deleted": True}
+
+    @app.post("/v1/chats/search")
+    async def search_chats(request: Request) -> dict[str, Any]:
+        """Search chat titles and messages.
+
+        Body: {"query": "string", "limit": 20}
+        Returns matching chats with the indices of matching messages.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        query = body.get("query", "")
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        limit = int(body.get("limit", 20))
+        store: ChatStore = request.app.state.chat_store
+        results = store.search(query, limit=limit)
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "chat": chat.summary(),
+                    "matching_message_indices": indices,
+                }
+                for chat, indices in results
+            ],
+        }
 
     # ------------------------------------------------------------------
     # Admin (used by the web UI / TUI)
@@ -198,6 +436,40 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         stopped = await rt.stop_all()
         return {"stopped": stopped}
 
+    @app.post("/admin/parse-pdf")
+    async def admin_parse_pdf(file: UploadFile) -> dict:
+        """Extract text from an uploaded PDF using pypdf.
+
+        Returns the original filename and the concatenated text of all pages.
+        The endpoint is lazy about importing pypdf so the rest of the server
+        starts fine even when the optional dependency is missing.
+        """
+        try:
+            from pypdf import PdfReader  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise HTTPException(
+                status_code=501,
+                detail="PDF parsing is not available; install pypdf: pip install pypdf",
+            ) from e
+
+        if not file.filename or not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+        try:
+            content = await file.read()
+            if len(content) > 50 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="PDF must be under 50 MB")
+            reader = PdfReader(io.BytesIO(content))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not parse PDF: {e}") from e
+        finally:
+            await file.close()
+
+        return {"filename": file.filename, "text": text}
+
     @app.post("/admin/models/{name}/edit")
     async def admin_edit_model(name: str, request: Request) -> dict:
         """Update a model's recipe in-place.
@@ -273,7 +545,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             try:
                 ub = int(body["ubatch_size"])
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="ubatch_size must be an integer")
+                raise HTTPException(status_code=400, detail="ubatch_size must be an integer") from None
             if not (1 <= ub <= 4096):
                 raise HTTPException(status_code=400, detail="ubatch_size must be 1..4096")
             recipe["ubatch_size"] = ub
@@ -351,6 +623,10 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     model_query = body.get("model", "")
 
     # Check upstreams first — they are passive proxies, no llama-server to start.
+    # Ensure the model list cache is warm before looking up the model id; otherwise
+    # the very first chat request after startup can incorrectly 404 an upstream
+    # model until /v1/models has been queried.
+    await mgr.models()
     upstream_model = mgr.find_model(model_query)
     if upstream_model is not None:
         try:

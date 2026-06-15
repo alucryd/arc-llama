@@ -1,4 +1,4 @@
-// arc-llama web UI: thin polling client over /admin/status + /admin/load|stop.
+// arc-llama model manager — polling client over /admin/status + /admin/load|stop.
 
 const $ = (sel) => document.querySelector(sel);
 const fmtVram = (mb) => mb == null ? "?" : `${(mb / 1024).toFixed(1)} GB`;
@@ -18,14 +18,19 @@ async function fetchStatus(force) {
   if (editingModel && !force) return;
   if (inflight) return;
   inflight = true;
+  const footer = $("#status-footer");
   try {
     const r = await fetch("/admin/status");
     if (!r.ok) throw new Error(`status ${r.status}`);
     lastStatus = await r.json();
     render(lastStatus);
     $("#last-updated").textContent = `updated ${new Date().toLocaleTimeString()}`;
+    footer.classList.remove("error");
+    footer.classList.add("online");
   } catch (e) {
     $("#last-updated").textContent = `error: ${e.message}`;
+    footer.classList.remove("online");
+    footer.classList.add("error");
   } finally {
     inflight = false;
   }
@@ -39,7 +44,7 @@ async function postAction(path, label) {
       alert(`${label} failed: ${r.status} ${t}`);
       return;
     }
-    await fetchStatus();
+    await fetchStatus(true);
   } catch (e) {
     alert(`${label} error: ${e.message}`);
   }
@@ -58,31 +63,53 @@ function render(s) {
   // GPUs
   const gpuBody = $("#gpus tbody");
   gpuBody.innerHTML = "";
-  for (const g of s.gpus) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${g.pci_slot}</td>
-      <td>${g.arch}</td>
-      <td>${g.name || "—"}</td>
-      <td>level_zero:${g.sycl_index}</td>
-      <td>${fmtVram(g.vram_mb)}</td>
-      <td>${g.enabled ? "yes" : "no"}</td>
-    `;
-    gpuBody.appendChild(tr);
+  if (!s.gpus || s.gpus.length === 0) {
+    renderEmpty(gpuBody, 6, "No GPUs detected", "Enable a device in config to make it available for model loading.");
+  } else {
+    for (const g of s.gpus) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${g.pci_slot}</td>
+        <td>${g.arch}</td>
+        <td>${g.name || "—"}</td>
+        <td class="mono">level_zero:${g.sycl_index}</td>
+        <td>${fmtVram(g.vram_mb)}</td>
+        <td><span class="pill ${g.enabled ? "loaded" : "idle"}">${g.enabled ? "yes" : "no"}</span></td>
+      `;
+      gpuBody.appendChild(tr);
+    }
   }
 
   // Models
   const modelBody = $("#models tbody");
   modelBody.innerHTML = "";
-  for (const m of s.models) {
-    const tr = document.createElement("tr");
-    if (editingModel === m.name) {
-      renderEditRow(tr, m);
-    } else {
-      renderViewRow(tr, m);
+  if (!s.models || s.models.length === 0) {
+    renderEmpty(modelBody, 8, "No models registered", "Click Scan for models to discover GGUF files, or add upstream endpoints in config.");
+  } else {
+    for (const m of s.models) {
+      const tr = document.createElement("tr");
+      if (editingModel === m.name) {
+        renderEditRow(tr, m);
+      } else {
+        renderViewRow(tr, m);
+      }
+      modelBody.appendChild(tr);
     }
-    modelBody.appendChild(tr);
   }
+}
+
+function renderEmpty(tbody, colspan, title, hint) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td colspan="${colspan}">
+      <div class="empty-state">
+        <div class="icon">∅</div>
+        <div class="title">${title}</div>
+        <div class="hint">${hint}</div>
+      </div>
+    </td>
+  `;
+  tbody.appendChild(tr);
 }
 
 function renderViewRow(tr, m) {
@@ -99,17 +126,15 @@ function renderViewRow(tr, m) {
     : m.name;
   tr.innerHTML = `
     <td>${pill}</td>
-    <td>${nameCell}</td>
-    <td>${m.gpu_pci_slot || "—"}${isUpstream ? " *" : ""}</td>
-    <td>${m.port || "—"}</td>
-    <td>${m.ctx ?? "?"}</td>
-    <td>${kv}</td>
+    <td><strong>${nameCell}</strong></td>
+    <td class="mono">${m.gpu_pci_slot || "—"}${isUpstream ? " *" : ""}</td>
+    <td class="mono">${m.port || "—"}</td>
+    <td class="mono">${m.ctx ?? "?"}</td>
+    <td class="mono">${kv}</td>
     <td class="path" title="${m.path || ""}">${isUpstream ? "— " : fmtPath(m.path)}</td>
     <td class="actions"></td>
   `;
   const actions = tr.querySelector(".actions");
-  const wrap = document.createElement("div");
-  wrap.className = "row-actions";
 
   if (isUpstream) {
     // Upstream models show a "via" link instead of load/stop
@@ -118,7 +143,11 @@ function renderViewRow(tr, m) {
     via.textContent = m.upstream_name;
     actions.appendChild(via);
   } else {
+    const wrap = document.createElement("div");
+    wrap.className = "row-actions";
+
     const editBtn = document.createElement("button");
+    editBtn.className = "secondary";
     editBtn.textContent = "Edit";
     editBtn.onclick = () => {
       editingModel = m.name;
@@ -128,11 +157,13 @@ function renderViewRow(tr, m) {
 
     if (m.loaded) {
       const stop = document.createElement("button");
+      stop.className = "danger";
       stop.textContent = "Stop";
       stop.onclick = () => postAction(`/admin/stop/${encodeURIComponent(m.name)}`, "stop");
       wrap.appendChild(stop);
     } else {
       const load = document.createElement("button");
+      load.className = "primary";
       load.textContent = "Load";
       load.onclick = () => postAction(`/admin/load/${encodeURIComponent(m.name)}`, "load");
       wrap.appendChild(load);
@@ -151,13 +182,15 @@ function renderEditRow(tr, m) {
   ).join("");
   tr.innerHTML = `
     <td><span class="pill warn">editing</span></td>
-    <td>${m.name}</td>
-    <td>${m.gpu_pci_slot}</td>
-    <td>${m.port}</td>
+    <td><strong>${m.name}</strong></td>
+    <td class="mono">${m.gpu_pci_slot}</td>
+    <td class="mono">${m.port}</td>
     <td><input class="edit-field" type="number" min="256" max="1048576" step="1024" value="${m.ctx ?? 8192}" data-field="ctx"/></td>
     <td>
-      <select class="edit-field" data-field="cache_type_k">${optsK}</select>
-      <select class="edit-field" data-field="cache_type_v" style="margin-top:2px">${optsV}</select>
+      <div class="kv-selects">
+        <select class="edit-field" data-field="cache_type_k">${optsK}</select>
+        <select class="edit-field" data-field="cache_type_v">${optsV}</select>
+      </div>
     </td>
     <td class="path" title="${m.path}">${fmtPath(m.path)}</td>
     <td class="actions"></td>
@@ -167,6 +200,7 @@ function renderEditRow(tr, m) {
   wrap.className = "row-actions";
 
   const save = document.createElement("button");
+  save.className = "primary";
   save.textContent = "Save";
   save.onclick = async () => {
     const ctx = parseInt(tr.querySelector('[data-field="ctx"]').value, 10);
@@ -199,6 +233,7 @@ function renderEditRow(tr, m) {
   wrap.appendChild(save);
 
   const cancel = document.createElement("button");
+  cancel.className = "secondary";
   cancel.textContent = "Cancel";
   cancel.onclick = () => { editingModel = null; fetchStatus(true); };
   wrap.appendChild(cancel);

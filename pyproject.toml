@@ -27,6 +27,8 @@ dependencies = [
     "rich>=13.0",
     "huggingface-hub>=0.20",
     "gguf>=0.10",
+    "pypdf>=5.0",
+    "python-multipart>=0.0.12",
 ]
 
 [project.optional-dependencies]
