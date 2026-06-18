@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,8 @@ from arc_llama.models import (
 )
 
 console = Console()
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -137,8 +140,14 @@ def init(
         sys.exit(1)
     gpus = detect_gpus()
     if not gpus:
-        console.print("[red]No Intel GPUs detected.[/red]")
-        console.print("Run [bold]arc-llama doctor[/bold] for a diagnosis.")
+        if _IS_WINDOWS:
+            console.print(
+                "[yellow]No Intel GPUs detected — Windows auto-detection is not "
+                "supported yet. Create a config manually or run this on WSL.[/yellow]"
+            )
+        else:
+            console.print("[red]No Intel GPUs detected.[/red]")
+            console.print("Run [bold]arc-llama doctor[/bold] for a diagnosis.")
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
     cfg = init_config_from_detection(gpus, llama_server_path=server_path)
@@ -178,12 +187,19 @@ def doctor(ctx: click.Context) -> None:
     config_path: Path = ctx.obj["config_path"]
     console.print("[bold]arc-llama doctor[/bold]\n")
 
-    # Kernel + driver
-    console.print(f"  kernel:        {os.uname().release}")
-    has_xe = Path("/sys/module/xe").exists()
-    has_i915 = Path("/sys/module/i915").exists()
-    console.print(f"  xe driver:     {'loaded' if has_xe else 'not loaded'}")
-    console.print(f"  i915 driver:   {'loaded' if has_i915 else 'not loaded'}")
+    # Kernel + driver (Linux-only diagnostics)
+    if _IS_WINDOWS:
+        console.print(f"  platform:      Windows {platform.release()}")
+        console.print(
+            "  [dim]Kernel/driver checks are not available on Windows.[/dim]"
+        )
+    else:
+        uname = platform.uname()
+        console.print(f"  kernel:        {uname.release}")
+        has_xe = Path("/sys/module/xe").exists()
+        has_i915 = Path("/sys/module/i915").exists()
+        console.print(f"  xe driver:     {'loaded' if has_xe else 'not loaded'}")
+        console.print(f"  i915 driver:   {'loaded' if has_i915 else 'not loaded'}")
 
     # GPU detection (enrich=True so clinfo populates VRAM where xe doesn't via sysfs)
     gpus = detect_gpus(enrich=True)
@@ -214,33 +230,49 @@ def doctor(ctx: click.Context) -> None:
         path = shutil.which(tool)
         console.print(f"    {tool:<14} {path or '— missing —'}")
 
-    # Permissions
-    console.print("\n  user groups:")
-    try:
-        out = subprocess.run(["id", "-nG"], capture_output=True, text=True, timeout=2)
-        groups = out.stdout.split()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        groups = []
-    for needed in ("render", "video"):
-        ok = needed in groups
-        marker = "[green]ok[/green]" if ok else "[yellow]missing[/yellow]"
-        console.print(f"    {needed:<14} {marker}")
-    if "render" not in groups or "video" not in groups:
-        console.print(
-            "    [yellow]→ add yourself with `sudo usermod -aG render,video $USER` "
-            "and re-login.[/yellow]"
-        )
+    # Permissions (Linux-only)
+    if _IS_WINDOWS:
+        console.print("\n  user groups:")
+        console.print("    [dim]Group checks are not available on Windows.[/dim]")
+    else:
+        console.print("\n  user groups:")
+        try:
+            out = subprocess.run(["id", "-nG"], capture_output=True, text=True, timeout=2)
+            groups = out.stdout.split()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            groups = []
+        for needed in ("render", "video"):
+            ok = needed in groups
+            marker = "[green]ok[/green]" if ok else "[yellow]missing[/yellow]"
+            console.print(f"    {needed:<14} {marker}")
+        if "render" not in groups or "video" not in groups:
+            console.print(
+                "    [yellow]→ add yourself with `sudo usermod -aG render,video $USER` "
+                "and re-login.[/yellow]"
+            )
 
     # oneAPI
-    oneapi_setvars = Path("/opt/intel/oneapi/setvars.sh")
     console.print("\n  oneAPI:")
-    if oneapi_setvars.exists():
-        console.print(f"    setvars.sh:   {oneapi_setvars}")
+    if _IS_WINDOWS:
+        oneapi_setvars = Path(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        ) / "Intel" / "oneAPI" / "setvars.bat"
+        if oneapi_setvars.exists():
+            console.print(f"    setvars.bat:  {oneapi_setvars}")
+        else:
+            console.print(
+                "    [yellow]Intel oneAPI setvars.bat not found — install Intel "
+                "oneAPI Base Toolkit if you're building llama.cpp from source.[/yellow]"
+            )
     else:
-        console.print(
-            "    [yellow]/opt/intel/oneapi/setvars.sh missing — install Intel "
-            "oneAPI Base Toolkit if you're building llama.cpp from source.[/yellow]"
-        )
+        oneapi_setvars = Path("/opt/intel/oneapi/setvars.sh")
+        if oneapi_setvars.exists():
+            console.print(f"    setvars.sh:   {oneapi_setvars}")
+        else:
+            console.print(
+                "    [yellow]/opt/intel/oneapi/setvars.sh missing — install Intel "
+                "oneAPI Base Toolkit if you're building llama.cpp from source.[/yellow]"
+            )
 
     # Config
     console.print("\n  config:")
@@ -604,9 +636,14 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         _shutdown_subprocesses()
         # Re-raise as default so uvicorn's own handler (or python) finishes the job.
         _signal.signal(signum, _signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        if _IS_WINDOWS:
+            sys.exit(0)
+        else:
+            os.kill(os.getpid(), signum)
 
-    for s in (_signal.SIGTERM, _signal.SIGINT):
+    for s in (getattr(_signal, "SIGTERM", None), _signal.SIGINT):
+        if s is None:
+            continue
         try:
             _signal.signal(s, _on_signal)
         except (OSError, ValueError):
@@ -643,6 +680,9 @@ def mtp_info_cmd(path: Path) -> None:
 @click.option("--write", is_flag=True, help="Write the unit to ~/.config/systemd/user/")
 def systemd_unit(service_name: str, description: str, write: bool) -> None:
     """Print (or write) a systemd --user unit for `arc-llama serve`."""
+    if _IS_WINDOWS:
+        console.print("[red]systemd is not available on Windows.[/red]")
+        sys.exit(1)
     arc = shutil.which("arc-llama")
     if not arc:
         arc = str(Path(sys.argv[0]).resolve())

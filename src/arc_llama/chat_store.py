@@ -27,7 +27,7 @@ class ChatMessage:
         return {"role": self.role, "content": self.content, "timestamp": self.timestamp}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ChatMessage":
+    def from_dict(cls, data: dict[str, Any]) -> ChatMessage:
         return cls(
             role=data.get("role", ""),
             content=data.get("content", ""),
@@ -55,7 +55,7 @@ class Chat:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Chat":
+    def from_dict(cls, data: dict[str, Any]) -> Chat:
         return cls(
             id=data.get("id", ""),
             title=data.get("title", "Untitled chat"),

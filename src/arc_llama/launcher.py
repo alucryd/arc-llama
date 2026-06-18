@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,11 @@ log = logging.getLogger("arc_llama.launcher")
 
 DEFAULT_HEALTH_TIMEOUT = 120  # seconds — generous for cold-start SYCL JIT
 HEALTH_POLL_INTERVAL = 1.5
+
+_IS_WINDOWS = sys.platform == "win32"
+# Not defined on POSIX. Fallback lets the Windows code path stay import-safe
+# when exercised under tests that monkeypatch _IS_WINDOWS on a Linux runner.
+_CTRL_BREAK_EVENT = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM)
 
 # Linux prctl(2) constant. We don't import a real binding — one syscall.
 _PR_SET_PDEATHSIG = 1
@@ -190,12 +196,22 @@ class LlamaServer:
             stdout = self._log_file
             stderr = subprocess.STDOUT
         log.info("[%s] starting: %s", self.name, " ".join(self.plan.argv))
+        popen_kwargs: dict[str, Any] = {}
+        if _IS_WINDOWS:
+            # A new process group lets us terminate the whole subtree cleanly
+            # without Unix-specific killpg. The constant is only defined on
+            # Windows; the getattr guard keeps tests on Linux valid.
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["preexec_fn"] = _preexec_isolate_and_pdeathsig
         self.process = subprocess.Popen(
             self.plan.argv,
             env=self.plan.env,
             stdout=stdout,
             stderr=stderr,
-            preexec_fn=_preexec_isolate_and_pdeathsig,
+            **popen_kwargs,
         )
         self.started_at = time.time()
 
@@ -221,22 +237,48 @@ class LlamaServer:
         proc = self.process
         assert proc is not None
         log.info("[%s] stopping pid=%s", self.name, proc.pid)
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=drain_seconds)
-        except subprocess.TimeoutExpired:
-            log.warning("[%s] SIGTERM timed out, sending SIGKILL", self.name)
+        if _IS_WINDOWS:
+            # proc.terminate()/kill() both just call TerminateProcess on Windows —
+            # there's no graceful/forceful distinction, and neither touches child
+            # processes. CTRL_BREAK_EVENT goes to the whole CREATE_NEW_PROCESS_GROUP
+            # (the closest equivalent to SIGTERM here); taskkill /T kills the whole
+            # subtree, mirroring killpg on the Linux side below.
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                proc.send_signal(_CTRL_BREAK_EVENT)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=drain_seconds)
+            except subprocess.TimeoutExpired:
+                log.warning(
+                    "[%s] CTRL_BREAK timed out, force-killing process tree", self.name
+                )
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=drain_seconds,
+                )
+                try:
+                    proc.wait(timeout=drain_seconds)
+                except subprocess.TimeoutExpired:
+                    pass
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
                 proc.wait(timeout=drain_seconds)
             except subprocess.TimeoutExpired:
-                pass
+                log.warning("[%s] SIGTERM timed out, sending SIGKILL", self.name)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=drain_seconds)
+                except subprocess.TimeoutExpired:
+                    pass
         self.process = None
         self.started_at = None
         if self._log_file is not None:

@@ -60,14 +60,24 @@ CONFIG_VERSION = 1
 
 
 def _xdg_config_home() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 
 
 def _xdg_data_home() -> Path:
+    if sys.platform == "win32":
+        return Path(
+            os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        )
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 
 
 def _xdg_state_home() -> Path:
+    if sys.platform == "win32":
+        return Path(
+            os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        )
     return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
 
 

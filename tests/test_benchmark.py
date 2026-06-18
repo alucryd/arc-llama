@@ -1,7 +1,6 @@
 """Tests for arc_llama.benchmark — measurement, formatting, sweep."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 

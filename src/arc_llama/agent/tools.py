@@ -14,6 +14,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -391,6 +392,9 @@ def run_command(command: str, root: Path, timeout: float = 60.0) -> ToolResult:
             f"Error: git history-mutating command '{bad_prefix}' is not allowed.",
             error=True,
         )
+    env = os.environ.copy()
+    if sys.platform != "win32":
+        env.update({"PS1": "", "TERM": "dumb"})
     try:
         result = subprocess.run(
             command,
@@ -399,7 +403,7 @@ def run_command(command: str, root: Path, timeout: float = 60.0) -> ToolResult:
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "PS1": "", "TERM": "dumb"},
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return ToolResult(

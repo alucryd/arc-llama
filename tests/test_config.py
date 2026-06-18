@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from arc_llama.config import Config, GPUConfig, ModelConfig, load_config
 
 
@@ -57,3 +59,18 @@ def test_find_model_matches_name_alias_display_name_and_filename(tmp_path):
     assert cfg.find_model("qwen 3").name == "qwen"
     assert cfg.find_model("Q4_K_M").name == "qwen"
     assert cfg.find_model("missing") is None
+
+
+def test_windows_default_paths_use_appdata(monkeypatch):
+    import os
+
+    from arc_llama import config as config_mod
+
+    monkeypatch.setattr(config_mod.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", r"C:\Users\test\AppData\Roaming")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\test\AppData\Local")
+    appdata = Path(os.environ["APPDATA"])
+    localappdata = Path(os.environ["LOCALAPPDATA"])
+    assert config_mod.default_config_path() == appdata / "arc-llama" / "config.toml"
+    assert config_mod.default_models_dir() == localappdata / "arc-llama" / "models"
+    assert config_mod.default_state_dir() == localappdata / "arc-llama"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -191,7 +192,6 @@ class TestLlamaServerLifecycle:
         srv.started_at = 0.0
 
         import httpx
-        original_get = httpx.AsyncClient.get
 
         async def _fake_get(self, url):
             if "/health" in url:
@@ -225,3 +225,100 @@ class TestLlamaServerLifecycle:
         # Should not raise when not running
         srv.stop()
         assert srv.is_running is False
+
+
+class TestWindowsLifecycle:
+    def test_start_uses_create_new_process_group(self, monkeypatch, tmp_path):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        log_dir = tmp_path / "logs"
+        called = {}
+        original_popen = subprocess.Popen
+
+        def _fake_popen(*args, **kwargs):
+            called["kwargs"] = kwargs
+            class FakeProc:
+                pid = 12345
+                def poll(self):
+                    return None
+            return FakeProc()
+
+        subprocess.Popen = _fake_popen
+        try:
+            srv.start(log_dir=log_dir)
+        finally:
+            subprocess.Popen = original_popen
+        assert called["kwargs"]["creationflags"] == getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        assert "preexec_fn" not in called["kwargs"]
+
+    def test_stop_sends_ctrl_break_then_force_kills_tree_on_timeout(self, monkeypatch):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        calls = []
+
+        class FakeProc:
+            pid = 12345
+            def poll(self):
+                return None
+            def send_signal(self, sig):
+                calls.append(("send_signal", sig))
+            def wait(self, timeout):
+                if not any(c[0] == "taskkill" for c in calls):
+                    raise subprocess.TimeoutExpired("cmd", timeout)
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(("taskkill", cmd))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        srv.process = FakeProc()
+        srv.stop(drain_seconds=0.1)
+        assert calls[0] == ("send_signal", launcher_mod._CTRL_BREAK_EVENT)
+        assert calls[1][0] == "taskkill"
+        assert calls[1][1] == ["taskkill", "/F", "/T", "/PID", "12345"]
+
+    def test_stop_skips_force_kill_when_ctrl_break_succeeds(self, monkeypatch):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        calls = []
+
+        class FakeProc:
+            pid = 12345
+            def poll(self):
+                return None
+            def send_signal(self, sig):
+                calls.append(("send_signal", sig))
+            def wait(self, timeout):
+                return None
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(("taskkill", cmd))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        srv.process = FakeProc()
+        srv.stop(drain_seconds=0.1)
+        assert calls == [("send_signal", launcher_mod._CTRL_BREAK_EVENT)]

@@ -328,13 +328,14 @@ function renderHistoryPanel() {
     const card = document.createElement("div");
     card.className = "h-card";
     card.dataset.id = c.id;
+    const ICON_CLOSE = '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
     card.innerHTML = `
       <div class="h-card-title">${escapeHtml(c.title)}</div>
       <div class="h-card-meta">
         <span>${escapeHtml(c.model || "unknown")}</span>
         <span>${formatRelativeTime(c.updatedAt)}</span>
       </div>
-      <button class="h-delete" aria-label="Delete chat">✕</button>
+      <button class="h-delete" aria-label="Delete chat">${ICON_CLOSE}</button>
     `;
     card.addEventListener("click", (e) => {
       if (e.target.closest(".h-delete")) return;
@@ -403,7 +404,7 @@ async function loadChat(id) {
   historyToggle.classList.remove("open");
   const m = models.find(x => x.id === selectedModel);
   updateCtxMeter(estimateTokens(), m?.ctx || 131072);
-  chatLog.scrollTop = chatLog.scrollHeight;
+  if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
   input.focus();
 }
 
@@ -633,7 +634,7 @@ function createMessage(role, text = "") {
   content.textContent = text;
   div.appendChild(content);
   chatLog.appendChild(div);
-  chatLog.scrollTop = chatLog.scrollHeight;
+  if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
   return { div, content };
 }
 
@@ -748,15 +749,19 @@ async function sendMessage() {
             if (newContent) {
               conversation[convoIndex].content = parsed.content;
               appendChunk(assistantMsg.content, newContent);
-              chatLog.scrollTop = chatLog.scrollHeight;
+              if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
             }
-            if (currentThinking) {
-              const thinkingBlock = assistantMsg.div.querySelector(".thinking-block");
-              if (thinkingBlock && thinkingBlock.style.display === "none") {
+            const thinkingBlock = assistantMsg.div.querySelector(".thinking-block");
+            const thinkingContent = assistantMsg.div.querySelector(".thinking-content");
+            if (thinkingBlock && thinkingContent) {
+              const trimmedThinking = currentThinking.trim();
+              if (trimmedThinking) {
                 thinkingBlock.style.display = "";
+                thinkingContent.textContent = trimmedThinking;
+              } else {
+                thinkingBlock.style.display = "none";
+                thinkingContent.textContent = "";
               }
-              const thinkingContent = assistantMsg.div.querySelector(".thinking-content");
-              if (thinkingContent) thinkingContent.textContent = currentThinking;
             }
           }
         }
@@ -841,7 +846,7 @@ function parseThinking(text) {
     thinking += (thinking ? "\n" : "") + unclosedThinking[1];
     content = content.replace(/<thinking>[\s\S]*$/, "");
   }
-  return { thinking, content, hasPartialTag: false };
+  return { thinking: thinking.trim(), content: content.trimEnd(), hasPartialTag: false };
 }
 
 function appendChunk(container, text) {
@@ -857,9 +862,15 @@ function renderMarkdown(container, text) {
     container.textContent = text;
     return;
   }
-  const raw = text.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<thinking>[\s\S]*?<\/thinking>/g, "");
+  const raw = text
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
+    .replace(/[\n\r]+$/, "")
+    .trimEnd();
   try {
-    container.innerHTML = marked.parse(raw, { renderer: mdRenderer });
+    let html = marked.parse(raw, { renderer: mdRenderer });
+    html = html.replace(/<p>\s*<\/p>/g, "").replace(/<p><br\s*\/?><\/p>/g, "");
+    container.innerHTML = html;
     attachCopyButtons(container);
   } catch (e) {
     console.warn("Markdown render failed, falling back to plain text", e);
@@ -880,8 +891,9 @@ function renderThinking(messageDiv, thinkingText) {
   const thinkingBlock = messageDiv.querySelector(".thinking-block");
   if (!thinkingBlock) return;
   const thinkingContent = thinkingBlock.querySelector(".thinking-content");
-  thinkingContent.textContent = thinkingText;
-  thinkingBlock.style.display = "";
+  const trimmed = String(thinkingText || "").trim();
+  thinkingContent.textContent = trimmed;
+  thinkingBlock.style.display = trimmed ? "" : "none";
 }
 
 function finishGeneration() {
@@ -890,11 +902,17 @@ function finishGeneration() {
   inputWrap.classList.remove("generating");
   const indicator = $("#streaming-indicator");
   if (indicator) indicator.style.opacity = "0";
-  // Collapse any thinking blocks that are open
+  // Collapse any thinking blocks that are open and hide empty ones
   const openThinking = document.querySelectorAll(".thinking-toggle.open");
   for (const t of openThinking) {
     t.classList.remove("open");
     t.nextElementSibling?.classList.remove("open");
+  }
+  for (const block of document.querySelectorAll(".thinking-block")) {
+    const content = block.querySelector(".thinking-content");
+    if (content && !content.textContent.trim()) {
+      block.style.display = "none";
+    }
   }
   input.focus();
 }
@@ -930,13 +948,15 @@ function renderAttachments() {
     const chip = document.createElement("div");
     chip.className = "attachment-chip" + (a.error ? " error" : a.processing ? " processing" : "");
     chip.dataset.id = a.id;
+    const ICON_CLIP = '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M16.5 6v11.5c0 2.485-2.015 4.5-4.5 4.5S7.5 19.985 7.5 17.5V5c0-1.657 1.343-3 3-3s3 1.343 3 3v12.5c0 .828-.672 1.5-1.5 1.5s-1.5-.672-1.5-1.5V6h-2v11.5c0 1.933 1.567 3.5 3.5 3.5s3.5-1.567 3.5-3.5V5c0-2.761-2.239-5-5-5S5 2.239 5 5v12.5c0 3.59 2.91 6.5 6.5 6.5s6.5-2.91 6.5-6.5V6h-2z"/></svg>';
+    const ICON_CLOSE = '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
     const icon = a.processing ? '<span class="spinner"></span>'
                  : a.error ? '<span>!</span>'
-                 : '<span>📎</span>';
+                 : `<span class="attachment-icon">${ICON_CLIP}</span>`;
     chip.innerHTML = `
       ${icon}
       <span class="filename" title="${escapeHtml(a.file.name)}">${escapeHtml(a.file.name)}</span>
-      <button class="remove" aria-label="Remove attachment">✕</button>
+      <button class="remove" aria-label="Remove attachment">${ICON_CLOSE}</button>
     `;
     chip.querySelector(".remove").addEventListener("click", () => removeAttachment(a.id));
     attachmentStrip.appendChild(chip);
@@ -1095,17 +1115,157 @@ function makeToggle(container, toggleClass, bodyClass) {
   body.classList.toggle("open");
 }
 
+// Robot llama mascot for the agent background. Every frame is built from the
+// same skeleton via center()/llamaBox() so widths can never drift between
+// frames - that's what kept the old hand-typed art from jittering as it
+// "animated" by swapping state.
+const LLAMA_WIDTH = 24;
+
+function center(str) {
+  str = str || "";
+  const pad = LLAMA_WIDTH - str.length;
+  const left = Math.floor(pad / 2);
+  const right = pad - left;
+  return " ".repeat(Math.max(left, 0)) + str + " ".repeat(Math.max(right, 0));
+}
+
+function llamaBox(left, innerWidth, content, right) {
+  content = content || "";
+  const pad = innerWidth - content.length;
+  const padLeft = Math.floor(pad / 2);
+  const padRight = pad - padLeft;
+  const inner = " ".repeat(Math.max(padLeft, 0)) + content + " ".repeat(Math.max(padRight, 0));
+  return center(left + inner + right);
+}
+
+function llamaFrame({ eyes = "", mouth = "", panel1 = "", panel2 = "" }) {
+  return [
+    center("/\\        /\\"),
+    center("/  \\      /  \\"),
+    center(".------------."),
+    llamaBox("|", 12, eyes, "|"),
+    llamaBox("|", 12, "", "|"),
+    llamaBox("|", 12, mouth, "|"),
+    center("'----,  ,----'"),
+    center("|  |"),
+    center(".--'--'--."),
+    llamaBox("| ", 8, panel1, " |"),
+    llamaBox("| ", 8, panel2, " |"),
+    center("'--------'"),
+  ].join("\n");
+}
+
+// Each state is a list of frame descriptors cycled by the interval below -
+// eyes/mouth/panel text change, the skeleton never does.
+const AGENT_ASCII = {
+  idle: [
+    { eyes: "o    o", mouth: "____", panel1: "ARC-LLAMA", panel2: "" },
+    { eyes: "-    -", mouth: "____", panel1: "ARC-LLAMA", panel2: "" },
+  ],
+  thinking: [
+    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "" },
+    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "." },
+    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: ".." },
+    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "..." },
+  ],
+  read: [
+    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[=  ]" },
+    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[ = ]" },
+    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[  =]" },
+    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[ = ]" },
+  ],
+  write: [
+    { eyes: "o    o", mouth: "____", panel1: "WRITING", panel2: "code_" },
+    { eyes: "o    o", mouth: "____", panel1: "WRITING", panel2: "code " },
+  ],
+  command: [
+    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "/" },
+    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "-" },
+    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "\\" },
+    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "|" },
+  ],
+  search: [
+    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[o   ]" },
+    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[ o  ]" },
+    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[  o ]" },
+    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[   o]" },
+  ],
+  list: [
+    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "* - -" },
+    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "- * -" },
+    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "- - *" },
+  ],
+  working: [
+    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "/" },
+    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "-" },
+    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "\\" },
+    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "|" },
+  ],
+  success: [
+    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "" },
+    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "\\o/" },
+  ],
+  done: [
+    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "" },
+    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "\\o/" },
+  ],
+  error: [
+    { eyes: "x    x", mouth: "/??\\", panel1: "ERROR", panel2: "!!!" },
+    { eyes: "x    x", mouth: "/??\\", panel1: "ERROR", panel2: "" },
+  ],
+};
+
+const AGENT_ASCII_FRAME_MS = 450;
+const agentAsciiBg = $("#agent-ascii-bg");
+let agentAsciiState = "idle";
+let agentAsciiFrameIndex = 0;
+
+function renderAgentAscii() {
+  if (!agentAsciiBg) return;
+  const frames = AGENT_ASCII[agentAsciiState] || AGENT_ASCII.idle;
+  agentAsciiBg.textContent = llamaFrame(frames[agentAsciiFrameIndex % frames.length]);
+  agentAsciiBg.className = "agent-ascii-bg state-" + agentAsciiState;
+}
+
+function setAgentAscii(state) {
+  if (!agentAsciiBg) return;
+  if (state === agentAsciiState) return;
+  agentAsciiState = AGENT_ASCII[state] ? state : "idle";
+  agentAsciiFrameIndex = 0;
+  renderAgentAscii();
+}
+
+renderAgentAscii();
+setInterval(() => {
+  agentAsciiFrameIndex += 1;
+  renderAgentAscii();
+}, AGENT_ASCII_FRAME_MS);
+
+function shouldAutoScroll(container) {
+  if (!container) return true;
+  const threshold = 60;
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+}
+
+function autoScroll(container) {
+  if (!container) return;
+  container.scrollTop = container.scrollHeight;
+}
+
 const agentRenderer = {
   thinkingEl: null,
   toolCards: new Map(),
   stepNumber: 0,
 
   clear() {
+    const bg = $("#agent-ascii-bg");
     agentLog.innerHTML = "";
+    if (bg) agentLog.appendChild(bg);
     if (agentEmptyState) agentEmptyState.style.display = "";
     this.toolCards.clear();
     this.thinkingEl = null;
     this.stepNumber = 0;
+    setAgentAscii("idle");
   },
 
   renderPrompt(task) {
@@ -1124,8 +1284,9 @@ const agentRenderer = {
       el.className = "agent-log-line thinking";
       el.innerHTML = `<div class="agent-thinking"><span>Thinking</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
       agentLog.appendChild(el);
-      agentLog.scrollTop = agentLog.scrollHeight;
+      if (shouldAutoScroll(agentLog)) autoScroll(agentLog);
       this.thinkingEl = el;
+      setAgentAscii("thinking");
     } else {
       if (this.thinkingEl) {
         this.thinkingEl.remove();
@@ -1161,7 +1322,7 @@ const agentRenderer = {
       default:
         this.renderRaw(event);
     }
-    agentLog.scrollTop = agentLog.scrollHeight;
+    if (shouldAutoScroll(agentLog)) autoScroll(agentLog);
   },
 
   renderStatus(event) {
@@ -1207,12 +1368,22 @@ const agentRenderer = {
   _makeToolDetail(label, content, open = false) {
     const detail = document.createElement("div");
     detail.className = "agent-tool-detail";
+    const trimmed = String(content || "").trimEnd();
     detail.innerHTML = `
       <div class="agent-tool-detail-toggle${open ? " open" : ""}"><span class="chevron">▶</span> ${escapeHtml(label)}</div>
-      <div class="agent-tool-detail-body${open ? " open" : ""}"><pre>${escapeHtml(content)}</pre></div>`;
+      <div class="agent-tool-detail-body${open ? " open" : ""}"><pre>${escapeHtml(trimmed)}</pre></div>`;
     const toggle = detail.querySelector(".agent-tool-detail-toggle");
     toggle.addEventListener("click", () => makeToggle(detail, ".agent-tool-detail-toggle", ".agent-tool-detail-body"));
     return detail;
+  },
+
+  _asciiForTool(name) {
+    if (name.includes("search")) return "search";
+    if (name.includes("write")) return "write";
+    if (name.includes("read")) return "read";
+    if (name === "list_directory") return "list";
+    if (name === "run_command") return "command";
+    return "working";
   },
 
   renderToolCall(event) {
@@ -1224,6 +1395,8 @@ const agentRenderer = {
     const icon = getToolIcon(name);
     const kind = getToolKind(name);
     const target = this._toolTarget(name, args);
+
+    setAgentAscii(this._asciiForTool(name));
 
     const line = document.createElement("div");
     line.className = "agent-log-line tool agent-tool pending";
@@ -1306,6 +1479,7 @@ const agentRenderer = {
     resultDetail.classList.add("agent-tool-result");
     details.appendChild(resultDetail);
 
+    setAgentAscii(event.error ? "error" : "success");
     this.setThinking(true);
   },
 
@@ -1394,6 +1568,7 @@ const agentRenderer = {
 
   renderError(event) {
     this.setThinking(false);
+    setAgentAscii("error");
     const line = document.createElement("div");
     line.className = "agent-log-line error";
     line.innerHTML = `<div class="agent-error"><span style="color:#d8a0a0">Error:</span> ${escapeHtml(event.message || "")}</div>`;
@@ -1402,6 +1577,7 @@ const agentRenderer = {
 
   renderDone(event) {
     this.setThinking(false);
+    setAgentAscii("done");
     const line = document.createElement("div");
     line.className = "agent-log-line done";
     line.innerHTML = `<div class="agent-done">${ICON_CHECK} Agent finished.</div>`;
@@ -1447,6 +1623,9 @@ async function runAgentTask() {
   agentRenderer.addEvent({ type: "status", message: `Running task with ${autoConfirm ? "auto-confirm" : "manual confirmation"}` });
   agentRenderer.setThinking(true);
 
+  let agentStartTime = null;
+  let agentTokenCount = 0;
+
   try {
     const r = await fetch("/v1/agent", {
       method: "POST",
@@ -1480,10 +1659,19 @@ async function runAgentTask() {
         try {
           const event = JSON.parse(payload);
           agentRenderer.addEvent(event);
+          if (event.type === "assistant" && event.content) {
+            if (agentStartTime === null) agentStartTime = Date.now();
+            agentTokenCount += Math.max(1, Math.round(event.content.length / 4));
+          }
         } catch (e) {
           // ignore malformed SSE payloads
         }
       }
+    }
+    if (agentStartTime && agentTokenCount > 0) {
+      const elapsed = (Date.now() - agentStartTime) / 1000;
+      const tps = elapsed > 0 ? (agentTokenCount / elapsed).toFixed(1) : null;
+      if (tps) ctxLabelTps.textContent = tps + " tok/s";
     }
   } catch (e) {
     if (e.name !== "AbortError") {
@@ -1629,7 +1817,7 @@ function renderHelpMessage() {
   content.innerHTML = html;
   div.appendChild(content);
   chatLog.appendChild(div);
-  chatLog.scrollTop = chatLog.scrollHeight;
+  if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
 }
 
 function clearChat() {
@@ -1703,7 +1891,7 @@ async function compactConversation(instruction) {
     chatLog.innerHTML = "";
     if (emptyState) emptyState.style.display = "none";
     const msg = createMessage("system", "Context compacted. Summary:\n\n" + summary);
-    chatLog.scrollTop = chatLog.scrollHeight;
+    if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
 
     const m = models.find((x) => x.id === selectedModel);
     updateCtxMeter(estimateTokens(), m?.ctx || 131072);

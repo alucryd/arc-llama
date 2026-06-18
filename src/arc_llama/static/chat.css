@@ -293,6 +293,8 @@ main {
   color: var(--fg-dim);
 }
 
+.empty-state .icon svg { fill: currentColor; }
+
 .empty-state .title {
   color: var(--fg-dim);
   font-weight: 600;
@@ -363,13 +365,22 @@ main {
 .message.error-card .role { color: var(--error); }
 
 .message .content {
-  white-space: pre-wrap;
   word-wrap: break-word;
+}
+
+.message.user .content,
+.message.system .content,
+.message.error-card .content {
+  white-space: pre-wrap;
 }
 
 .message.assistant .content {
   font-size: 14px;
   line-height: 1.65;
+}
+
+.message.assistant .content > *:last-child {
+  margin-bottom: 0;
 }
 
 .message.user .content {
@@ -734,6 +745,18 @@ main {
 
 .attachment-chip .remove:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
 
+.attachment-chip .remove svg { fill: currentColor; }
+
+.attachment-chip .attachment-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-bright);
+}
+
+.attachment-chip .attachment-icon svg { fill: currentColor; }
+
 .attachment-chip .spinner {
   width: 12px;
   height: 12px;
@@ -1040,14 +1063,52 @@ main {
    Agent log
    ------------------------------------------------------------------ */
 #agent-log {
+  flex: 1;
+  width: 100%;
+  max-width: 900px;
+  overflow-y: auto;
   padding: 16px 24px;
   font-size: 14px;
   line-height: 1.6;
   color: var(--fg);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 #agent-log.hidden { display: none; }
-#agent-log.active { display: flex; flex-direction: column; }
+
+.agent-log-line:empty,
+.agent-assistant:empty { display: none; }
+
+.agent-ascii-bg {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.15;
+  white-space: pre;
+  color: var(--fg-dim);
+  opacity: 0.25;
+  pointer-events: none;
+  user-select: none;
+  z-index: 0;
+  transition: opacity 0.4s ease, color 0.4s ease;
+  max-width: 90vw;
+  max-height: 90vh;
+  overflow: hidden;
+  text-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+}
+
+.agent-ascii-bg.state-thinking { opacity: 0.40; color: var(--accent-bright); }
+.agent-ascii-bg.state-working { opacity: 0.35; color: var(--warn); }
+.agent-ascii-bg.state-success { opacity: 0.35; color: var(--success); }
+.agent-ascii-bg.state-error { opacity: 0.40; color: var(--error); }
+.agent-ascii-bg.state-done { opacity: 0.35; color: var(--success); }
+
+#agent-log > *:not(.agent-ascii-bg) { position: relative; z-index: 1; }
 
 .agent-log-line {
   position: relative;
@@ -1141,6 +1202,8 @@ main {
 }
 .agent-assistant ul, .agent-assistant ol { margin: 8px 0; padding-left: 22px; }
 .agent-assistant li { margin: 3px 0; }
+.agent-assistant > *:last-child { margin-bottom: 0; }
+.agent-assistant .code-block-wrapper:last-child { margin-bottom: 0; }
 
 .agent-assistant pre {
   background: var(--bg-code);
@@ -1169,7 +1232,8 @@ main {
   word-break: break-word;
 }
 
-.agent-done { color: var(--fg-mute); font-size: 12px; }
+.agent-done { color: var(--fg-mute); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+.agent-done svg { width: 14px; height: 14px; fill: currentColor; }
 
 .agent-tool {
   display: flex;
@@ -1364,6 +1428,7 @@ main {
 .agent-confirm-btn:hover { background: var(--bg); color: var(--fg); }
 .agent-confirm-btn:active { transform: translateY(1px); }
 .agent-confirm-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+.agent-confirm-btn svg { width: 14px; height: 14px; fill: currentColor; }
 
 .agent-confirm-btn.approve {
   background: rgba(63, 185, 80, 0.10);

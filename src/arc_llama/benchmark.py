@@ -8,18 +8,15 @@ benchmark inherits the correct SYCL env, arch profile, and router policy.
 """
 from __future__ import annotations
 
-import json
 import logging
-import statistics
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from arc_llama.config import Config, ModelConfig, load_config
-from arc_llama.recipes import KVCacheType, default_recipe, suggest_ctx
+from arc_llama.config import Config, load_config
 
 log = logging.getLogger("arc_llama.benchmark")
 
