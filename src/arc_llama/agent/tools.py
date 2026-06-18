@@ -458,7 +458,7 @@ def search_files(pattern: str, root: Path, path_glob: str = "*") -> ToolResult:
                 with p.open("r", encoding="utf-8", errors="ignore") as f:
                     for i, line in enumerate(f, start=1):
                         if pattern in line:
-                            rel = p.relative_to(root)
+                            rel = p.relative_to(root).as_posix()
                             matches.append(f"{rel}:{i}: {line.rstrip()}")
             except OSError:
                 continue

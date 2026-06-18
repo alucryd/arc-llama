@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,16 @@ from arc_llama.config import Config, GPUConfig, ModelConfig
 
 @pytest.fixture
 def make_sysfs_gpu(tmp_path: Path):
-    """Factory fixture that creates fake sysfs PCI device entries."""
+    """Factory fixture that creates fake sysfs PCI device entries.
+
+    Simulates Linux's /sys/bus/pci/devices/<slot> layout, which only exists
+    on Linux. The slot name contains colons (e.g. "0000:03:00.0"), which are
+    illegal in Windows path components, so this is skipped there rather than
+    rewritten — there's no Windows sysfs equivalent to fake.
+    """
+    if sys.platform == "win32":
+        pytest.skip("simulates Linux-only /sys/bus/pci layout")
+
     def _make(slot: str, device_id: int = 0xE211, vram_bytes: int | None = None, driver: str = "xe"):
         base = tmp_path / "sys" / "bus" / "pci" / "devices" / slot
         base.mkdir(parents=True)

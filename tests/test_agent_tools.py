@@ -1,6 +1,7 @@
 """Tests for the agent tool sandbox."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -78,7 +79,11 @@ def test_run_command_echo(tmp_root: Path) -> None:
 
 
 def test_run_command_cwd_is_root(tmp_root: Path) -> None:
-    res = run_command("pwd", tmp_root)
+    # Use the interpreter's own cwd report rather than a shell builtin like
+    # `pwd` — on the Windows CI runner that resolves to Git Bash's pwd.exe,
+    # which prints an MSYS-style path ("/c/Users/...") instead of a native
+    # Windows one, even though the actual cwd is correct.
+    res = run_command(f'"{sys.executable}" -c "import os; print(os.getcwd())"', tmp_root)
     assert not res.error
     assert str(tmp_root) in res.content
 
