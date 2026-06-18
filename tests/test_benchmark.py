@@ -1,6 +1,7 @@
 """Tests for arc_llama.benchmark — measurement, formatting, sweep."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,11 @@ class TestVramHelpers:
         monkeypatch.setattr("arc_llama.benchmark.Path", lambda p: tmp_path / p)
         assert _find_drm_card("0000:03:00.0") is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="fakes a Linux /sys/bus/pci/devices/<slot> path; colon in the "
+        "slot name is illegal on Windows and there's no sysfs to fake there",
+    )
     def test_find_drm_card_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         drm = tmp_path / "sys" / "class" / "drm"
         card = drm / "card1"
