@@ -962,6 +962,27 @@ main {
 .h-new:hover { border-color: var(--accent); background: rgba(88, 166, 255, 0.08); color: var(--accent-bright); }
 .h-new:active { transform: translateY(1px); }
 
+.h-actions {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.h-action {
+  flex: 1;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elev);
+  color: var(--fg-mute);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.h-action:hover { border-color: var(--accent); color: var(--accent-bright); }
+
 .h-list { display: flex; flex-direction: column; gap: 8px; }
 .h-empty { font-size: 13px; color: var(--fg-mute); text-align: center; padding: 24px 0; }
 

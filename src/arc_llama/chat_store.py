@@ -170,3 +170,46 @@ class ChatStore:
         if self.directory.exists():
             shutil.rmtree(self.directory)
             self.directory.mkdir(parents=True, exist_ok=True)
+
+    def export_all(self) -> list[dict[str, Any]]:
+        """Return every stored chat as a list of plain dicts."""
+        return [chat.to_dict() for chat in self.list_chats()]
+
+    def import_chats(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, int | list[str]]:
+        """Import a list of chat dicts.
+
+        Args:
+            data: list of chat dicts in the format produced by ``Chat.to_dict``.
+            overwrite: if True, replace an existing chat with the same id.
+
+        Returns:
+            A summary dict with ``imported``, ``skipped``, and ``errors`` counts.
+        """
+        imported = 0
+        skipped = 0
+        errors: list[str] = []
+        for item in data:
+            if not isinstance(item, dict):
+                errors.append("skipped non-dict entry")
+                continue
+            chat_id = item.get("id")
+            if not chat_id:
+                errors.append("skipped chat with missing id")
+                continue
+            path = self._chat_path(chat_id)
+            if path.exists() and not overwrite:
+                skipped += 1
+                continue
+            try:
+                chat = Chat.from_dict(item)
+            except (TypeError, ValueError) as e:
+                errors.append(f"{chat_id}: invalid chat data ({e})")
+                continue
+            self._save(chat)
+            imported += 1
+        return {"imported": imported, "skipped": skipped, "errors": len(errors), "error_details": errors}

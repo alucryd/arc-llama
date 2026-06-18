@@ -115,3 +115,42 @@ def test_search_endpoint(tmp_path, monkeypatch):
         assert len(data) == 1
         assert data[0]["chat"]["id"] == "chat-1"
         assert data[0]["matching_message_indices"] == [-1, 0]
+
+
+def test_export_and_import_chats(tmp_path, monkeypatch):
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    app = _app(tmp_path)
+
+    with TestClient(app) as client:
+        client.post("/v1/chats", json={"id": "chat-1", "title": "Plan"})
+        client.patch(
+            "/v1/chats/chat-1",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        export_resp = client.get("/v1/chats/export")
+        assert export_resp.status_code == 200
+        payload = export_resp.json()
+        assert payload["version"] == 1
+        assert len(payload["chats"]) == 1
+        assert payload["chats"][0]["id"] == "chat-1"
+
+        import_resp = client.post(
+            "/v1/chats/import",
+            json={"chats": payload["chats"], "overwrite": False},
+        )
+        assert import_resp.status_code == 200
+        summary = import_resp.json()
+        assert summary["imported"] == 0
+        assert summary["skipped"] == 1
+
+        payload["chats"][0]["id"] = "chat-2"
+        import_resp = client.post(
+            "/v1/chats/import",
+            json={"chats": payload["chats"], "overwrite": False},
+        )
+        assert import_resp.status_code == 200
+        summary = import_resp.json()
+        assert summary["imported"] == 1
+        assert client.get("/v1/chats/chat-2").status_code == 200

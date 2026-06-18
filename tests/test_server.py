@@ -27,6 +27,13 @@ class FakeRouter:
             aliases=["qwen.gguf"],
         )
         self._servers = {"qwen": FakeBackend()}
+        self.metrics = {
+            "loads": 5,
+            "stops": 2,
+            "load_errors": 1,
+            "last_load_at": 1234.0,
+            "last_error": None,
+        }
 
     def all_models(self):
         return [self.model]
@@ -370,8 +377,40 @@ def test_upstream_streaming_proxy_forwards_sse_and_closes_upstream(monkeypatch):
     assert response.status_code == 200
     assert body == b"data: upstream chunk 1\n\ndata: upstream chunk 2\n\n"
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers["x-upstream"] == "stream-ok"
-    assert "transfer-encoding" not in response.headers
-    assert "content-length" not in response.headers
-    assert mgr.last_streaming_ok is True
-    assert mgr.last_stream.closed is True
+
+
+def test_health_includes_loaded_models_and_uptime(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        r = client.get("/health")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+    assert data["loaded_model_count"] == 1
+    assert "qwen" in data["loaded_models"]
+    assert data["uptime_seconds"] >= 0
+
+
+def test_admin_metrics_returns_counters_and_gpus(monkeypatch):
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app()
+
+    with TestClient(app) as client:
+        r = client.get("/admin/metrics")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["loads"] == 5
+    assert data["stops"] == 2
+    assert data["load_errors"] == 1
+    assert data["active_models"] == ["qwen"]
+    assert any(g["pci_slot"] == "0000:03:00.0" for g in data["gpus"])

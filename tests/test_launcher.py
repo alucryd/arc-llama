@@ -227,6 +227,52 @@ class TestLlamaServerLifecycle:
         assert srv.is_running is False
 
 
+class TestLogHandling:
+    def test_log_rotation_renames_existing_large_log(self, tmp_path):
+        from arc_llama import launcher as launcher_mod
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_path = log_dir / "m.log"
+        log_path.write_bytes(b"x" * (launcher_mod._MAX_LOG_BYTES + 1))
+        launcher_mod._rotate_log(log_path)
+        assert not log_path.exists()
+        assert (log_dir / "m.log.1").exists()
+
+    def test_tail_log_returns_last_lines(self, tmp_path):
+        from arc_llama.config import Config, GPUConfig, ModelConfig
+
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        log_dir = tmp_path / "logs"
+        original_popen = subprocess.Popen
+
+        def _fake_popen(*args, **kwargs):
+            class FakeProc:
+                pid = 12345
+                def poll(self):
+                    return None
+                def send_signal(self, sig):
+                    pass
+                def wait(self, timeout):
+                    self._waited = True
+            return FakeProc()
+
+        subprocess.Popen = _fake_popen
+        try:
+            srv.start(log_dir=log_dir)
+            srv._log_file.write(b"line1\nline2\nline3\n")
+            srv._log_file.flush()
+            assert srv.tail_log(lines=2) == "line2\nline3"
+        finally:
+            subprocess.Popen = original_popen
+        srv.stop()
+
+
 class TestWindowsLifecycle:
     def test_start_uses_create_new_process_group(self, monkeypatch, tmp_path):
         from arc_llama import launcher as launcher_mod

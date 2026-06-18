@@ -262,12 +262,52 @@ def _strip_none(obj: Any) -> Any:
     return obj
 
 
+def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Bump an on-disk config dict to the current schema version.
+
+    Currently a no-op migration (v1 → v1), but the hook exists so future schema
+    changes can be handled automatically when users upgrade arc-llama.
+    """
+    version = int(raw.get("version", 1))
+    if version > CONFIG_VERSION:
+        raise ValueError(
+            f"config version {version} is newer than the supported version "
+            f"{CONFIG_VERSION}; upgrade arc-llama"
+        )
+    raw["version"] = CONFIG_VERSION
+    # Ensure all top-level sections exist so downstream code can assume them.
+    raw.setdefault("server", {})
+    raw.setdefault("paths", {})
+    raw.setdefault("gpus", [])
+    raw.setdefault("models", [])
+    raw.setdefault("upstreams", [])
+    return raw
+
+
+def validate_config(raw: dict[str, Any]) -> None:
+    """Basic structural validation for a loaded config dict."""
+    if not isinstance(raw.get("version"), int):
+        raise ValueError("config 'version' must be an integer")
+    if not isinstance(raw.get("server", {}), dict):
+        raise ValueError("config 'server' must be a table")
+    if not isinstance(raw.get("paths", {}), dict):
+        raise ValueError("config 'paths' must be a table")
+    if not isinstance(raw.get("gpus", []), list):
+        raise ValueError("config 'gpus' must be an array")
+    if not isinstance(raw.get("models", []), list):
+        raise ValueError("config 'models' must be an array")
+    if not isinstance(raw.get("upstreams", []), list):
+        raise ValueError("config 'upstreams' must be an array")
+
+
 def load_config(path: Path | None = None) -> Config:
     path = path or default_config_path()
     if not path.exists():
         return Config()
     with open(path, "rb") as f:
         raw = _toml_load(f)
+    raw = migrate_config(raw)
+    validate_config(raw)
     return Config(
         version=int(raw.get("version", CONFIG_VERSION)),
         server=ServerConfig(**raw.get("server", {})),

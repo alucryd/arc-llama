@@ -50,6 +50,9 @@ const historyToggle  = $("#history-toggle");
 const historyPanel   = $("#history-panel");
 const hNew           = $("#h-new");
 const hList          = $("#h-list");
+const hExport        = $("#h-export");
+const hImport        = $("#h-import");
+const hImportInput   = $("#h-import-input");
 
 const HISTORY_KEY    = "arc-llama-chats";
 const MAX_HISTORY    = 50;
@@ -117,6 +120,10 @@ historyToggle.addEventListener("click", () => {
 });
 
 hNew.addEventListener("click", newChat);
+
+if (hExport) hExport.addEventListener("click", exportChats);
+if (hImport) hImport.addEventListener("click", () => hImportInput?.click());
+if (hImportInput) hImportInput.addEventListener("change", importChatsFromFile);
 
 function loadChatsFromStorage() {
   try {
@@ -420,6 +427,56 @@ async function deleteChat(id) {
     currentChatId = null;
   }
   renderHistoryPanel();
+}
+
+async function exportChats() {
+  try {
+    const data = await apiRequest("/v1/chats/export");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `arc-llama-chats-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.warn("Could not export chats:", e.message);
+    showError("Export failed: " + e.message);
+  }
+}
+
+async function importChatsFromFile() {
+  const file = hImportInput.files?.[0];
+  if (!file) return;
+  hImportInput.value = "";
+  let body;
+  try {
+    const text = await file.text();
+    body = JSON.parse(text);
+  } catch (e) {
+    showError("Import failed: invalid JSON file");
+    return;
+  }
+  const chats = body.chats;
+  if (!Array.isArray(chats)) {
+    showError("Import failed: missing 'chats' array");
+    return;
+  }
+  try {
+    const r = await fetch("/v1/chats/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chats, overwrite: false }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    await syncChatsFromServer();
+    showError(`Imported ${data.imported || 0}, skipped ${data.skipped || 0}, errors ${data.errors || 0}.`);
+  } catch (e) {
+    showError("Import failed: " + e.message);
+  }
 }
 
 function renderSettingsPanel() {

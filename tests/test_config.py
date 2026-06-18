@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from arc_llama.config import Config, GPUConfig, ModelConfig, load_config
 
 
@@ -74,3 +76,24 @@ def test_windows_default_paths_use_appdata(monkeypatch):
     assert config_mod.default_config_path() == appdata / "arc-llama" / "config.toml"
     assert config_mod.default_models_dir() == localappdata / "arc-llama" / "models"
     assert config_mod.default_state_dir() == localappdata / "arc-llama"
+
+
+def test_migrate_config_adds_missing_sections():
+    from arc_llama.config import CONFIG_VERSION, migrate_config
+
+    raw = migrate_config({})
+    assert raw["version"] == CONFIG_VERSION
+    assert raw["server"] == {}
+    assert raw["paths"] == {}
+    assert raw["gpus"] == []
+    assert raw["models"] == []
+    assert raw["upstreams"] == []
+
+
+def test_validate_config_rejects_bad_structure():
+    from arc_llama.config import validate_config
+
+    with pytest.raises(ValueError, match="version"):
+        validate_config({"version": "not-an-int"})
+    with pytest.raises(ValueError, match="gpus"):
+        validate_config({"version": 1, "gpus": {}})

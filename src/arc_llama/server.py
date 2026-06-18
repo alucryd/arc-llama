@@ -20,6 +20,7 @@ import asyncio
 import io
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -62,6 +63,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         app.state.router = Router(cfg, log_dir=state_dir)
         app.state.upstream_mgr = UpstreamManager(cfg.upstreams)
         app.state.cfg = cfg
+        app.state.started_at = time.time()
         app.state.pending_confirmations: dict[str, tuple[asyncio.Event, dict[str, bool]]] = {}
         if state_dir:
             app.state.chat_store = ChatStore(state_dir / "chats")
@@ -76,8 +78,44 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app = FastAPI(title="arc-llama", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health(request: Request) -> dict[str, Any]:
+        """Liveness probe for the arc-llama router itself."""
+        rt: Router = request.app.state.router
+        uptime = time.time() - request.app.state.started_at
+        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        return {
+            "status": "ok",
+            "uptime_seconds": round(uptime, 2),
+            "loaded_models": loaded,
+            "loaded_model_count": len(loaded),
+        }
+
+    @app.get("/admin/metrics")
+    async def admin_metrics(request: Request) -> dict[str, Any]:
+        """Operational counters and current GPU/model state."""
+        rt: Router = request.app.state.router
+        c: Config = request.app.state.cfg
+        uptime = time.time() - request.app.state.started_at
+        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        return {
+            "uptime_seconds": round(uptime, 2),
+            "loads": rt.metrics["loads"],
+            "stops": rt.metrics["stops"],
+            "load_errors": rt.metrics["load_errors"],
+            "last_load_at": rt.metrics["last_load_at"],
+            "last_error": rt.metrics["last_error"],
+            "active_models": loaded,
+            "gpus": [
+                {
+                    "pci_slot": g.pci_slot,
+                    "name": g.name,
+                    "arch": g.arch,
+                    "vram_mb": g.vram_mb,
+                    "enabled": g.enabled,
+                }
+                for g in c.gpus
+            ],
+        }
 
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict:
@@ -262,6 +300,65 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=f"Chat already exists: {chat_id}") from None
         return chat.to_dict()
 
+    @app.post("/v1/chats/search")
+    async def search_chats(request: Request) -> dict[str, Any]:
+        """Search chat titles and messages.
+
+        Body: {"query": "string", "limit": 20}
+        Returns matching chats with the indices of matching messages.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        query = body.get("query", "")
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        limit = int(body.get("limit", 20))
+        store: ChatStore = request.app.state.chat_store
+        results = store.search(query, limit=limit)
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "chat": chat.summary(),
+                    "matching_message_indices": indices,
+                }
+                for chat, indices in results
+            ],
+        }
+
+    @app.get("/v1/chats/export")
+    async def export_chats(request: Request) -> dict[str, Any]:
+        """Export every chat as a portable JSON document."""
+        store: ChatStore = request.app.state.chat_store
+        return {"version": 1, "exported_at": time.time(), "chats": store.export_all()}
+
+    @app.post("/v1/chats/import")
+    async def import_chats(request: Request) -> dict[str, Any]:
+        """Import chats from an export document.
+
+        Body: {"chats": [...], "overwrite": false}
+        Existing chats are skipped unless ``overwrite`` is true.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        chats = body.get("chats")
+        if not isinstance(chats, list):
+            raise HTTPException(status_code=400, detail="'chats' must be an array")
+        store: ChatStore = request.app.state.chat_store
+        result = store.import_chats(chats, overwrite=bool(body.get("overwrite", False)))
+        return {
+            "imported": result["imported"],
+            "skipped": result["skipped"],
+            "errors": result["errors"],
+            "error_details": result["error_details"],
+        }
+
     @app.get("/v1/chats/{chat_id}")
     async def get_chat(chat_id: str, request: Request) -> dict[str, Any]:
         """Return a full chat including all messages."""
@@ -331,34 +428,6 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not store.delete(chat_id):
             raise HTTPException(status_code=404, detail="Chat not found")
         return {"deleted": True}
-
-    @app.post("/v1/chats/search")
-    async def search_chats(request: Request) -> dict[str, Any]:
-        """Search chat titles and messages.
-
-        Body: {"query": "string", "limit": 20}
-        Returns matching chats with the indices of matching messages.
-        """
-        try:
-            body = await request.json()
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
-        query = body.get("query", "")
-        if not query:
-            raise HTTPException(status_code=400, detail="query is required")
-        limit = int(body.get("limit", 20))
-        store: ChatStore = request.app.state.chat_store
-        results = store.search(query, limit=limit)
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "chat": chat.summary(),
-                    "matching_message_indices": indices,
-                }
-                for chat, indices in results
-            ],
-        }
 
     # ------------------------------------------------------------------
     # Admin (used by the web UI / TUI)

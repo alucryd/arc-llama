@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from arc_llama.router import Router
 
 
@@ -62,3 +64,39 @@ async def test_multi_resident_policy_keeps_models_on_different_gpus_running(tmp_
 
     assert FakeServer.starts == ["qwen", "gemma"]
     assert FakeServer.stops == []
+
+
+async def test_vram_guard_refuses_oversized_model(tmp_path, monkeypatch):
+    from conftest import make_config
+
+    import arc_llama.router as router_mod
+
+    FakeServer.starts = []
+    FakeServer.stops = []
+    cfg = make_config(tmp_path, single_resident=False)
+    monkeypatch.setattr(router_mod, "LlamaServer", FakeServer)
+    monkeypatch.setattr(router_mod, "_estimate_model_vram_mb", lambda m: 999_999)
+    rt = Router(cfg)
+
+    with pytest.raises(RuntimeError, match="needs ~"):
+        await rt.ensure_active("qwen")
+    assert FakeServer.starts == []
+
+
+async def test_metrics_increment_on_load_and_stop(tmp_path, monkeypatch):
+    from conftest import make_config
+
+    import arc_llama.router as router_mod
+
+    FakeServer.starts = []
+    FakeServer.stops = []
+    cfg = make_config(tmp_path, single_resident=False)
+    monkeypatch.setattr(router_mod, "LlamaServer", FakeServer)
+    rt = Router(cfg)
+
+    await rt.ensure_active("qwen")
+    assert rt.metrics["loads"] == 1
+    assert rt.metrics["load_errors"] == 0
+
+    await rt.stop_one("qwen")
+    assert rt.metrics["stops"] == 1

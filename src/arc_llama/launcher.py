@@ -33,6 +33,10 @@ log = logging.getLogger("arc_llama.launcher")
 DEFAULT_HEALTH_TIMEOUT = 120  # seconds — generous for cold-start SYCL JIT
 HEALTH_POLL_INTERVAL = 1.5
 
+# Log rotation for llama-server subprocess logs.
+_MAX_LOG_BYTES = 50 * 1024 * 1024
+_LOG_BACKUPS = 3
+
 _IS_WINDOWS = sys.platform == "win32"
 # Not defined on POSIX. Fallback lets the Windows code path stay import-safe
 # when exercised under tests that monkeypatch _IS_WINDOWS on a Linux runner.
@@ -85,6 +89,32 @@ def _preexec_isolate_and_pdeathsig() -> None:
     if rc != 0:
         # Can't really log here — preexec_fn runs in a fragile post-fork state.
         # The child will simply not receive PDEATHSIG; not fatal.
+        pass
+
+
+def _rotate_log(log_path: Path) -> None:
+    """Rotate an existing log file so it doesn't grow unbounded.
+
+    Keeps up to ``_LOG_BACKUPS`` historic files (``.log.1``, ``.log.2``, ...).
+    """
+    if not log_path.exists():
+        return
+    try:
+        if log_path.stat().st_size < _MAX_LOG_BYTES:
+            return
+    except OSError:
+        return
+    for i in range(_LOG_BACKUPS, 0, -1):
+        src = log_path.parent / f"{log_path.name}.{i}"
+        dst = log_path.parent / f"{log_path.name}.{i + 1}"
+        if src.exists():
+            try:
+                src.replace(dst)
+            except OSError:
+                pass
+    try:
+        log_path.replace(log_path.parent / f"{log_path.name}.1")
+    except OSError:
         pass
 
 
@@ -178,6 +208,7 @@ class LlamaServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.started_at: float | None = None
         self._log_file: Any = None  # file handle opened in start(), closed in stop()
+        self._log_path: Path | None = None
 
     @property
     def is_running(self) -> bool:
@@ -189,9 +220,12 @@ class LlamaServer:
             return
         stdout = subprocess.DEVNULL
         stderr = subprocess.DEVNULL
+        self._log_path = None
         if log_dir is not None:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / f"{self.name}.log"
+            _rotate_log(log_path)
+            self._log_path = log_path
             self._log_file = open(log_path, "ab")
             stdout = self._log_file
             stderr = subprocess.STDOUT
@@ -230,6 +264,17 @@ class LlamaServer:
                     pass
                 await asyncio.sleep(HEALTH_POLL_INTERVAL)
         return False
+
+    def tail_log(self, lines: int = 50) -> str:
+        """Return the last *lines* of the llama-server log, if any."""
+        if self._log_path is None:
+            return ""
+        try:
+            text = self._log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        all_lines = text.splitlines()
+        return "\n".join(all_lines[-lines:])
 
     def stop(self, drain_seconds: float = 3.0) -> None:
         if not self.is_running:

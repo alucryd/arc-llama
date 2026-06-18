@@ -17,6 +17,7 @@ A small static web UI is bundled and served at `/` on the same port as
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -50,12 +51,35 @@ console = Console()
 _IS_WINDOWS = sys.platform == "win32"
 
 
+class _JsonFormatter(logging.Formatter):
+    """Emit log records as single-line JSON objects."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        obj = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            obj["exception"] = self.formatException(record.exc_info)
+        return json.dumps(obj, default=str)
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    if os.environ.get("ARC_LLAMA_LOG_JSON"):
+        handler = logging.StreamHandler()
+        handler.setFormatter(_JsonFormatter())
+        root = logging.getLogger()
+        root.setLevel(level)
+        root.handlers.clear()
+        root.addHandler(handler)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
 
 def _save_or_die(cfg: Config, path: Path) -> None:
