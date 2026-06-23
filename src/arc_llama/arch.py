@@ -17,6 +17,12 @@ class Arch(str, Enum):
     UNKNOWN = "unknown"
 
 
+class Backend(str, Enum):
+    """Which llama.cpp compute backend to use for a GPU."""
+    SYCL = "sycl"     # Intel oneAPI/SYCL path; best prompt-eval on Arc
+    VULKAN = "vulkan" # Cross-vendor Vulkan path; often better token-gen on Arc
+
+
 @dataclass
 class ArchProfile:
     """SYCL recipe for a specific Intel GPU generation."""

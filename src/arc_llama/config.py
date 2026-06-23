@@ -53,7 +53,7 @@ else:
     import tomli  # type: ignore[import-not-found]
     _toml_load = tomli.load
 
-from arc_llama.arch import Arch
+from arc_llama.arch import Arch, Backend
 from arc_llama.recipes import KVCacheType, LaunchRecipe
 
 CONFIG_VERSION = 1
@@ -148,6 +148,7 @@ class GPUConfig:
     vram_mb: int | None = None
     enabled: bool = True
     name: str = ""
+    backend: str = Backend.SYCL.value  # Backend.value
 
 
 @dataclass
@@ -332,6 +333,7 @@ def init_config_from_detection(detected_gpus, llama_server_path: str | None = No
             vram_mb=g.vram_mb,
             enabled=False,
             name=g.name,
+            backend=Backend.SYCL.value,
         )
         # Prefer the highest-VRAM Battlemage / Alchemist as the default GPU.
         if not enabled_set and g.arch in (Arch.BATTLEMAGE, Arch.ALCHEMIST) and g.vram_mb:

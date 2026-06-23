@@ -28,10 +28,15 @@ class KVCacheType(str, Enum):
 # Battlemage B60 stack. They're upper bounds for sizing; actual usage with
 # sliding-window attention (Gemma) is several × smaller again.
 KV_PER_TOKEN_F16_BYTES: dict[str, int] = {
-    "default": 70 * 1024,   # 70 KiB/token f16 — covers ~30B dense models
-    "moe_a3b": 20 * 1024,   # ~20 KiB — Qwen3 30B/35B-A3B-class MoE
-    "qwen3_27b_dense": 67 * 1024,
-    "gemma_swa": 16 * 1024, # interleaved sliding-window attention compresses heavily
+    "default": 70 * 1024,        # 70 KiB/token f16 — covers most ≤30B dense models
+    "moe_a3b": 20 * 1024,        # ~20 KiB — Qwen3 30B/35B-A3B-class MoE
+    "qwen3_dense": 67 * 1024,    # Qwen3 0.6B–32B dense (incl. Coder, Instruct)
+    "qwen3_27b_dense": 67 * 1024,# kept for backwards compatibility
+    "qwen2_5": 70 * 1024,        # Qwen2.5 / Qwen2.5-Coder dense
+    "gemma_swa": 16 * 1024,      # Gemma 2/3/4 interleaved sliding-window attn
+    "phi4": 72 * 1024,           # Phi-4 / Phi-4-reasoning 14.7B dense
+    "llama3": 75 * 1024,         # Llama 3.x / 4 dense & small MoE distills
+    "deepseek_r1_distill": 70 * 1024, # R1 distill on Llama/Qwen
 }
 
 

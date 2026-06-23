@@ -547,7 +547,7 @@ def test_register_discovered_correct_recipe_assignment(tmp_path, mock_recipe_and
 
     added = register_discovered(cfg, [model_file])
     assert len(added) == 1
-    assert added[0].kv_class == "qwen3_27b_dense"
+    assert added[0].kv_class == "qwen3_dense"
     assert added[0].recipe["n_gpu_layers"] == 999
 
 
@@ -677,6 +677,6 @@ def test_discover_and_register_ggufs_skips_hidden_symlink_and_existing_files(tmp
 
     assert discovered == [first.resolve()]
     assert [model.name for model in added] == ["qwen3-27b-q4_k_m"]
-    assert added[0].kv_class == "qwen3_27b_dense"
+    assert added[0].kv_class == "qwen3_dense"
     assert added_again == []
     assert len(cfg.models) == 1

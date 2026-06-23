@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from arc_llama.arch import Arch, ArchProfile, profile_for
+from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.gguf_meta import has_mtp_heads, is_hybrid_ssm
 
@@ -128,16 +128,40 @@ class LaunchPlan:
     backend_url: str = ""
 
 
-def build_env(profile: ArchProfile, sycl_index: int) -> dict[str, str]:
-    """Compose the environment, layering arch defaults over the user's shell env."""
+# Environment variables that only make sense for the SYCL backend; they can
+# confuse the Vulkan loader or cause unnecessary backend initialization delays.
+_SYCL_ONLY_ENVS: frozenset[str] = frozenset({
+    "ONEAPI_DEVICE_SELECTOR",
+    "ZES_ENABLE_SYSMAN",
+    "SYCL_CACHE_PERSISTENT",
+    "SYCL_CACHE_DIR",
+    "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS",
+    "SYCL_DEVICE_FILTER",
+    "SYCL_DEVICE_ALLOWLIST",
+    "GGML_SYCL_DISABLE_OPT",
+})
+
+
+def build_env(profile: ArchProfile, gpu: GPUConfig) -> dict[str, str]:
+    """Compose the environment for llama-server based on backend and arch."""
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     env = os.environ.copy()
-    # Strip env vars known to break this arch (even if the user inherited them).
+
+    if backend == Backend.VULKAN:
+        # Vulkan path: keep the environment clean of SYCL/oneAPI selectors.
+        for k in _SYCL_ONLY_ENVS:
+            env.pop(k, None)
+        # Restrict visible Vulkan devices to the one this model is bound to.
+        # GGML_VK_VISIBLE_DEVICES accepts a comma-separated list; we expose
+        # exactly one device so the model cannot accidentally land elsewhere.
+        env["GGML_VK_VISIBLE_DEVICES"] = str(gpu.sycl_index)
+        return env
+
+    # SYCL path: apply arch-specific env, stripping known-bad inherited vars.
     for k in profile.sycl_env_remove:
         env.pop(k, None)
-    # Apply arch-recommended values, but override the device selector with the
-    # specific GPU index this model is bound to.
     env.update(profile.sycl_env)
-    env["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{sycl_index}"
+    env["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{gpu.sycl_index}"
     return env
 
 
@@ -146,7 +170,7 @@ def build_plan(
 ) -> LaunchPlan:
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     profile = profile_for(arch)
-    env = build_env(profile, gpu.sycl_index)
+    env = build_env(profile, gpu)
     recipe = model.launch_recipe()
 
     # --- MTP head detection & safety wiring ---

@@ -158,8 +158,13 @@ def add_local_model(
 
 # Filename → kv_class hints, evaluated in order. First match wins.
 _KV_CLASS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"gemma[\W_-]*[34]", re.IGNORECASE), "gemma_swa"),
-    (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_27b_dense"),
+    (re.compile(r"gemma[\W_-]*[234]", re.IGNORECASE), "gemma_swa"),
+    (re.compile(r"phi[\W_-]*4", re.IGNORECASE), "phi4"),
+    (re.compile(r"deepseek[\W_-]*r1[\W_-]*distill", re.IGNORECASE), "deepseek_r1_distill"),
+    (re.compile(r"llama[\W_-]*(3|4)", re.IGNORECASE), "llama3"),
+    (re.compile(r"qwen[\W_-]*2[.\W_-]*5", re.IGNORECASE), "qwen2_5"),
+    (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_dense"),
+    (re.compile(r"qwen[\W_-]*3(?!.*a3b)(?!.*moe)", re.IGNORECASE), "qwen3_dense"),
     (re.compile(r"(qwen[\W_-]*3.*a3b|qwen[\W_-]*3.*moe|carnice|huihui.*30b.*a3b)", re.IGNORECASE), "moe_a3b"),
 ]
 

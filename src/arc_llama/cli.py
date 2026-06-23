@@ -31,6 +31,8 @@ from rich.console import Console
 from rich.table import Table
 
 from arc_llama import __version__
+from arc_llama.arch import Backend
+from arc_llama.binary import detect_llama_server_backend
 from arc_llama.config import (
     Config,
     default_config_path,
@@ -137,7 +139,7 @@ def cli(ctx: click.Context, verbose: bool, config_path: Path | None) -> None:
     "--llama-server",
     type=click.Path(),
     default=None,
-    help="Path to your built llama-server binary (SYCL backend).",
+    help="Path to your built llama-server binary (SYCL or Vulkan backend).",
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing config.")
 @click.option(
@@ -174,6 +176,18 @@ def init(
             console.print("Run [bold]arc-llama doctor[/bold] for a diagnosis.")
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
+    server_bin = Path(server_path).expanduser()
+    if server_bin.exists():
+        bin_backend = detect_llama_server_backend(server_bin)
+        if bin_backend is None:
+            console.print(
+                f"[yellow]Could not determine backend of {server_bin}; "
+                f"ensure it supports the GPUs you configured.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
+            )
     cfg = init_config_from_detection(gpus, llama_server_path=server_path)
     if scan_paths:
         cfg.paths.scan_paths = list(scan_paths)
@@ -210,6 +224,13 @@ def doctor(ctx: click.Context) -> None:
     """Diagnose the local environment."""
     config_path: Path = ctx.obj["config_path"]
     console.print("[bold]arc-llama doctor[/bold]\n")
+
+    cfg: Config | None = None
+    if config_path.exists():
+        try:
+            cfg = load_config(config_path)
+        except Exception:
+            console.print("[yellow]  warning: could not read config[/yellow]")
 
     # Kernel + driver (Linux-only diagnostics)
     if _IS_WINDOWS:
@@ -250,7 +271,7 @@ def doctor(ctx: click.Context) -> None:
 
     # External tools
     console.print("\n  external tools:")
-    for tool in ("clinfo", "sycl-ls", "intel_gpu_top", "nvtop", "lspci"):
+    for tool in ("clinfo", "sycl-ls", "vulkaninfo", "intel_gpu_top", "nvtop", "lspci"):
         path = shutil.which(tool)
         console.print(f"    {tool:<14} {path or '— missing —'}")
 
@@ -298,10 +319,42 @@ def doctor(ctx: click.Context) -> None:
                 "oneAPI Base Toolkit if you're building llama.cpp from source.[/yellow]"
             )
 
+    # llama-server binary
+    console.print("\n  llama-server binary:")
+    if cfg is not None:
+        llama_server = Path(cfg.paths.llama_server).expanduser()
+        if llama_server.exists():
+            bin_backend = detect_llama_server_backend(llama_server)
+            backend_text = bin_backend.value if bin_backend else "unknown"
+            console.print(f"    path:    {llama_server}")
+            console.print(f"    backend: {backend_text}")
+            if cfg.gpus:
+                mismatches = [
+                    gpu_cfg for gpu_cfg in cfg.gpus
+                    if gpu_cfg.enabled and gpu_cfg.backend != backend_text
+                ]
+                for gpu_cfg in mismatches:
+                    console.print(
+                        f"    [yellow]→ GPU {gpu_cfg.pci_slot} is configured for "
+                        f"'{gpu_cfg.backend}' but binary looks like '{backend_text}'.[/yellow]"
+                    )
+        else:
+            console.print(f"    [yellow]not found[/yellow] at {llama_server}")
+    else:
+        console.print("    [dim]no config loaded[/dim]")
+
     # Config
     console.print("\n  config:")
-    if config_path.exists():
+    if cfg is not None:
         console.print(f"    [green]found[/green] at {config_path}")
+        if cfg.gpus:
+            console.print("    GPUs in config:")
+            for gpu_cfg in cfg.gpus:
+                status = "enabled" if gpu_cfg.enabled else "disabled"
+                console.print(
+                    f"      - {gpu_cfg.pci_slot}  {gpu_cfg.name or gpu_cfg.arch}  "
+                    f"backend={gpu_cfg.backend}  [{status}]"
+                )
     else:
         console.print(
             f"    [yellow]missing[/yellow] at {config_path} — run "
@@ -362,6 +415,7 @@ def list_models(ctx: click.Context) -> None:
     table = Table(title="Models")
     table.add_column("Name")
     table.add_column("GPU")
+    table.add_column("Backend")
     table.add_column("Port")
     table.add_column("ctx")
     table.add_column("KV")
@@ -373,9 +427,12 @@ def list_models(ctx: click.Context) -> None:
         spec = r.get("spec_type", "—")
         if r.get("ubatch_size"):
             spec += f" (ub={r['ubatch_size']})"
+        gpu_cfg = cfg.find_gpu(m.gpu_pci_slot)
+        backend = gpu_cfg.backend if gpu_cfg else "?"
         table.add_row(
             m.name,
             m.gpu_pci_slot,
+            backend,
             str(m.port),
             str(r.get("ctx", "?")),
             kv,
@@ -397,6 +454,11 @@ def list_models(ctx: click.Context) -> None:
     help="PCI slot of the GPU to bind to (default: first enabled GPU).",
 )
 @click.option(
+    "--backend", "backend", default=None,
+    type=click.Choice([Backend.SYCL.value, Backend.VULKAN.value]),
+    help="Compute backend for this GPU (default: the GPU's configured backend, usually sycl).",
+)
+@click.option(
     "--port", type=int, default=None,
     help="Backend port for this model's llama-server (default: auto).",
 )
@@ -409,7 +471,10 @@ def list_models(ctx: click.Context) -> None:
 @click.option("--display-name", default="", help="Human-friendly name.")
 @click.option(
     "--kv-class",
-    type=click.Choice(["default", "moe_a3b", "qwen3_27b_dense", "gemma_swa"]),
+    type=click.Choice([
+        "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
+        "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
+    ]),
     default="default",
     help="KV-class hint, used for VRAM estimation.",
 )
@@ -433,6 +498,7 @@ def add(
     source: str,
     name: str | None,
     gpu_pci_slot: str | None,
+    backend: str | None,
     port: int | None,
     ctx_override: int | None,
     kv_type: str | None,
@@ -458,6 +524,25 @@ def add(
             console.print("[red]No enabled GPUs in config.[/red]")
             sys.exit(1)
         gpu_pci_slot = enabled[0].pci_slot
+
+    # Apply backend override to the selected GPU.
+    if backend is not None:
+        gpu_cfg = cfg.find_gpu(gpu_pci_slot)
+        if gpu_cfg is not None:
+            gpu_cfg.backend = backend
+
+    # Warn if the configured llama-server binary does not support the GPU backend.
+    selected_gpu = cfg.find_gpu(gpu_pci_slot)
+    if selected_gpu is not None:
+        bin_path = Path(cfg.paths.llama_server).expanduser()
+        if bin_path.exists():
+            bin_backend = detect_llama_server_backend(bin_path)
+            if bin_backend is not None and bin_backend.value != selected_gpu.backend:
+                console.print(
+                    f"[yellow]Warning: GPU {selected_gpu.pci_slot} is set to "
+                    f"'{selected_gpu.backend}', but {bin_path} appears to be a "
+                    f"'{bin_backend.value}' binary.[/yellow]"
+                )
 
     # Resolve source → file path. Local file wins if it exists; otherwise try HF.
     local_candidate = Path(source).expanduser()

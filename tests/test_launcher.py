@@ -7,9 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from arc_llama.arch import Arch
+from arc_llama.arch import Arch, Backend
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.launcher import LlamaServer, build_env, build_plan
+
+
+def _gpu(sycl_index: int = 0, backend: Backend = Backend.SYCL) -> GPUConfig:
+    return GPUConfig(
+        pci_slot="00:00.0",
+        sycl_index=sycl_index,
+        arch="battlemage",
+        backend=backend.value,
+    )
 
 
 class TestBuildEnv:
@@ -17,7 +26,7 @@ class TestBuildEnv:
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=2)
+        env = build_env(profile, _gpu(sycl_index=2))
         assert env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:2"
 
     def test_strips_bad_vars(self, monkeypatch: pytest.MonkeyPatch):
@@ -28,7 +37,7 @@ class TestBuildEnv:
         })
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=0)
+        env = build_env(profile, _gpu(sycl_index=0))
         assert "GGML_SYCL_DISABLE_OPT" not in env
         assert "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS" not in env
 
@@ -36,9 +45,31 @@ class TestBuildEnv:
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=0)
+        env = build_env(profile, _gpu(sycl_index=0))
         assert env["SYCL_CACHE_PERSISTENT"] == "0"
         assert env["ZES_ENABLE_SYSMAN"] == "1"
+
+    def test_vulkan_uses_visible_devices(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+        env = build_env(profile, _gpu(sycl_index=2, backend=Backend.VULKAN))
+        assert env["GGML_VK_VISIBLE_DEVICES"] == "2"
+        assert "ONEAPI_DEVICE_SELECTOR" not in env
+
+    def test_vulkan_strips_sycl_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(os, "environ", {
+            "PATH": "/usr/bin",
+            "ONEAPI_DEVICE_SELECTOR": "level_zero:0",
+            "SYCL_CACHE_PERSISTENT": "1",
+            "ZES_ENABLE_SYSMAN": "1",
+        })
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+        env = build_env(profile, _gpu(sycl_index=0, backend=Backend.VULKAN))
+        assert "ONEAPI_DEVICE_SELECTOR" not in env
+        assert "SYCL_CACHE_PERSISTENT" not in env
+        assert "ZES_ENABLE_SYSMAN" not in env
 
 
 class TestBuildPlan:

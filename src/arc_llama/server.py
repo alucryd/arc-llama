@@ -566,7 +566,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if model is None:
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
         valid_kv = {kv.value for kv in KVCacheType}
-        valid_classes = {"default", "moe_a3b", "qwen3_27b_dense", "gemma_swa"}
+        valid_classes = {
+            "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
+            "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
+        }
         recipe = dict(model.recipe or {})
         changed: list[str] = []
         if "ctx" in body:
