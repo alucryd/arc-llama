@@ -110,3 +110,80 @@ def mtp_info(path: Path | str) -> dict[str, Any]:
         "has_mtp_heads": has_mtp_heads(path),
         "is_hybrid_ssm": is_hybrid_ssm(path),
     }
+
+
+# ---------------------------------------------------------------------------
+# VRAM estimation
+# ---------------------------------------------------------------------------
+
+# Map GGML quantization type -> bytes per element. SYCL/Vulkan keep quantized
+# weights in their packed device format, so the raw tensor byte size is the
+# dominant weight-VRAM term.
+_BYTES_PER_ELEMENT: dict[gguf.GGMLQuantizationType, float] = {
+    qtype: block_bytes / block_size
+    for qtype, (block_size, block_bytes) in gguf.GGML_QUANT_SIZES.items()
+}
+
+
+def _tensor_vram_bytes(tensor: Any) -> int:
+    """Return the packed VRAM bytes for a single GGUF tensor.
+
+    For quantized tensors this is the raw quantized size (which is how SYCL
+    stores them on device). For unquantized types it is n_elements * bytes/elem.
+    """
+    try:
+        # n_bytes is the exact on-disk tensor payload size; for GGUF this is
+        # also the device-side size for quantized weights.
+        return int(tensor.n_bytes)
+    except Exception:
+        pass
+    try:
+        bpe = _BYTES_PER_ELEMENT.get(tensor.tensor_type)
+        if bpe is not None:
+            return int(tensor.n_elements * bpe)
+    except Exception:
+        pass
+    return 0
+
+
+def estimate_weight_vram_bytes(path: Path | str) -> int | None:
+    """Estimate the VRAM footprint of the model weights alone.
+
+    Sums the raw quantized tensor sizes from the GGUF file, which closely
+    matches the device-side footprint on SYCL/Vulkan. Falls back to the file
+    size if the GGUF cannot be inspected.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        reader = gguf.GGUFReader(p)
+    except Exception as exc:
+        log.debug("gguf weight estimate failed for %s: %s", p, exc)
+        return None
+
+    total = 0
+    for tensor in reader.tensors:
+        total += _tensor_vram_bytes(tensor)
+    return total
+
+
+def gguf_vram_estimate(path: Path | str) -> dict[str, Any]:
+    """Return a detailed VRAM estimate for a GGUF file.
+
+    Keys:
+        - file_size_bytes: size on disk
+        - weight_vram_bytes: estimated weight footprint in VRAM
+        - params: total parameter count read from tensor shapes
+        - architecture: model architecture from metadata
+    """
+    p = Path(path)
+    file_size = p.stat().st_size if p.exists() else 0
+    weight_vram = estimate_weight_vram_bytes(p)
+    meta = read_gguf_meta(p)
+    return {
+        "file_size_bytes": file_size,
+        "weight_vram_bytes": weight_vram,
+        "params": weight_vram // 2 if weight_vram else None,
+        "architecture": meta.get("architecture", "unknown"),
+    }

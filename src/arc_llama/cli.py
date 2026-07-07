@@ -9,7 +9,11 @@ Top-level commands:
   arc-llama add        Register a model — local file or HF download.
   arc-llama remove     Remove a model from the config.
   arc-llama serve      Run the OpenAI-compatible router.
-  arc-llama tui        Launch the terminal UI.
+  arc-llama agent      Run the local coding agent from the terminal (one-shot).
+  arc-llama code       Start an interactive coding agent REPL.
+  arc-llama agent-tui  Launch the arcllama agent TUI.
+  arcllama              Launch the arcllama agent TUI (same as agent-tui).
+  arc-llama tui        Launch the server management TUI.
   arc-llama systemd    Print a systemd --user service unit for `arc-llama serve`.
 
 A small static web UI is bundled and served at `/` on the same port as
@@ -17,6 +21,7 @@ A small static web UI is bundled and served at `/` on the same port as
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -24,15 +29,25 @@ import platform
 import shutil
 import subprocess
 import sys
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import click
+import httpx
 from rich.console import Console
 from rich.table import Table
 
 from arc_llama import __version__
+from arc_llama import benchmark as benchmark_mod
+from arc_llama.agent import run_agent
+from arc_llama.agent.checkpoints import CheckpointStore
+from arc_llama.agent.interactive import InteractiveAgent
+from arc_llama.agent.mcp_client import MCPClientManager
+from arc_llama.agent_tui import run_agent_tui
 from arc_llama.arch import Backend
 from arc_llama.binary import detect_llama_server_backend
+from arc_llama.chat_store import ChatMessage, ChatStore
 from arc_llama.config import (
     Config,
     default_config_path,
@@ -47,6 +62,7 @@ from arc_llama.models import (
     parse_hf_spec,
     register_discovered,
 )
+from arc_llama.skills import load_skills
 
 console = Console()
 
@@ -93,11 +109,14 @@ def _save_or_die(cfg: Config, path: Path) -> None:
 
 
 def _resolve_llama_server(explicit: str | None) -> str:
-    """Find a usable llama-server binary, in order of preference."""
-    candidates: list[str] = []
+    """Find a usable llama-server binary, in order of preference.
+
+    If the user explicitly passed a path, preserve it even when it does not
+    exist so the caller can report the exact location in an error.
+    """
     if explicit:
-        candidates.append(explicit)
-    candidates += [
+        return explicit
+    candidates = [
         os.environ.get("ARC_LLAMA_SERVER", ""),
         shutil.which("llama-server") or "",
         "/usr/local/bin/llama-server",
@@ -177,28 +196,31 @@ def init(
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
     server_bin = Path(server_path).expanduser()
-    if server_bin.exists():
-        bin_backend = detect_llama_server_backend(server_bin)
-        if bin_backend is None:
+    if not server_bin.exists():
+        console.print(
+            f"[red]llama-server binary not found: {server_path}[/red]"
+        )
+        if llama_server is None:
             console.print(
-                f"[yellow]Could not determine backend of {server_bin}; "
-                f"ensure it supports the GPUs you configured.[/yellow]"
+                "Pass --llama-server /path/to/llama-server or ensure it is on PATH."
             )
-        else:
-            console.print(
-                f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
-            )
+        sys.exit(3)
+    bin_backend = detect_llama_server_backend(server_bin)
+    if bin_backend is None:
+        console.print(
+            f"[yellow]Could not determine backend of {server_bin}; "
+            f"ensure it supports the GPUs you configured.[/yellow]"
+        )
+    else:
+        console.print(
+            f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
+        )
     cfg = init_config_from_detection(gpus, llama_server_path=server_path)
     if scan_paths:
         cfg.paths.scan_paths = list(scan_paths)
     _save_or_die(cfg, config_path)
     console.print(f"[green]Wrote config to {config_path}[/green]")
     _print_gpu_table(gpus)
-    if cfg.paths.llama_server == "llama-server":
-        console.print(
-            "[yellow]llama-server binary not found; set 'paths.llama_server' "
-            "in the config or pass --llama-server.[/yellow]"
-        )
     if scan:
         added = _do_scan(cfg, [Path(p) for p in scan_paths])
         if added:
@@ -404,7 +426,7 @@ def _print_gpu_table(gpus) -> None:
 @cli.command("list")
 @click.pass_context
 def list_models(ctx: click.Context) -> None:
-    """List registered models."""
+    """List registered models and which one is currently loaded."""
     cfg = load_config(ctx.obj["config_path"])
     if not cfg.models:
         console.print(
@@ -412,8 +434,22 @@ def list_models(ctx: click.Context) -> None:
             "Run [bold]arc-llama add ...[/bold].[/yellow]"
         )
         return
+
+    loaded: set[str] = set()
+    status_connected = False
+    status_url = f"http://{cfg.server.host}:{cfg.server.port}/admin/status"
+    try:
+        r = httpx.get(status_url, timeout=2.0)
+        r.raise_for_status()
+        loaded = {m["name"] for m in r.json().get("models", []) if m.get("loaded")}
+        status_connected = True
+    except Exception:
+        # Server not running; fall back to config-only listing.
+        pass
+
     table = Table(title="Models")
     table.add_column("Name")
+    table.add_column("Status")
     table.add_column("GPU")
     table.add_column("Backend")
     table.add_column("Port")
@@ -422,24 +458,30 @@ def list_models(ctx: click.Context) -> None:
     table.add_column("Spec")
     table.add_column("Path")
     for m in cfg.models:
-        r = m.recipe or {}
-        kv = f"{r.get('cache_type_k','f16')}/{r.get('cache_type_v','f16')}"
-        spec = r.get("spec_type", "—")
-        if r.get("ubatch_size"):
-            spec += f" (ub={r['ubatch_size']})"
+        recipe = m.recipe or {}
+        kv = f"{recipe.get('cache_type_k','f16')}/{recipe.get('cache_type_v','f16')}"
+        spec = recipe.get("spec_type", "—")
+        if recipe.get("ubatch_size"):
+            spec += f" (ub={recipe['ubatch_size']})"
         gpu_cfg = cfg.find_gpu(m.gpu_pci_slot)
         backend = gpu_cfg.backend if gpu_cfg else "?"
+        status = "[green]loaded[/green]" if m.name in loaded else "[dim]idle[/dim]"
         table.add_row(
             m.name,
+            status,
             m.gpu_pci_slot,
             backend,
             str(m.port),
-            str(r.get("ctx", "?")),
+            str(recipe.get("ctx", "?")),
             kv,
             spec,
             m.path,
         )
     console.print(table)
+    if not status_connected and cfg.server.host and cfg.server.port:
+        console.print(
+            f"[dim]Status not available from {status_url}; server may not be running.[/dim]"
+        )
 
 
 # ===========================================================================
@@ -701,18 +743,51 @@ def remove(ctx: click.Context, name: str) -> None:
 @cli.command("serve")
 @click.option("--host", default=None, help="Override server host.")
 @click.option("--port", type=int, default=None, help="Override server port.")
+@click.option(
+    "--profile",
+    default=None,
+    help="Active MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--admin-token",
+    default=None,
+    help=(
+        "Bearer token required for admin endpoints and auto_confirm agent runs "
+        "(overrides config; also settable via ARC_LLAMA_ADMIN_TOKEN)."
+    ),
+)
 @click.pass_context
-def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
+def serve(
+    ctx: click.Context,
+    host: str | None,
+    port: int | None,
+    profile: str | None,
+    admin_token: str | None,
+) -> None:
     """Run the OpenAI-compatible router."""
     cfg = load_config(ctx.obj["config_path"])
     if host:
         cfg.server.host = host
     if port:
         cfg.server.port = port
+    if profile:
+        cfg.agent.profile = profile
+    if admin_token:
+        cfg.server.admin_token = admin_token
     if not cfg.models:
         console.print(
             "[yellow]No models registered yet — `arc-llama add` something first.[/yellow]"
         )
+    if cfg.server.host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            f"[yellow]Binding to {cfg.server.host!r}, not loopback -- make sure "
+            "admin_token is set to something you control (it was auto-generated "
+            "if you never set one).[/yellow]"
+        )
+    console.print(
+        f"[dim]Admin token: {cfg.server.admin_token} "
+        "(required for admin endpoints and auto_confirm agent runs)[/dim]"
+    )
     try:
         import uvicorn
     except ImportError:
@@ -759,6 +834,90 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
             pass
 
     uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="info")
+
+
+# ===========================================================================
+# benchmark
+# ===========================================================================
+
+@cli.command("benchmark")
+@click.argument("model")
+@click.option(
+    "--server", "server_url",
+    default=None,
+    help="Base URL of arc-llama serve (default: http://HOST:PORT from config).",
+)
+@click.option(
+    "--prompt-tokens", "prompt_tokens",
+    type=int, default=benchmark_mod.DEFAULT_PROMPT_TOKENS,
+    help="Approximate prompt length to benchmark.",
+)
+@click.option(
+    "--gen-tokens", "gen_tokens",
+    type=int, default=benchmark_mod.DEFAULT_GEN_TOKENS,
+    help="Number of tokens to generate.",
+)
+@click.option(
+    "--sweep-ctx", "sweep_ctx",
+    default="",
+    help="Comma-separated ctx values for a sweep (e.g. 4096,8192,16384).",
+)
+@click.option(
+    "--sweep-kv", "sweep_kv",
+    default="",
+    help="Comma-separated KV types for a sweep (e.g. f16,q8_0,q4_0).",
+)
+@click.pass_context
+def benchmark_cmd(
+    ctx: click.Context,
+    model: str,
+    server_url: str | None,
+    prompt_tokens: int,
+    gen_tokens: int,
+    sweep_ctx: str,
+    sweep_kv: str,
+) -> None:
+    """Benchmark prompt-eval and generation throughput for a registered model."""
+    cfg = load_config(ctx.obj["config_path"])
+    if cfg.find_model(model) is None:
+        console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
+        sys.exit(1)
+    if server_url is None:
+        server_url = f"http://{cfg.server.host}:{cfg.server.port}"
+
+    ctx_values = [int(x.strip()) for x in sweep_ctx.split(",") if x.strip()] if sweep_ctx else []
+    kv_values = [x.strip() for x in sweep_kv.split(",") if x.strip()] if sweep_kv else []
+
+    model_cfg = cfg.find_model(model)
+    assert model_cfg is not None
+
+    async def _run() -> None:
+        if ctx_values or kv_values:
+            recipe = model_cfg.recipe or {}
+            results = await benchmark_mod.benchmark_sweep(
+                server_url, model,
+                ctx_values=ctx_values or [recipe.get("ctx", 4096)],
+                kv_types=kv_values or [recipe.get("cache_type_k", "f16")],
+                prompt_tokens=prompt_tokens,
+                gen_tokens=gen_tokens,
+                cfg=cfg,
+            )
+            benchmark_mod.print_sweep_table(results)
+        else:
+            result = await benchmark_mod.benchmark_model(
+                server_url, model,
+                prompt_tokens=prompt_tokens,
+                gen_tokens=gen_tokens,
+                cfg=cfg,
+            )
+            benchmark_mod.print_result(result)
+
+    import asyncio
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Benchmark interrupted.[/yellow]")
+        sys.exit(130)
 
 
 # ===========================================================================
@@ -884,6 +1043,471 @@ def upstream_remove(ctx: click.Context, name: str) -> None:
         sys.exit(1)
     _save_or_die(cfg, cfg_path)
     console.print(f"[green]Removed upstream '{name}'.[/green]")
+
+
+# ===========================================================================
+# agent
+# ===========================================================================
+
+def _state_dir_from_config(cfg: Config) -> Path | None:
+    if cfg.paths.state_dir:
+        return Path(cfg.paths.state_dir).expanduser()
+    return None
+
+
+@asynccontextmanager
+async def _agent_tool_context(cfg: Config, profile: str | None):
+    """Load skills and start the active profile's MCP servers for a CLI agent run."""
+    load_skills(cfg.paths.skills_dir)
+    manager = MCPClientManager(cfg.active_mcp_servers(profile))
+    try:
+        await manager.start()
+        yield
+    finally:
+        await manager.stop()
+
+
+async def _prompt_yes_no(prompt: str) -> bool:
+    """Prompt the user for a yes/no answer from an async context."""
+    loop = asyncio.get_running_loop()
+    while True:
+        answer = await loop.run_in_executor(None, input, prompt)
+        cleaned = answer.strip().lower()
+        if cleaned in ("y", "yes"):
+            return True
+        if cleaned in ("n", "no"):
+            return False
+        console.print("[dim]Please answer y or n.[/dim]")
+
+
+def _render_agent_event(event: dict) -> None:
+    t = event.get("type")
+    if t == "status":
+        console.print(f"[dim]# {event.get('message', '')}[/dim]")
+    elif t == "plan":
+        console.print("[bold cyan]Proposed plan:[/bold cyan]")
+        console.print(event.get("content", ""))
+    elif t == "assistant":
+        content = event.get("content", "")
+        if content:
+            console.print(content)
+    elif t == "tool_call":
+        name = event.get("name", "tool")
+        args = event.get("arguments", {})
+        console.print(f"[bold yellow]▶ {name}[/bold yellow]")
+        console.print(f"[dim]{json.dumps(args, indent=2, ensure_ascii=False)}[/dim]")
+    elif t == "tool_result":
+        name = event.get("name", "tool")
+        content = event.get("content", "")
+        if event.get("error"):
+            console.print(f"[red]✗ {name} failed[/red]")
+        else:
+            console.print(f"[green]✓ {name} done[/green]")
+        console.print(f"[dim]{content}[/dim]")
+    elif t == "confirm_required":
+        console.print(f"[yellow]⚠ Confirmation required for {event.get('tool', 'tool')}[/yellow]")
+    elif t == "checkpoint":
+        console.print(f"[dim]Checkpoint saved: {event.get('id', '')}[/dim]")
+    elif t == "error":
+        console.print(f"[red]Error: {event.get('message', '')}[/red]")
+    elif t == "done":
+        console.print("[green]Agent finished.[/green]")
+
+
+@cli.command("agent")
+@click.argument("task")
+@click.option("--model", "-m", required=True, help="Model id to use.")
+@click.option("--root", "-r", default=None, help="Project root (default: agent.root from config).")
+@click.option("--auto-confirm", is_flag=True, help="Do not prompt for tool confirmation.")
+@click.option("--plan-mode", is_flag=True, help="Generate a plan first and ask for approval.")
+@click.option("--max-turns", type=int, default=30, help="Maximum agent turns (default: 30).")
+@click.option("--folder", "-f", default="", help="Folder to save the agent transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def agent_cmd(
+    ctx: click.Context,
+    task: str,
+    model: str,
+    root: str | None,
+    auto_confirm: bool,
+    plan_mode: bool,
+    max_turns: int,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Run the local coding agent from the terminal.
+
+    Requires a running `arc-llama serve` instance. The agent streams events to
+    the terminal and prompts for confirmation before destructive tools.
+    """
+    cfg = load_config(ctx.obj["config_path"])
+    if base_url is None:
+        base_url = f"http://{cfg.server.host}:{cfg.server.port}"
+
+    try:
+        health = httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+        health.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Cannot reach arc-llama server at {base_url}: {e}[/red]")
+        console.print("[dim]Start one with:[/dim] arc-llama serve")
+        sys.exit(1)
+
+    root_path = Path(root or cfg.agent.root).expanduser().resolve()
+    state_dir = _state_dir_from_config(cfg)
+    chat_store = ChatStore(
+        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
+    )
+    checkpoint_store = CheckpointStore(
+        state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
+    )
+
+    title = task.strip().split("\n")[0][:80] or "Agent task"
+    agent_chat = chat_store.create(str(uuid.uuid4()), title, folder=folder)
+    run_id = str(uuid.uuid4())
+    transcript: list[ChatMessage] = [ChatMessage(role="user", content=task)]
+
+    async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
+        summary = json.dumps(arguments, ensure_ascii=False)[:200]
+        return await _prompt_yes_no(f"Allow [bold]{tool}[/bold] {summary}? [y/n] ")
+
+    async def plan_callback(plan_text: str) -> bool:
+        return await _prompt_yes_no("Approve plan? [y/n] ")
+
+    async def run() -> None:
+        async with _agent_tool_context(cfg, profile):
+            async for event in run_agent(
+                task=task,
+                model=model,
+                base_url=base_url,
+                root=root_path,
+                auto_confirm=auto_confirm,
+                confirm_callback=confirm_callback,
+                plan_mode=plan_mode,
+                plan_callback=plan_callback,
+                run_id=run_id,
+                checkpoint_store=checkpoint_store,
+                max_turns=max_turns,
+                chat_store=chat_store,
+            ):
+                _render_agent_event(event)
+                if event.get("type") == "assistant" and event.get("content"):
+                    transcript.append(ChatMessage(role="assistant", content=event["content"]))
+                elif event.get("type") == "tool_result":
+                    name = event.get("name", "tool")
+                    content = event.get("content", "")
+                    transcript.append(ChatMessage(role="tool", content=f"{name}:\n{content}"))
+
+            chat = chat_store.get(agent_chat.id)
+            if chat is not None:
+                chat.messages.extend(transcript)
+                chat_store.save(chat)
+                console.print(f"[dim]Transcript saved: chat {agent_chat.id} in folder '{folder or 'default'}'[/dim]")
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Agent run interrupted.[/yellow]")
+
+
+# ===========================================================================
+# code (interactive agent REPL)
+# ===========================================================================
+
+@cli.command("code")
+@click.option("--model", "-m", required=True, help="Model id to use.")
+@click.option("--root", "-r", default=None, help="Project root (default: agent.root from config).")
+@click.option("--auto-confirm", is_flag=True, help="Do not prompt for tool confirmation.")
+@click.option("--plan-mode", is_flag=True, help="Generate a plan first and ask for approval each turn.")
+@click.option("--max-turns", type=int, default=30, help="Maximum agent turns per user message (default: 30).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def code_cmd(
+    ctx: click.Context,
+    model: str,
+    root: str | None,
+    auto_confirm: bool,
+    plan_mode: bool,
+    max_turns: int,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Start an interactive coding agent REPL.
+
+    Requires a running `arc-llama serve` instance. Type messages and the agent
+    will use tools across multiple turns. Special commands start with `/`.
+    """
+    cfg = load_config(ctx.obj["config_path"])
+    if base_url is None:
+        base_url = f"http://{cfg.server.host}:{cfg.server.port}"
+
+    try:
+        health = httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+        health.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Cannot reach arc-llama server at {base_url}: {e}[/red]")
+        console.print("[dim]Start one with:[/dim] arc-llama serve")
+        sys.exit(1)
+
+    root_path = Path(root or cfg.agent.root).expanduser().resolve()
+    state_dir = _state_dir_from_config(cfg)
+    chat_store = ChatStore(
+        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
+    )
+    checkpoint_store = CheckpointStore(
+        state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
+    )
+
+    session_chat = chat_store.create(str(uuid.uuid4()), "CLI session", folder=folder)
+    run_id = str(uuid.uuid4())
+
+    agent = InteractiveAgent(
+        model=model,
+        base_url=base_url,
+        root=root_path,
+        auto_confirm=auto_confirm,
+        plan_mode=plan_mode,
+        max_turns=max_turns,
+        chat_store=chat_store,
+        checkpoint_store=checkpoint_store,
+        run_id=run_id,
+    )
+
+    settings = {
+        "model": model,
+        "root": str(root_path),
+        "folder": folder or "default",
+        "auto_confirm": auto_confirm,
+        "plan_mode": plan_mode,
+        "max_turns": max_turns,
+    }
+
+    console.print("[bold green]arc-llama code[/bold green] — interactive agent")
+    for key, value in settings.items():
+        console.print(f"  [dim]{key}:[/dim] {value}")
+    console.print("[dim]Type /help for commands, /quit to exit.[/dim]\n")
+
+    async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
+        summary = json.dumps(arguments, ensure_ascii=False)[:200]
+        return await _prompt_yes_no(f"Allow [bold]{tool}[/bold] {summary}? [y/n] ")
+
+    async def plan_callback(plan_text: str) -> bool:
+        return await _prompt_yes_no("Approve plan? [y/n] ")
+
+    async def save_transcript(messages: list[ChatMessage]) -> None:
+        if not messages:
+            return
+        chat = chat_store.get(session_chat.id)
+        if chat is None:
+            return
+        chat.messages.extend(messages)
+        chat_store.save(chat)
+
+    async def repl() -> None:
+        nonlocal session_chat, agent
+        async with _agent_tool_context(cfg, profile):
+            loop = asyncio.get_running_loop()
+            while True:
+                try:
+                    user_input = await loop.run_in_executor(None, input, ">>> ")
+                except EOFError:
+                    console.print("\n[yellow]Exiting.[/yellow]")
+                    break
+
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    command = user_input[1:].strip()
+                    if command in ("quit", "exit"):
+                        console.print("[yellow]Goodbye.[/yellow]")
+                        break
+                    if command == "help":
+                        console.print(
+                            "[bold]Commands:[/bold]\n"
+                            "  /help              show this message\n"
+                            "  /quit, /exit       leave the REPL\n"
+                            "  /auto              toggle auto-confirm\n"
+                            "  /plan              toggle plan mode\n"
+                            "  /model <id>        change model\n"
+                            "  /root <path>       change project root\n"
+                            "  /folder <name>     move transcript to folder\n"
+                            "  /max-turns <n>     change max turns per message\n"
+                            "  /clear             start a new session chat"
+                        )
+                        continue
+                    if command == "auto":
+                        agent.auto_confirm = not agent.auto_confirm
+                        console.print(f"[dim]auto_confirm = {agent.auto_confirm}[/dim]")
+                        continue
+                    if command == "plan":
+                        agent.plan_mode = not agent.plan_mode
+                        console.print(f"[dim]plan_mode = {agent.plan_mode}[/dim]")
+                        continue
+                    if command == "clear":
+                        await agent.close()
+                        session_chat = chat_store.create(str(uuid.uuid4()), "CLI session", folder=folder)
+                        agent = InteractiveAgent(
+                            model=agent.model,
+                            base_url=base_url,
+                            root=agent.root,
+                            auto_confirm=agent.auto_confirm,
+                            plan_mode=agent.plan_mode,
+                            max_turns=agent.max_turns,
+                            chat_store=chat_store,
+                            checkpoint_store=checkpoint_store,
+                            run_id=str(uuid.uuid4()),
+                        )
+                        console.print("[dim]Started a new session chat.[/dim]")
+                        continue
+                    if command.startswith("model "):
+                        agent.model = command[6:].strip() or agent.model
+                        console.print(f"[dim]model = {agent.model}[/dim]")
+                        continue
+                    if command.startswith("root "):
+                        new_root = Path(command[5:].strip()).expanduser().resolve()
+                        agent.root = new_root
+                        console.print(f"[dim]root = {agent.root}[/dim]")
+                        continue
+                    if command.startswith("folder "):
+                        new_folder = command[7:].strip()
+                        chat = chat_store.get(session_chat.id)
+                        if chat is not None:
+                            chat.folder = new_folder
+                            chat_store.save(chat)
+                        console.print(f"[dim]folder = {new_folder}[/dim]")
+                        continue
+                    if command.startswith("max-turns "):
+                        try:
+                            agent.max_turns = int(command[10:].strip())
+                            console.print(f"[dim]max_turns = {agent.max_turns}[/dim]")
+                        except ValueError:
+                            console.print("[red]max-turns requires an integer[/red]")
+                        continue
+                    console.print(f"[red]Unknown command: /{command}[/red]")
+                    continue
+
+                turn_messages: list[ChatMessage] = [ChatMessage(role="user", content=user_input)]
+                async for event in agent.chat(
+                    user_input,
+                    confirm_callback=confirm_callback,
+                    plan_callback=plan_callback,
+                ):
+                    _render_agent_event(event)
+                    if event.get("type") == "assistant" and event.get("content"):
+                        turn_messages.append(ChatMessage(role="assistant", content=event["content"]))
+                    elif event.get("type") == "tool_result":
+                        name = event.get("name", "tool")
+                        content = event.get("content", "")
+                        turn_messages.append(ChatMessage(role="tool", content=f"{name}:\n{content}"))
+
+                await save_transcript(turn_messages)
+
+            await agent.close()
+
+    try:
+        asyncio.run(repl())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Session interrupted.[/yellow]")
+
+
+# ===========================================================================
+# agent-tui (arcllama)
+# ===========================================================================
+
+@cli.command("agent-tui")
+@click.option("--model", "-m", default=None, help="Model id to use (default: first available).")
+@click.option("--root", "-r", default=None, help="Project root (default: current directory).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def agent_tui_cmd(
+    ctx: click.Context,
+    model: str | None,
+    root: str | None,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Launch the interactive arcllama agent TUI."""
+    cfg = load_config(ctx.obj["config_path"])
+    try:
+        run_agent_tui(
+            base_url=base_url,
+            model=model,
+            root=root,
+            folder=folder,
+            profile=profile,
+            config=cfg,
+        )
+    except SystemExit as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+
+@click.command(name="arcllama", add_help_option=True)
+@click.option("--model", "-m", default=None, help="Model id to use (default: first available).")
+@click.option("--root", "-r", default=None, help="Project root (default: current directory).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+def arcllama_main(
+    model: str | None,
+    root: str | None,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Entry point for the `arcllama` command."""
+    try:
+        run_agent_tui(
+            base_url=base_url,
+            model=model,
+            root=root,
+            folder=folder,
+            profile=profile,
+        )
+    except SystemExit as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
 
 
 # ===========================================================================

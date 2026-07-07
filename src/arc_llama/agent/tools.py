@@ -42,6 +42,7 @@ class ToolResult:
 
     content: str
     error: bool = False
+    checkpoint_id: str | None = None
 
 
 @dataclass
@@ -51,6 +52,8 @@ class ToolContext:
     root: Path
     client: httpx.AsyncClient
     extra: dict[str, Any] = field(default_factory=dict)
+    checkpoint_store: Any | None = None
+    run_id: str | None = None
 
 
 @dataclass
@@ -214,6 +217,28 @@ def _git_mutation_prefix(command: str) -> str | None:
     return None
 
 
+def _ensure_checkpoint(ctx: ToolContext) -> str | None:
+    """Create a checkpoint before the first mutation in a run.
+
+    Returns the checkpoint id, or None if checkpointing is not configured.
+    """
+    if ctx.checkpoint_store is None or ctx.run_id is None:
+        return None
+    key = "checkpoint_id"
+    checkpoint_id = ctx.extra.get(key)
+    if checkpoint_id:
+        return checkpoint_id
+
+    from arc_llama.agent.checkpoints import CheckpointStore
+
+    if not isinstance(ctx.checkpoint_store, CheckpointStore):
+        return None
+
+    cp = ctx.checkpoint_store.create(ctx.run_id, ctx.root)
+    ctx.extra[key] = cp.id
+    return cp.id
+
+
 def read_file(path: str, root: Path) -> ToolResult:
     """Read the contents of a single file."""
     try:
@@ -229,6 +254,52 @@ def read_file(path: str, root: Path) -> ToolResult:
     except OSError as e:
         return ToolResult(f"Error reading {path}: {e}", error=True)
     return ToolResult(text)
+
+
+def apply_patch(
+    path: str,
+    old_string: str,
+    new_string: str,
+    root: Path,
+    replace_all: bool = False,
+) -> ToolResult:
+    """Apply a surgical search/replace edit to a single file."""
+    try:
+        target = _resolve_path(path, root)
+    except ToolError as e:
+        return ToolResult(str(e), error=True)
+    if not target.exists():
+        return ToolResult(f"Error: file not found: {path}", error=True)
+    if target.is_dir():
+        return ToolResult(f"Error: {path} is a directory", error=True)
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return ToolResult(f"Error reading {path}: {e}", error=True)
+
+    if old_string not in text:
+        return ToolResult(
+            f"Error: old_string not found in {path}",
+            error=True,
+        )
+
+    count = text.count(old_string)
+    if not replace_all and count > 1:
+        return ToolResult(
+            f"Error: old_string occurs {count} times in {path}; "
+            "set replace_all=true to replace all occurrences",
+            error=True,
+        )
+
+    new_text = text.replace(old_string, new_string) if replace_all else text.replace(old_string, new_string, 1)
+
+    try:
+        target.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return ToolResult(f"Error writing {path}: {e}", error=True)
+
+    replaced = count if replace_all else 1
+    return ToolResult(f"Patched {path} ({replaced} replacement(s))")
 
 
 @tool(
@@ -345,10 +416,57 @@ def write_file(path: str, content: str, root: Path) -> ToolResult:
     requires_confirmation=True,
 )
 def _write_file_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    return write_file(
+    checkpoint_id = _ensure_checkpoint(ctx)
+    result = write_file(
         arguments.get("path", ""),
         arguments.get("content", ""),
         ctx.root,
+    )
+    return ToolResult(
+        content=result.content,
+        error=result.error,
+        checkpoint_id=checkpoint_id,
+    )
+
+
+@tool(
+    name="apply_patch",
+    description="Apply a surgical search/replace edit to a file. "
+                "old_string must match exactly once unless replace_all is true.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Relative path to the file."},
+            "old_string": {
+                "type": "string",
+                "description": "Exact text to replace.",
+            },
+            "new_string": {
+                "type": "string",
+                "description": "Replacement text.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Replace every occurrence instead of just the first.",
+            },
+        },
+        "required": ["path", "old_string", "new_string"],
+    },
+    requires_confirmation=True,
+)
+def _apply_patch_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    checkpoint_id = _ensure_checkpoint(ctx)
+    result = apply_patch(
+        arguments.get("path", ""),
+        arguments.get("old_string", ""),
+        arguments.get("new_string", ""),
+        ctx.root,
+        bool(arguments.get("replace_all", False)),
+    )
+    return ToolResult(
+        content=result.content,
+        error=result.error,
+        checkpoint_id=checkpoint_id,
     )
 
 
@@ -498,14 +616,23 @@ def _search_files_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResul
 
 @tool(
     name="list_chats",
-    description="List saved chat conversations ordered by most recently updated first.",
-    parameters={"type": "object", "properties": {}},
+    description="List saved chat conversations ordered by most recently updated first. Optionally filter by folder.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "folder": {
+                "type": "string",
+                "description": "Optional folder name to filter by. Omit to list all folders.",
+            },
+        },
+    },
 )
 def _list_chats_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
     store = ctx.extra.get("chat_store")
     if store is None:
         return ToolResult("Chat history is not available in this environment.", error=True)
-    summaries = [c.summary() for c in store.list_chats()]
+    folder = arguments.get("folder")
+    summaries = [c.summary() for c in store.list_chats(folder=folder)]
     return ToolResult(json.dumps(summaries, indent=2))
 
 
@@ -532,7 +659,7 @@ def _read_chat_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 @tool(
     name="search_chats",
-    description="Search saved chat titles and messages for a keyword or phrase.",
+    description="Search saved chat titles and messages for a keyword or phrase. Optionally restrict to a folder.",
     parameters={
         "type": "object",
         "properties": {
@@ -540,6 +667,10 @@ def _read_chat_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of chats to return (default 20).",
+            },
+            "folder": {
+                "type": "string",
+                "description": "Optional folder name to restrict the search to.",
             },
         },
         "required": ["query"],
@@ -551,12 +682,121 @@ def _search_chats_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResul
         return ToolResult("Chat history is not available in this environment.", error=True)
     query = arguments.get("query", "")
     limit = int(arguments.get("limit", 20))
-    results = store.search(query, limit=limit)
+    folder = arguments.get("folder")
+    results = store.search(query, limit=limit, folder=folder)
     payload = [
         {"chat": chat.summary(), "matching_message_indices": indices}
         for chat, indices in results
     ]
     return ToolResult(json.dumps(payload, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint tools (require checkpoint_store in ToolContext)
+# ---------------------------------------------------------------------------
+
+@tool(
+    name="list_checkpoints",
+    description="List checkpoints for the current agent run, oldest first.",
+    parameters={"type": "object", "properties": {}},
+)
+def _list_checkpoints_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    from arc_llama.agent.checkpoints import CheckpointStore
+
+    if ctx.checkpoint_store is None or ctx.run_id is None:
+        return ToolResult("Checkpointing is not available in this environment.", error=True)
+    if not isinstance(ctx.checkpoint_store, CheckpointStore):
+        return ToolResult("Checkpointing is not available in this environment.", error=True)
+
+    checkpoints = ctx.checkpoint_store.list(ctx.run_id)
+    payload = [
+        {
+            "id": cp.id,
+            "created_at": cp.created_at,
+            "files": cp.files,
+        }
+        for cp in checkpoints
+    ]
+    return ToolResult(json.dumps(payload, indent=2))
+
+
+@tool(
+    name="restore_checkpoint",
+    description="Restore the project root to a previous checkpoint.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "checkpoint_id": {
+                "type": "string",
+                "description": "The id of the checkpoint to restore.",
+            },
+        },
+        "required": ["checkpoint_id"],
+    },
+    requires_confirmation=True,
+)
+def _restore_checkpoint_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    from arc_llama.agent.checkpoints import CheckpointStore
+
+    if ctx.checkpoint_store is None or ctx.run_id is None:
+        return ToolResult("Checkpointing is not available in this environment.", error=True)
+    if not isinstance(ctx.checkpoint_store, CheckpointStore):
+        return ToolResult("Checkpointing is not available in this environment.", error=True)
+
+    checkpoint_id = arguments.get("checkpoint_id", "")
+    try:
+        ctx.checkpoint_store.restore(ctx.run_id, checkpoint_id, ctx.root)
+    except FileNotFoundError as e:
+        return ToolResult(str(e), error=True)
+    except Exception as e:
+        return ToolResult(f"Error restoring checkpoint: {e}", error=True)
+    return ToolResult(f"Restored checkpoint {checkpoint_id}")
+
+
+@tool(
+    name="repo_map",
+    description="Return a concise symbol-level map of the project codebase.",
+    parameters={"type": "object", "properties": {}},
+)
+def _repo_map_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    from arc_llama.agent.repo_map import build_repo_map
+
+    return ToolResult(build_repo_map(ctx.root))
+
+
+@tool(
+    name="semantic_search",
+    description="Search the codebase using local semantic embeddings (requires the 'semantic' extra).",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language query, e.g. 'where is authentication handled?'",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum number of results (default 5).",
+            },
+        },
+        "required": ["query"],
+    },
+)
+def _semantic_search_tool(arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    from arc_llama.agent.repo_map import SemanticIndex
+
+    index = ctx.extra.get("semantic_index")
+    if index is None:
+        # Fallback to a local index directory adjacent to the project root.
+        index = SemanticIndex(ctx.root / ".arc_llama_semantic_index")
+        ctx.extra["semantic_index"] = index
+    try:
+        results = index.search(ctx.root, arguments.get("query", ""), top_k=int(arguments.get("top_k", 5)))
+    except RuntimeError as e:
+        return ToolResult(str(e), error=True)
+    except Exception as e:
+        return ToolResult(f"Semantic search failed: {e}", error=True)
+    return ToolResult(json.dumps(results, indent=2))
 
 
 # ---------------------------------------------------------------------------

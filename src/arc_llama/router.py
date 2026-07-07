@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from arc_llama.config import Config, GPUConfig, ModelConfig
+from arc_llama.gguf_meta import estimate_weight_vram_bytes
 from arc_llama.launcher import LlamaServer, build_plan
 from arc_llama.recipes import KVCacheType, estimate_kv_bytes
 
@@ -33,19 +34,27 @@ _VRAM_SAFETY_MARGIN_MB = 256
 def _estimate_model_vram_mb(model: ModelConfig) -> int:
     """Rough VRAM footprint for one model instance.
 
-    Includes the mapped weights (model file size), the KV cache at the
-    configured context/type, and a fixed compute-buffer + safety margin.
+    Uses GGUF tensor metadata to estimate the decompressed weight footprint,
+    which is much closer to reality for heavily quantized files than the raw
+    file size. Falls back to file size if the GGUF cannot be read.
     """
     path = Path(model.path)
-    try:
-        model_file_mb = path.stat().st_size // (1_048_576)
-    except OSError:
-        model_file_mb = 0
+    weight_bytes = estimate_weight_vram_bytes(path)
+    if weight_bytes is None:
+        try:
+            weight_bytes = path.stat().st_size
+        except OSError:
+            weight_bytes = 0
+        log.debug(
+            "VRAM estimate for %s falling back to file size: %.0f MiB",
+            model.name, weight_bytes / (1_048_576),
+        )
+    weight_mb = weight_bytes // (1_048_576)
     recipe = model.recipe or {}
     ctx = int(recipe.get("ctx", 8192))
     kv_type = KVCacheType(recipe.get("cache_type_k", "f16"))
     kv_mb = estimate_kv_bytes(ctx, kv_type, model.kv_class) // (1_048_576)
-    return model_file_mb + kv_mb + _VRAM_COMPUTE_BUFFER_MB + _VRAM_SAFETY_MARGIN_MB
+    return weight_mb + kv_mb + _VRAM_COMPUTE_BUFFER_MB + _VRAM_SAFETY_MARGIN_MB
 
 
 class Router:
@@ -154,6 +163,7 @@ class Router:
             self._check_vram_fit(target_model, target_gpu)
 
             # We are the one responsible for starting.
+            log.info("loading model %s on GPU %s ...", target_model.name, target_gpu.pci_slot)
             loop = asyncio.get_running_loop()
             future: asyncio.Future[tuple[ModelConfig, LlamaServer]] = loop.create_future()
             self._loading_futures[target_model.name] = future

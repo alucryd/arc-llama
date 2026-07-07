@@ -17,6 +17,24 @@ let selectedModel = null;
 let loadingModel = null;
 let generating = false;
 let statusPoller = null;
+let adminToken = null;
+
+async function initAdminToken() {
+  try {
+    const r = await fetch("/admin/session-token");
+    if (r.ok) {
+      const data = await r.json();
+      adminToken = data.admin_token || null;
+    }
+  } catch (e) {
+    // Non-loopback deployment or offline -- admin calls will 401/403 until
+    // the user supplies a token some other way.
+  }
+}
+
+function authHeaders(extra = {}) {
+  return adminToken ? { ...extra, Authorization: `Bearer ${adminToken}` } : extra;
+}
 let lastUsage = null;
 let streamStartTime = null;
 let streamTokenCount = 0;
@@ -29,6 +47,7 @@ const modeToggle        = $("#mode-toggle");
 const chatHint          = $("#chat-hint");
 const agentControls     = $("#agent-controls");
 const agentAutoConfirm  = $("#agent-auto-confirm");
+const agentPlanMode     = $("#agent-plan-mode");
 const agentMaxTurns     = $("#agent-max-turns");
 
 let agentMode = false;
@@ -53,9 +72,18 @@ const hList          = $("#h-list");
 const hExport        = $("#h-export");
 const hImport        = $("#h-import");
 const hImportInput   = $("#h-import-input");
+const hFolder        = $("#h-folder");
+const hNewFolder     = $("#h-new-folder");
+const agentFolder    = $("#agent-folder");
+const agentFolderList = $("#agent-folder-list");
+const agentNewFolder = $("#agent-new-folder");
 
 const HISTORY_KEY    = "arc-llama-chats";
 const MAX_HISTORY    = 50;
+const ALL_FOLDERS    = "__all__";
+
+let currentFolder    = ALL_FOLDERS;
+let folders          = [];
 
 // Configure Markdown renderer with syntax highlighting and safe defaults.
 if (typeof marked !== "undefined") {
@@ -113,13 +141,36 @@ settingsToggle.addEventListener("click", () => {
   if (open) renderSettingsPanel();
 });
 
-historyToggle.addEventListener("click", () => {
+historyToggle.addEventListener("click", async () => {
   const open = historyPanel.classList.toggle("open");
   historyToggle.classList.toggle("open", open);
-  if (open) renderHistoryPanel();
+  if (open) {
+    await loadFolders();
+    await syncChatsFromServer();
+    renderHistoryPanel();
+  }
 });
 
 hNew.addEventListener("click", newChat);
+
+if (hFolder) {
+  hFolder.addEventListener("change", () => {
+    currentFolder = hFolder.value;
+    renderHistoryPanel();
+  });
+}
+
+if (hNewFolder) {
+  hNewFolder.addEventListener("click", createFolder);
+}
+
+if (agentNewFolder) {
+  agentNewFolder.addEventListener("click", () => {
+    const name = prompt("Name for the new folder:");
+    if (!name || !name.trim()) return;
+    if (agentFolder) agentFolder.value = name.trim();
+  });
+}
 
 if (hExport) hExport.addEventListener("click", exportChats);
 if (hImport) hImport.addEventListener("click", () => hImportInput?.click());
@@ -155,6 +206,7 @@ function serverChatToLocal(data, modelHint) {
   return {
     id: data.id,
     title: data.title || "New chat",
+    folder: data.folder || "",
     model: modelHint || null,
     createdAt: Math.round((data.created_at || Date.now() / 1000) * 1000),
     updatedAt: Math.round((data.updated_at || Date.now() / 1000) * 1000),
@@ -176,11 +228,14 @@ async function syncChatsFromServer() {
     const data = await apiRequest("/v1/chats");
     const summaries = data.data || [];
     const map = new Map(chatCache.map(c => [c.id, c]));
+    // Server is the source of truth for the chat list. Update titles and
+    // ordering from summaries; full messages are lazy-loaded by loadChat().
     for (const s of summaries) {
       const existing = map.get(s.id);
       const updatedAt = Math.round((s.updated_at || 0) * 1000);
       if (existing) {
         existing.title = s.title;
+        existing.folder = s.folder || "";
         existing.createdAt = Math.round((s.created_at || 0) * 1000);
         existing.updatedAt = updatedAt;
         existing.message_count = s.message_count;
@@ -188,6 +243,7 @@ async function syncChatsFromServer() {
         map.set(s.id, {
           id: s.id,
           title: s.title,
+          folder: s.folder || "",
           model: null,
           messages: [],
           createdAt: Math.round((s.created_at || 0) * 1000),
@@ -204,14 +260,17 @@ async function syncChatsFromServer() {
   }
 }
 
-async function ensureServerChat(titleHint) {
+async function ensureServerChat(titleHint, folder) {
   if (currentChatId) return;
   const title = truncateTitle(titleHint || "New chat");
+  const chatFolder = folder === ALL_FOLDERS ? "" : folder;
   try {
+    const body = { title };
+    if (chatFolder !== undefined) body.folder = chatFolder;
     const data = await apiRequest("/v1/chats", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
+      body: JSON.stringify(body),
     });
     currentChatId = data.id;
     const now = Date.now();
@@ -227,7 +286,7 @@ async function ensureServerChat(titleHint) {
     currentChatId = id;
     const now = Date.now();
     const chats = loadChats();
-    chats.unshift({ id, title, model: selectedModel, messages: [], createdAt: now, updatedAt: now });
+    chats.unshift({ id, title, folder: chatFolder || "", model: selectedModel, messages: [], createdAt: now, updatedAt: now });
     saveChats(chats);
   }
 }
@@ -280,31 +339,49 @@ function formatRelativeTime(ms) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function saveCurrentChat() {
+async function saveCurrentChat() {
   if (conversation.length === 0) return;
   const firstUser = conversation.find(m => m.role === "user");
   const title = truncateTitle(firstUser ? firstUser.content : "New chat");
-  const chats = loadChats();
   const now = Date.now();
-  if (currentChatId) {
-    const idx = chats.findIndex(c => c.id === currentChatId);
-    if (idx >= 0) {
-      chats[idx] = { ...chats[idx], title, model: selectedModel, messages: [...conversation], updatedAt: now };
-    } else {
-      chats.unshift({ id: currentChatId, title, model: selectedModel, messages: [...conversation], createdAt: now, updatedAt: now });
-    }
+  if (!currentChatId) {
+    currentChatId = generateId();
+  }
+
+  const chatDoc = {
+    id: currentChatId,
+    title,
+    model: selectedModel,
+    messages: conversation.map(m => ({ role: m.role, content: m.content })),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // Server is the source of truth; persist the full chat there first.
+  try {
+    await apiRequest(`/v1/chats/${encodeURIComponent(currentChatId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title,
+        messages: chatDoc.messages,
+      }),
+    });
+  } catch (e) {
+    console.warn("Could not save chat to server:", e.message);
+  }
+
+  // Update the local cache to match.
+  const chats = loadChats();
+  const idx = chats.findIndex(c => c.id === currentChatId);
+  if (idx >= 0) {
+    chats[idx] = { ...chats[idx], ...chatDoc };
   } else {
-    const id = generateId();
-    currentChatId = id;
-    chats.unshift({ id, title, model: selectedModel, messages: [...conversation], createdAt: now, updatedAt: now });
+    chats.unshift(chatDoc);
   }
   chats.sort((a, b) => b.updatedAt - a.updatedAt);
   while (chats.length > MAX_HISTORY) chats.pop();
   saveChats(chats);
-  // Keep the server-side title in sync (best-effort).
-  if (currentChatId) {
-    serverAppendMessages(currentChatId, [], title).catch(() => {});
-  }
 }
 
 async function newChat() {
@@ -320,15 +397,15 @@ async function newChat() {
   updateCtxMeter(0, models.find(m => m.id === selectedModel)?.ctx || 131072);
   ctxMeter.classList.remove("visible");
   ctxLabelTps.textContent = "";
-  await ensureServerChat("New chat");
+  await ensureServerChat("New chat", currentFolder);
   input.focus();
 }
 
 function renderHistoryPanel() {
-  const chats = loadChats();
+  const chats = loadChats().filter(c => currentFolder === ALL_FOLDERS || c.folder === currentFolder);
   hList.innerHTML = "";
   if (chats.length === 0) {
-    hList.innerHTML = '<div class="h-empty">No saved chats yet.</div>';
+    hList.innerHTML = '<div class="h-empty">No chats in this folder yet.</div>';
     return;
   }
   for (const c of chats) {
@@ -344,8 +421,9 @@ function renderHistoryPanel() {
       </div>
       <button class="h-delete" aria-label="Delete chat">${ICON_CLOSE}</button>
     `;
+    card.appendChild(buildMoveSelect(c));
     card.addEventListener("click", (e) => {
-      if (e.target.closest(".h-delete")) return;
+      if (e.target.closest(".h-delete") || e.target.closest(".h-move")) return;
       loadChat(c.id);
     });
     card.querySelector(".h-delete").addEventListener("click", (e) => {
@@ -357,28 +435,20 @@ function renderHistoryPanel() {
 }
 
 async function loadChat(id) {
-  let chat = chatCache.find(c => c.id === id);
-  if (!chat) {
-    try {
-      const data = await apiRequest(`/v1/chats/${encodeURIComponent(id)}`);
-      chat = serverChatToLocal(data, null);
-      chatCache.push(chat);
-      saveChats(chatCache);
-    } catch (e) {
-      console.warn("Could not load chat from server:", e.message);
-      return;
-    }
-  } else if (!chat.messages || chat.messages.length === 0) {
-    try {
-      const data = await apiRequest(`/v1/chats/${encodeURIComponent(id)}`);
-      const updated = serverChatToLocal(data, chat.model);
-      const idx = chatCache.findIndex(c => c.id === id);
-      if (idx >= 0) chatCache[idx] = updated; else chatCache.push(updated);
-      saveChats(chatCache);
-      chat = updated;
-    } catch (e) {
-      console.warn("Could not load chat details from server:", e.message);
-    }
+  // Always refresh from the server so switching browsers / clearing localStorage
+  // shows the latest persisted state.
+  let chat = null;
+  try {
+    const data = await apiRequest(`/v1/chats/${encodeURIComponent(id)}`);
+    const cached = chatCache.find(c => c.id === id);
+    chat = serverChatToLocal(data, cached?.model || null);
+    const idx = chatCache.findIndex(c => c.id === id);
+    if (idx >= 0) chatCache[idx] = chat; else chatCache.push(chat);
+    saveChats(chatCache);
+  } catch (e) {
+    console.warn("Could not load chat from server:", e.message);
+    chat = chatCache.find(c => c.id === id);
+    if (!chat) return;
   }
   if (!chat) return;
   conversation.length = 0;
@@ -427,6 +497,106 @@ async function deleteChat(id) {
     currentChatId = null;
   }
   renderHistoryPanel();
+}
+
+function getFolderLabel(name) {
+  return name || "Default";
+}
+
+function populateFolderSelects() {
+  if (!hFolder || !agentFolder) return;
+
+  const saved = hFolder.value;
+  hFolder.innerHTML = `<option value="${ALL_FOLDERS}">All folders</option>`;
+  for (const f of folders) {
+    const label = getFolderLabel(f.name);
+    hFolder.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(f.name)}">${escapeHtml(label)} (${f.count})</option>`);
+  }
+  if ([...hFolder.options].some(o => o.value === saved)) {
+    hFolder.value = saved;
+  } else {
+    hFolder.value = ALL_FOLDERS;
+    currentFolder = ALL_FOLDERS;
+  }
+
+  if (agentFolderList) {
+    agentFolderList.innerHTML = "";
+    for (const f of folders) {
+      if (!f.name) continue;
+      const label = getFolderLabel(f.name);
+      agentFolderList.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(f.name)}">${escapeHtml(label)}</option>`);
+    }
+  }
+}
+
+async function loadFolders() {
+  try {
+    const data = await apiRequest("/v1/chats/folders");
+    folders = data.data || [];
+  } catch (e) {
+    console.warn("Could not load folders:", e.message);
+    folders = [];
+  }
+  populateFolderSelects();
+}
+
+async function createFolder() {
+  const name = prompt("Name for the new folder:");
+  if (!name || !name.trim()) return;
+  const folder = name.trim();
+  await ensureServerChat("New chat", folder);
+  currentFolder = folder;
+  hFolder.value = folder;
+  await loadFolders();
+  renderHistoryPanel();
+  historyPanel.classList.add("open");
+  historyToggle.classList.add("open");
+}
+
+async function moveChat(chatId, folder) {
+  try {
+    await apiRequest(`/v1/chats/${encodeURIComponent(chatId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder }),
+    });
+  } catch (e) {
+    console.warn("Could not move chat:", e.message);
+    showError("Could not move chat: " + e.message);
+    return;
+  }
+  const chats = loadChats();
+  const chat = chats.find(c => c.id === chatId);
+  if (chat) {
+    chat.folder = folder;
+    saveChats(chats);
+  }
+  await loadFolders();
+  renderHistoryPanel();
+}
+
+function buildMoveSelect(chat) {
+  const select = document.createElement("select");
+  select.className = "h-move";
+  select.innerHTML = `<option value="">Move to…</option>`;
+  for (const f of folders) {
+    if (f.name === chat.folder) continue;
+    const label = getFolderLabel(f.name);
+    select.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(f.name)}">${escapeHtml(label)}</option>`);
+  }
+  select.insertAdjacentHTML("beforeend", `<option value="__new__">+ New folder</option>`);
+  select.addEventListener("change", async (e) => {
+    const value = e.target.value;
+    e.target.value = "";
+    if (value === "__new__") {
+      const name = prompt("Name for the new folder:");
+      if (!name || !name.trim()) return;
+      await moveChat(chat.id, name.trim());
+    } else if (value) {
+      await moveChat(chat.id, value);
+    }
+  });
+  return select;
 }
 
 async function exportChats() {
@@ -529,7 +699,7 @@ async function applySettings() {
   try {
     const r = await fetch(`/admin/models/${encodeURIComponent(selectedModel)}/edit`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body),
     });
     const data = await r.json();
@@ -607,7 +777,7 @@ function renderModelPicker() {
 
 async function fetchStatus() {
   try {
-    const r = await fetch("/admin/status");
+    const r = await fetch("/admin/status", { headers: authHeaders() });
     if (!r.ok) return;
     const data = await r.json();
     const modelMap = new Map((data.models || []).map(m => [m.name, m]));
@@ -708,7 +878,10 @@ async function ensureModelLoaded() {
   loadingModel = selectedModel;
   updatePickerStatus();
   try {
-    const r = await fetch(`/admin/load/${encodeURIComponent(selectedModel)}`, { method: "POST" });
+    const r = await fetch(`/admin/load/${encodeURIComponent(selectedModel)}`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`Load failed: ${r.status} ${t}`);
@@ -743,7 +916,7 @@ async function sendMessage() {
   createMessage("user", fullText);
 
   // Persist this conversation on the server (best-effort).
-  await ensureServerChat(fullText);
+  await ensureServerChat(fullText, currentFolder);
   serverAppendMessages(currentChatId, [{ role: "user", content: fullText }]);
 
   generating = true;
@@ -837,8 +1010,8 @@ async function sendMessage() {
                            : null;
     if (tps) ctxLabelTps.textContent = tps + " tok/s";
     updateCtxMeter(totalToks, m?.ctx || 131072);
-    serverAppendMessages(currentChatId, [{ role: "assistant", content: conversation[convoIndex].content }]);
-    saveCurrentChat();
+    await serverAppendMessages(currentChatId, [{ role: "assistant", content: conversation[convoIndex].content }]);
+    await saveCurrentChat();
   } catch (e) {
     assistantMsg.div.remove();
     conversation.pop();
@@ -1033,7 +1206,11 @@ async function processAttachment(a) {
     if (isPdfFile(a.file)) {
       const form = new FormData();
       form.append("file", a.file);
-      const r = await fetch("/admin/parse-pdf", { method: "POST", body: form });
+      const r = await fetch("/admin/parse-pdf", {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
       a.text = data.text || "";
@@ -1358,6 +1535,9 @@ const agentRenderer = {
       case "status":
         this.renderStatus(event);
         break;
+      case "plan":
+        this.renderPlan(event);
+        break;
       case "assistant":
         this.renderAssistant(event);
         break;
@@ -1369,6 +1549,9 @@ const agentRenderer = {
         break;
       case "confirm_required":
         this.renderConfirm(event);
+        break;
+      case "checkpoint":
+        this.renderCheckpoint(event);
         break;
       case "error":
         this.renderError(event);
@@ -1387,6 +1570,61 @@ const agentRenderer = {
     el.className = "agent-log-line status";
     el.textContent = "# " + (event.message || "");
     agentLog.appendChild(el);
+  },
+
+  renderPlan(event) {
+    this.setThinking(false);
+    setAgentAscii("thinking");
+    const line = document.createElement("div");
+    line.className = "agent-log-line plan";
+    const runId = event.run_id || "";
+    const content = event.content || "";
+    line.innerHTML = `
+      <div class="agent-plan-header">
+        <span class="agent-tool-icon">${ICON_BOT}</span>
+        <span class="agent-tool-title">Proposed plan</span>
+      </div>
+      <div class="agent-plan-body"><pre>${escapeHtml(content)}</pre></div>
+      <div class="agent-plan-actions">
+        <button class="agent-confirm-btn approve" data-action="approve">${ICON_CHECK} Approve & run</button>
+        <button class="agent-confirm-btn deny" data-action="deny">${ICON_X} Deny</button>
+      </div>`;
+    agentLog.appendChild(line);
+
+    if (!runId) return;
+    const approveBtn = line.querySelector('.agent-confirm-btn[data-action="approve"]');
+    const denyBtn = line.querySelector('.agent-confirm-btn[data-action="deny"]');
+
+    const submitApproval = async (approved) => {
+      if (approveBtn) approveBtn.disabled = true;
+      if (denyBtn) denyBtn.disabled = true;
+      const clicked = approved ? approveBtn : denyBtn;
+      if (clicked) clicked.innerHTML = '<span class="spinner"></span> ' + (approved ? "Approving…" : "Denying…");
+      try {
+        const r = await fetch(`/v1/agent/${encodeURIComponent(runId)}/plan`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ approved }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(`${r.status} ${t}`);
+        }
+      } catch (e) {
+        if (approveBtn) {
+          approveBtn.disabled = false;
+          approveBtn.innerHTML = `${ICON_CHECK} Approve & run`;
+        }
+        if (denyBtn) {
+          denyBtn.disabled = false;
+          denyBtn.innerHTML = `${ICON_X} Deny`;
+        }
+        this.renderError({ message: "Plan approval failed: " + e.message });
+      }
+    };
+
+    if (approveBtn) approveBtn.addEventListener("click", () => submitApproval(true));
+    if (denyBtn) denyBtn.addEventListener("click", () => submitApproval(false));
   },
 
   renderAssistant(event) {
@@ -1599,7 +1837,7 @@ const agentRenderer = {
       try {
         const r = await fetch(`/v1/agent/${encodeURIComponent(runId)}/confirm`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ approved }),
         });
         if (!r.ok) {
@@ -1621,6 +1859,13 @@ const agentRenderer = {
 
     if (approveBtn) approveBtn.addEventListener("click", () => submitConfirmation(true));
     if (denyBtn) denyBtn.addEventListener("click", () => submitConfirmation(false));
+  },
+
+  renderCheckpoint(event) {
+    const line = document.createElement("div");
+    line.className = "agent-log-line checkpoint";
+    line.innerHTML = `<div class="agent-checkpoint">${ICON_CHECK} Checkpoint created: <code>${escapeHtml(event.id || "")}</code></div>`;
+    agentLog.appendChild(line);
   },
 
   renderError(event) {
@@ -1672,12 +1917,17 @@ async function runAgentTask() {
   }
 
   const autoConfirm = agentAutoConfirm.checked;
+  const planMode = agentPlanMode.checked;
   const maxTurns = parseInt(agentMaxTurns.value, 10) || 30;
+  const agentChatFolder = agentFolder ? agentFolder.value : "";
 
   const abortController = new AbortController();
   agentAbort = () => abortController.abort();
 
-  agentRenderer.addEvent({ type: "status", message: `Running task with ${autoConfirm ? "auto-confirm" : "manual confirmation"}` });
+  agentRenderer.addEvent({
+    type: "status",
+    message: `Running task with ${autoConfirm ? "auto-confirm" : "manual confirmation"}${planMode ? " + plan mode" : ""}`,
+  });
   agentRenderer.setThinking(true);
 
   let agentStartTime = null;
@@ -1686,12 +1936,14 @@ async function runAgentTask() {
   try {
     const r = await fetch("/v1/agent", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         model: selectedModel,
         task: task,
         auto_confirm: autoConfirm,
+        plan_mode: planMode,
         max_turns: maxTurns,
+        folder: agentChatFolder,
       }),
       signal: abortController.signal,
     });
@@ -1737,6 +1989,7 @@ async function runAgentTask() {
   } finally {
     agentAbort = null;
     finishAgentRun();
+    loadFolders().then(() => syncChatsFromServer()).catch(() => {});
   }
 }
 
@@ -1827,7 +2080,7 @@ function updateCommandPalette() {
   }
 }
 
-function executeSlashCommand(rawText) {
+async function executeSlashCommand(rawText) {
   const parsed = parseSlashCommand(rawText);
   if (!parsed) return false;
 
@@ -1842,16 +2095,16 @@ function executeSlashCommand(rawText) {
       renderHelpMessage();
       break;
     case "clear":
-      clearChat();
+      await clearChat();
       break;
     case "new":
-      newChat();
+      await newChat();
       break;
     case "model":
       switchModel(parsed.rest);
       break;
     case "compact":
-      compactConversation(parsed.rest);
+      await compactConversation(parsed.rest);
       break;
   }
   return true;
@@ -1877,13 +2130,13 @@ function renderHelpMessage() {
   if (shouldAutoScroll(chatLog)) autoScroll(chatLog);
 }
 
-function clearChat() {
+async function clearChat() {
   conversation.length = 0;
   chatLog.innerHTML = "";
   if (emptyState) emptyState.style.display = "";
   updateCtxMeter(0, models.find((m) => m.id === selectedModel)?.ctx || 131072);
   ctxLabelTps.textContent = "";
-  saveCurrentChat();
+  await saveCurrentChat();
 }
 
 function switchModel(modelId) {
@@ -1952,13 +2205,13 @@ async function compactConversation(instruction) {
 
     const m = models.find((x) => x.id === selectedModel);
     updateCtxMeter(estimateTokens(), m?.ctx || 131072);
-    saveCurrentChat();
+    await saveCurrentChat();
   } catch (e) {
     showError("Compact failed: " + e.message);
   }
 }
 
-input.addEventListener("keydown", (e) => {
+input.addEventListener("keydown", async (e) => {
   if (commandPalette.classList.contains("open")) {
     const items = commandPalette.querySelectorAll(".command-item");
     if (e.key === "ArrowDown") {
@@ -1989,7 +2242,7 @@ input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     const text = input.value.trim();
-    if (!agentMode && executeSlashCommand(text)) {
+    if (!agentMode && await executeSlashCommand(text)) {
       input.value = "";
       input.style.height = "auto";
       hideCommandPalette();
@@ -2003,9 +2256,9 @@ input.addEventListener("keydown", (e) => {
   }
 });
 
-sendButton.addEventListener("click", () => {
+sendButton.addEventListener("click", async () => {
   const text = input.value.trim();
-  if (!agentMode && executeSlashCommand(text)) {
+  if (!agentMode && await executeSlashCommand(text)) {
     input.value = "";
     input.style.height = "auto";
     hideCommandPalette();
@@ -2025,7 +2278,9 @@ input.addEventListener("input", () => {
 });
 
 (async function init() {
+  await initAdminToken();
   await fetchModels();
+  await loadFolders();
   await syncChatsFromServer();
+  statusPoller = setInterval(fetchStatus, 3000);
 })();
-statusPoller = setInterval(fetchStatus, 3000);

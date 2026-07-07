@@ -275,6 +275,8 @@ class LlamaServer:
 
     async def wait_ready(self, timeout: float = DEFAULT_HEALTH_TIMEOUT) -> bool:
         deadline = time.time() + timeout
+        last_progress = time.time()
+        progress_interval = 15.0  # log every 15 s so the terminal isn't silent
         async with httpx.AsyncClient(timeout=2.0) as client:
             while time.time() < deadline:
                 if not self.is_running:
@@ -283,10 +285,21 @@ class LlamaServer:
                 try:
                     r = await client.get(self.plan.health_url)
                     if r.status_code == 200 and r.json().get("status") == "ok":
+                        elapsed = time.time() - self.started_at if self.started_at else 0
+                        log.info("[%s] ready after %.1fs", self.name, elapsed)
                         return True
                 except Exception:
                     pass
+                now = time.time()
+                if now - last_progress >= progress_interval:
+                    remaining = max(0, deadline - now)
+                    log.info(
+                        "[%s] still loading... %.0fs elapsed, %.0fs budget remaining",
+                        self.name, timeout - remaining, remaining,
+                    )
+                    last_progress = now
                 await asyncio.sleep(HEALTH_POLL_INTERVAL)
+        log.warning("[%s] health-check timed out after %.0fs", self.name, timeout)
         return False
 
     def tail_log(self, lines: int = 50) -> str:

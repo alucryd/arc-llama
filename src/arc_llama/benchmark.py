@@ -390,19 +390,22 @@ def _fmt_vram(used_mb: int | None, total_mb: int | None) -> str:
 
 def print_result(result: BenchmarkResult) -> None:
     """Pretty-print a single BenchmarkResult to the console."""
+    from rich.console import Console
+
+    console = Console()
     if result.error:
-        print(f"\n[red]Benchmark failed for {result.model}: {result.error}[/red]")
+        console.print(f"\n[red]Benchmark failed for {result.model}: {result.error}[/red]")
         return
 
-    print(f"\n[bold]Benchmark: {result.model}[/bold]")
-    print(f"  Recipe:   ctx={result.ctx}, KV={result.cache_type_k}/{result.cache_type_v}")
-    print(f"  Prompt:   {result.prompt_tokens} tokens")
-    print(f"  Generate: {result.gen_tokens} tokens")
+    console.print(f"\n[bold]Benchmark: {result.model}[/bold]")
+    console.print(f"  Recipe:   ctx={result.ctx}, KV={result.cache_type_k}/{result.cache_type_v}")
+    console.print(f"  Prompt:   {result.prompt_tokens} tokens")
+    console.print(f"  Generate: {result.gen_tokens} tokens")
     if result.jit_warmup_s is not None:
-        print(f"  Warm-up:  {result.jit_warmup_s:.1f}s (SYCL JIT)")
-    print(f"  Prompt-eval:  {_fmt_speed(result.prompt_eval_tok_s)}  |  {_fmt_time(result.prompt_eval_ms)}")
-    print(f"  Generation:   {_fmt_speed(result.generation_tok_s)}  |  {_fmt_time(result.generation_ms)}")
-    print(f"  VRAM:         {_fmt_vram(result.vram_used_mb, result.vram_total_mb)}")
+        console.print(f"  Warm-up:  {result.jit_warmup_s:.1f}s (SYCL JIT)")
+    console.print(f"  Prompt-eval:  {_fmt_speed(result.prompt_eval_tok_s)}  |  {_fmt_time(result.prompt_eval_ms)}")
+    console.print(f"  Generation:   {_fmt_speed(result.generation_tok_s)}  |  {_fmt_time(result.generation_ms)}")
+    console.print(f"  VRAM:         {_fmt_vram(result.vram_used_mb, result.vram_total_mb)}")
 
 
 def print_sweep_table(results: list[BenchmarkResult]) -> None:

@@ -36,6 +36,13 @@ dependencies = [
 tui = [
     "textual>=0.60",
 ]
+semantic = [
+    "fastembed>=0.3.0",
+    "numpy>=1.24",
+]
+mcp = [
+    "mcp>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -47,6 +54,7 @@ dev = [
 
 [project.scripts]
 arc-llama = "arc_llama.cli:main"
+arcllama = "arc_llama.cli:arcllama_main"
 
 [project.urls]
 Homepage = "https://github.com/offbyonebit/arc-llama"

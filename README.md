@@ -13,7 +13,7 @@ It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
 > [!NOTE]
-> **Status: 0.2 beta.** Tested end-to-end on Battlemage B60. HF download,
+> **Status: 0.3.0.** Tested end-to-end on Battlemage B60. HF download,
 > streaming, and the OpenAI-compatible API all pass. Other SKUs (A770, A380,
 > B580) need community confirmation -- open an issue if something breaks on
 > your card.
@@ -33,7 +33,7 @@ something useful before lunch.
   `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS`) are stripped from the
   inherited shell environment.
 - **Smart defaults** for `-ctx`, `--cache-type-k/v`, and `-ngl` based on the
-  detected VRAM and the model file size , never starts a model you can't fit.
+  detected VRAM and the model's quantized tensor size, never starts a model you can't fit.
 - **Model registry** in TOML at `$XDG_CONFIG_HOME/arc-llama/config.toml`,
   trivially editable.
 - **One process per model**, swapped in/out by an internal router. Default
@@ -79,7 +79,11 @@ arc-llama serve
 # 6. (Optional) Open the terminal UI in another window
 arc-llama tui
 
-# 7. (Optional) Install a systemd --user unit
+# 7. (Optional) Benchmark prompt-eval and generation throughput
+arc-llama benchmark <model-name>
+# Sweep ctx + KV configs: arc-llama benchmark <model-name> --sweep-ctx 4096,8192,16384 --sweep-kv f16,q8_0
+
+# 8. (Optional) Install a systemd --user unit
 arc-llama systemd --write
 systemctl --user daemon-reload
 systemctl --user enable --now arc-llama.service
@@ -160,10 +164,14 @@ llama_server = "/usr/local/bin/llama-server"
 models_dir   = "~/.local/share/arc-llama/models"
 state_dir    = "~/.local/state/arc-llama"
 
+[agent]
+root = "/home/me/projects"   # default project root for the coding agent
+
 [[gpus]]
 pci_slot   = "0000:03:00.0"
 sycl_index = 0
 arch       = "battlemage"
+backend    = "sycl"          # or "vulkan" for a Vulkan llama-server build
 vram_mb    = 24480
 enabled    = true
 name       = "Arc Pro B60"
@@ -286,8 +294,6 @@ docker run ... \
 
 ## Roadmap
 
-- Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
-- IPEX-LLM Ollama as an optional backend for users who prefer it.
 - ~~HF model download (`arc-llama add org/repo:quant --from-hf`).~~ ✅
 - ~~Streaming response forwarding (`stream: true`).~~ ✅
 - ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅

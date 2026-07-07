@@ -38,7 +38,9 @@ extra_flags      = ["--reasoning", "off"]
 """
 from __future__ import annotations
 
+import logging
 import os
+import secrets
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -141,6 +143,42 @@ class PathsConfig:
 
 
 @dataclass
+class AgentConfig:
+    root: str = "."
+    """Default filesystem root for the agent file/shell tools.
+
+    Request-level `root` overrides this. Use an absolute path if you access
+    arc-llama from another machine and `.` (the server's working directory)
+    is not what you want.
+    """
+    profile: str | None = None
+    """Default profile name for selecting which MCP servers are active.
+
+    A profile references MCP servers by name. When a profile is active,
+    only the MCP servers listed in that profile are loaded. If unset, all
+    configured MCP servers are loaded.
+    """
+
+
+@dataclass
+class ProfileConfig:
+    """Named whitelist of MCP servers."""
+
+    name: str = ""
+    mcp_servers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MCPServerConfig:
+    """Configuration for one stdio MCP server."""
+
+    name: str = ""
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class GPUConfig:
     pci_slot: str
     sycl_index: int
@@ -186,13 +224,64 @@ class Config:
     version: int = CONFIG_VERSION
     server: ServerConfig = field(default_factory=ServerConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
     gpus: list[GPUConfig] = field(default_factory=list)
     models: list[ModelConfig] = field(default_factory=list)
     upstreams: list[UpstreamConfig] = field(default_factory=list)
+    mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    profiles: list[ProfileConfig] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Lookup helpers
     # ------------------------------------------------------------------
+
+    def find_profile(self, name: str | None) -> ProfileConfig | None:
+        if not name:
+            return None
+        for p in self.profiles:
+            if p.name == name:
+                return p
+        return None
+
+    def active_profile_name(self, profile_name: str | None = None) -> str | None:
+        """Return the effective profile name.
+
+        Explicit ``profile_name`` wins, then ``agent.profile`` in config,
+        then None (meaning all MCP servers are active).
+        """
+        if profile_name:
+            return profile_name
+        if self.agent.profile:
+            return self.agent.profile
+        return None
+
+    def active_mcp_servers(
+        self, profile_name: str | None = None
+    ) -> list[MCPServerConfig]:
+        """Return MCP servers that belong to the active profile.
+
+        If no profile is active, all configured servers are returned. Unknown
+        server names listed in a profile are ignored with a warning.
+        """
+        name = self.active_profile_name(profile_name)
+        if not name:
+            return list(self.mcp_servers)
+        profile = self.find_profile(name)
+        if profile is None:
+            logging.getLogger("arc_llama.config").warning(
+                "Profile %r not found; loading all MCP servers", name
+            )
+            return list(self.mcp_servers)
+        allowed = set(profile.mcp_servers)
+        found: dict[str, MCPServerConfig] = {}
+        for server in self.mcp_servers:
+            if server.name in allowed:
+                found[server.name] = server
+        for missing in allowed - set(found):
+            logging.getLogger("arc_llama.config").warning(
+                "Profile %r references unknown MCP server %r", name, missing
+            )
+        return [found[name] for name in profile.mcp_servers if name in found]
 
     def find_model(self, query: str) -> ModelConfig | None:
         """Match a user-supplied model id against name/display_name/aliases.
@@ -236,9 +325,12 @@ class Config:
             "version": self.version,
             "server": asdict(self.server),
             "paths": asdict(self.paths),
+            "agent": asdict(self.agent),
             "gpus": [asdict(g) for g in self.gpus],
             "models": [asdict(m) for m in self.models],
             "upstreams": [asdict(u) for u in self.upstreams],
+            "mcp_servers": [asdict(s) for s in self.mcp_servers],
+            "profiles": [asdict(p) for p in self.profiles],
         }
         return _strip_none(d)
 
@@ -266,8 +358,8 @@ def _strip_none(obj: Any) -> Any:
 def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     """Bump an on-disk config dict to the current schema version.
 
-    Currently a no-op migration (v1 → v1), but the hook exists so future schema
-    changes can be handled automatically when users upgrade arc-llama.
+    Applies field-level migrations so older configs (0.1 → 0.2 → 0.3) pick up
+    new defaults without losing user edits.
     """
     version = int(raw.get("version", 1))
     if version > CONFIG_VERSION:
@@ -275,13 +367,56 @@ def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
             f"config version {version} is newer than the supported version "
             f"{CONFIG_VERSION}; upgrade arc-llama"
         )
-    raw["version"] = CONFIG_VERSION
+
     # Ensure all top-level sections exist so downstream code can assume them.
     raw.setdefault("server", {})
     raw.setdefault("paths", {})
+    raw.setdefault("agent", {})
     raw.setdefault("gpus", [])
     raw.setdefault("models", [])
     raw.setdefault("upstreams", [])
+    raw.setdefault("mcp_servers", [])
+    raw.setdefault("profiles", [])
+
+    # 0.2 → 0.3: GPU backend field (SYCL vs Vulkan). Default to SYCL to match
+    # pre-0.3 behaviour, but log so the user knows they can set it explicitly.
+    for gpu in raw.get("gpus", []):
+        if not isinstance(gpu, dict):
+            continue
+        if "backend" not in gpu:
+            gpu["backend"] = Backend.SYCL.value
+            logging.getLogger("arc_llama.config").warning(
+                "GPU %s is missing the 'backend' field; defaulting to '%s'. "
+                "Set it to '%s' if you are using a Vulkan llama-server build.",
+                gpu.get("pci_slot", "?"),
+                Backend.SYCL.value,
+                Backend.VULKAN.value,
+            )
+
+    # 0.3: agent settings default to a server-side project root of ".".
+    agent = raw.get("agent", {})
+    if "root" not in agent:
+        agent["root"] = "."
+    if "profile" not in agent:
+        agent["profile"] = None
+
+    # Ensure newer server fields exist with safe defaults.
+    server = raw.get("server", {})
+    if "admin_token" not in server:
+        server["admin_token"] = None
+
+    # Ensure model defaults that were introduced across releases.
+    for model in raw.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        if "kv_class" not in model:
+            model["kv_class"] = "default"
+        if "display_name" not in model:
+            model["display_name"] = ""
+        if "aliases" not in model:
+            model["aliases"] = []
+
+    raw["version"] = CONFIG_VERSION
     return raw
 
 
@@ -293,30 +428,70 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise ValueError("config 'server' must be a table")
     if not isinstance(raw.get("paths", {}), dict):
         raise ValueError("config 'paths' must be a table")
+    if not isinstance(raw.get("agent", {}), dict):
+        raise ValueError("config 'agent' must be a table")
     if not isinstance(raw.get("gpus", []), list):
         raise ValueError("config 'gpus' must be an array")
     if not isinstance(raw.get("models", []), list):
         raise ValueError("config 'models' must be an array")
     if not isinstance(raw.get("upstreams", []), list):
         raise ValueError("config 'upstreams' must be an array")
+    if not isinstance(raw.get("mcp_servers", []), list):
+        raise ValueError("config 'mcp_servers' must be an array")
+    if not isinstance(raw.get("profiles", []), list):
+        raise ValueError("config 'profiles' must be an array")
+
+
+def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
+    """Fill in cfg.server.admin_token so admin/auto_confirm auth is never a no-op.
+
+    ARC_LLAMA_ADMIN_TOKEN always wins and is never written to disk (so it can
+    be overridden per-invocation, e.g. in containers). Otherwise, if no token
+    is configured yet, generate one and persist it so it survives restarts --
+    admin endpoints and `auto_confirm` agent runs would otherwise be
+    unauthenticated by default.
+    """
+    env_token = os.environ.get("ARC_LLAMA_ADMIN_TOKEN")
+    if env_token:
+        cfg.server.admin_token = env_token
+        return
+    if cfg.server.admin_token:
+        return
+    cfg.server.admin_token = secrets.token_urlsafe(32)
+    if persist:
+        cfg.save(path)
+    logging.getLogger("arc_llama.config").warning(
+        "No admin_token was configured -- generated one and saved it to %s. "
+        "Admin endpoints and auto_confirm agent runs now require "
+        "'Authorization: Bearer %s'.",
+        path,
+        cfg.server.admin_token,
+    )
 
 
 def load_config(path: Path | None = None) -> Config:
     path = path or default_config_path()
     if not path.exists():
-        return Config()
+        cfg = Config()
+        _resolve_admin_token(cfg, path, persist=False)
+        return cfg
     with open(path, "rb") as f:
         raw = _toml_load(f)
     raw = migrate_config(raw)
     validate_config(raw)
-    return Config(
+    cfg = Config(
         version=int(raw.get("version", CONFIG_VERSION)),
         server=ServerConfig(**raw.get("server", {})),
         paths=PathsConfig(**raw.get("paths", {})),
+        agent=AgentConfig(**raw.get("agent", {})),
         gpus=[GPUConfig(**g) for g in raw.get("gpus", [])],
         models=[ModelConfig(**m) for m in raw.get("models", [])],
         upstreams=[UpstreamConfig(**u) for u in raw.get("upstreams", [])],
+        mcp_servers=[MCPServerConfig(**s) for s in raw.get("mcp_servers", [])],
+        profiles=[ProfileConfig(**p) for p in raw.get("profiles", [])],
     )
+    _resolve_admin_token(cfg, path, persist=True)
+    return cfg
 
 
 def init_config_from_detection(detected_gpus, llama_server_path: str | None = None) -> Config:

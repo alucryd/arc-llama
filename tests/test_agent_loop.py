@@ -257,3 +257,86 @@ async def test_agent_reads_pdf_and_reports_text(tmp_root: Path) -> None:
     assert tool_result["content"] == "PDF extracted text"
     assert not tool_result["error"]
     assert any(e["type"] == "assistant" and "extracted text" in e["content"] for e in events)
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_auto_confirm(tmp_root: Path) -> None:
+    responses = [
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Plan: read file then write result.",
+                }
+            }]
+        },
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                }
+            }]
+        },
+    ]
+    events = await collect_events("do a thing", responses, tmp_root, plan_mode=True, auto_confirm=True)
+
+    plan_event = next(e for e in events if e["type"] == "plan")
+    assert "Plan:" in plan_event["content"]
+    assert any(e["type"] == "assistant" and e["content"] == "Done." for e in events)
+    assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_manual_approval(tmp_root: Path) -> None:
+    responses = [
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Plan: read file then write result.",
+                }
+            }]
+        },
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                }
+            }]
+        },
+    ]
+    plan_callback = AsyncMock(return_value=True)
+    events = await collect_events(
+        "do a thing", responses, tmp_root, plan_mode=True, plan_callback=plan_callback
+    )
+
+    plan_event = next(e for e in events if e["type"] == "plan")
+    assert "Plan:" in plan_event["content"]
+    plan_callback.assert_awaited_once()
+    assert any(e["type"] == "assistant" and e["content"] == "Done." for e in events)
+    assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_manual_deny(tmp_root: Path) -> None:
+    responses = [
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Plan: read file then write result.",
+                }
+            }]
+        },
+    ]
+    plan_callback = AsyncMock(return_value=False)
+    events = await collect_events(
+        "do a thing", responses, tmp_root, plan_mode=True, plan_callback=plan_callback
+    )
+
+    assert any(e["type"] == "plan" for e in events)
+    plan_callback.assert_awaited_once()
+    assert not any(e["type"] == "tool_call" for e in events)
+    assert events[-1]["type"] == "done"

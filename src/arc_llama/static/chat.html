@@ -80,7 +80,17 @@
       <input type="checkbox" id="agent-auto-confirm" />
       Auto-confirm tools
     </label>
+    <label title="Generate a plan first and ask for approval before making changes">
+      <input type="checkbox" id="agent-plan-mode" />
+      Plan mode
+    </label>
     <span>Max turns: <input type="number" id="agent-max-turns" value="30" min="1" max="100" /></span>
+    <label class="agent-folder-wrap" title="Folder to save the agent transcript">
+      Folder:
+      <input list="agent-folder-list" id="agent-folder" placeholder="Default" />
+      <datalist id="agent-folder-list"></datalist>
+      <button id="agent-new-folder" class="agent-folder-add" title="New folder">+</button>
+    </label>
   </div>
 </div>
 
@@ -93,6 +103,10 @@
 
 <div id="history-panel">
   <div class="h-title">Chat History</div>
+  <div class="h-folder-bar">
+    <select id="h-folder" aria-label="Select folder"></select>
+    <button id="h-new-folder" class="h-folder-add" title="New folder">+</button>
+  </div>
   <button class="h-new" id="h-new">New Chat</button>
   <div class="h-actions">
     <button class="h-action" id="h-export">Export</button>

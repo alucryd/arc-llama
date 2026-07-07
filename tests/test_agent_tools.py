@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from arc_llama.agent.tools import (
+    apply_patch,
     list_directory,
     read_file,
     read_pdf,
@@ -147,3 +148,31 @@ async def test_read_pdf_rejects_non_pdf(tmp_root: Path) -> None:
     assert res.error
     assert "only PDF files are supported" in res.content
     mock_client.post.assert_not_awaited()
+
+
+def test_apply_patch_single_occurrence(tmp_root: Path) -> None:
+    (tmp_root / "src" / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    res = apply_patch("src/main.py", "print('hello')", "print('world')", tmp_root)
+    assert not res.error
+    assert (tmp_root / "src" / "main.py").read_text(encoding="utf-8") == "print('world')\n"
+
+
+def test_apply_patch_replace_all(tmp_root: Path) -> None:
+    (tmp_root / "src" / "main.py").write_text("aaa\nbbb\naaa\n", encoding="utf-8")
+    res = apply_patch("src/main.py", "aaa", "xxx", tmp_root, replace_all=True)
+    assert not res.error
+    assert (tmp_root / "src" / "main.py").read_text(encoding="utf-8") == "xxx\nbbb\nxxx\n"
+
+
+def test_apply_patch_ambiguous_without_replace_all(tmp_root: Path) -> None:
+    (tmp_root / "src" / "main.py").write_text("aaa\nbbb\naaa\n", encoding="utf-8")
+    res = apply_patch("src/main.py", "aaa", "xxx", tmp_root, replace_all=False)
+    assert res.error
+    assert "occurs 2 times" in res.content
+
+
+def test_apply_patch_missing_old_string(tmp_root: Path) -> None:
+    (tmp_root / "src" / "main.py").write_text("hello\n", encoding="utf-8")
+    res = apply_patch("src/main.py", "notfound", "xxx", tmp_root)
+    assert res.error
+    assert "old_string not found" in res.content
