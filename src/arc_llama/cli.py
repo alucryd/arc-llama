@@ -9,12 +9,11 @@ Top-level commands:
   arc-llama add        Register a model — local file or HF download.
   arc-llama remove     Remove a model from the config.
   arc-llama serve      Run the OpenAI-compatible router.
-  arc-llama agent      Run the local coding agent from the terminal (one-shot).
-  arc-llama code       Start an interactive coding agent REPL.
-  arc-llama agent-tui  Launch the arcllama agent TUI.
-  arcllama              Launch the arcllama agent TUI (same as agent-tui).
   arc-llama tui        Launch the server management TUI.
   arc-llama systemd    Print a systemd --user service unit for `arc-llama serve`.
+
+The agent/coding-assistant commands (`agent`, `code`, `agent-tui`) are
+experimental and only appear when ARC_LLAMA_EXPERIMENTAL_AGENT=1 is set.
 
 A small static web UI is bundled and served at `/` on the same port as
 `arc-llama serve` — open it in a browser for a model-picker + load/stop view.
@@ -1497,6 +1496,12 @@ def arcllama_main(
     base_url: str | None,
 ) -> None:
     """Entry point for the `arcllama` command."""
+    if not _experimental_agent_enabled():
+        console.print(
+            "[red]The arcllama agent TUI is experimental. "
+            "Set ARC_LLAMA_EXPERIMENTAL_AGENT=1 to enable it.[/red]"
+        )
+        sys.exit(1)
     try:
         run_agent_tui(
             base_url=base_url,
@@ -1533,6 +1538,17 @@ def tui_cmd(ctx: click.Context, server_url: str | None) -> None:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
     run_tui(server_url)
+
+
+def _experimental_agent_enabled() -> bool:
+    """Return True if the experimental coding-agent commands should be exposed."""
+    return os.environ.get("ARC_LLAMA_EXPERIMENTAL_AGENT", "").lower() in ("1", "true", "yes")
+
+
+# Hide the experimental agent commands unless the user explicitly opts in.
+if not _experimental_agent_enabled():
+    for _experimental_agent_cmd in ("agent", "code", "agent-tui"):
+        cli.commands.pop(_experimental_agent_cmd, None)
 
 
 def main() -> None:

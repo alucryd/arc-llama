@@ -17,10 +17,6 @@
     <span class="tagline">Chat</span>
   </div>
   <div class="meta">
-    <div class="mode-toggle" id="mode-toggle">
-      <button class="active" data-mode="chat">Chat</button>
-      <button data-mode="agent">Agent</button>
-    </div>
     <a class="manager-link" href="/">Model Manager &rarr;</a>
   </div>
 </header>
@@ -38,15 +34,6 @@
     <div class="icon"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg></div>
     <div class="title">Start a conversation</div>
     <div class="hint">Select a model and send a message to begin chatting with arc-llama.</div>
-  </div>
-</main>
-
-<main id="agent-log">
-  <div class="agent-ascii-bg" id="agent-ascii-bg"></div>
-  <div class="empty-state" id="agent-empty-state">
-    <div class="icon"><svg viewBox="0 0 24 24" width="20" height="20"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm7-3H7V4h7v2zm5 6H7v-2h12v2z"/></svg></div>
-    <div class="title">Agent mode</div>
-    <div class="hint">Switch to Agent mode, enter a task, and click Run to start a coding assistant session.</div>
   </div>
 </main>
 
@@ -75,23 +62,6 @@
     <div id="command-palette" class="command-palette" role="listbox" aria-label="Slash commands"></div>
   </div>
   <div class="hint" id="chat-hint">Enter to send · Shift+Enter for a new line</div>
-  <div class="agent-controls" id="agent-controls" style="display:none;">
-    <label title="Allow the agent to write files and run shell commands without asking">
-      <input type="checkbox" id="agent-auto-confirm" />
-      Auto-confirm tools
-    </label>
-    <label title="Generate a plan first and ask for approval before making changes">
-      <input type="checkbox" id="agent-plan-mode" />
-      Plan mode
-    </label>
-    <span>Max turns: <input type="number" id="agent-max-turns" value="30" min="1" max="100" /></span>
-    <label class="agent-folder-wrap" title="Folder to save the agent transcript">
-      Folder:
-      <input list="agent-folder-list" id="agent-folder" placeholder="Default" />
-      <datalist id="agent-folder-list"></datalist>
-      <button id="agent-new-folder" class="agent-folder-add" title="New folder">+</button>
-    </label>
-  </div>
 </div>
 
 <button id="history-toggle" aria-label="Chat history" title="Chat history">

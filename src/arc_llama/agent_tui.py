@@ -227,6 +227,7 @@ class AgentApp(App):
         self.chat_input = self.query_one("#chat-input", Input)
         self.chat_input.focus()
         self._write("[b]arcllama[/b] — type a task below. Press Ctrl+C to quit, Ctrl+N for a new session.")
+        self._write("[yellow]Draft interface:[/yellow] still working on ergonomics and style — subject to change.")
 
     def _write(self, text: str) -> None:
         if self.chat_log is not None:

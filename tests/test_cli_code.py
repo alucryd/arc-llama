@@ -1,6 +1,14 @@
 """Tests for the `arc-llama code` CLI command."""
 from __future__ import annotations
 
+import importlib
+import os
+
+import arc_llama.cli
+
+os.environ["ARC_LLAMA_EXPERIMENTAL_AGENT"] = "1"
+importlib.reload(arc_llama.cli)
+
 from click.testing import CliRunner
 
 from arc_llama.cli import cli

@@ -164,9 +164,6 @@ llama_server = "/usr/local/bin/llama-server"
 models_dir   = "~/.local/share/arc-llama/models"
 state_dir    = "~/.local/state/arc-llama"
 
-[agent]
-root = "/home/me/projects"   # default project root for the coding agent
-
 [[gpus]]
 pci_slot   = "0000:03:00.0"
 sycl_index = 0
@@ -197,6 +194,11 @@ extra_flags      = []
 name = "ollama"
 url  = "http://127.0.0.1:11434"
 ```
+
+> [!NOTE]
+> The optional agent/coding-assistant mode is experimental. Enable it by setting
+> `ARC_LLAMA_EXPERIMENTAL_AGENT=1` before running `arc-llama agent`, `code`,
+> or `agent-tui`.
 
 `kv_class` controls the KV-cache size estimate that `arc-llama add` uses to
 pick a context length. Currently:

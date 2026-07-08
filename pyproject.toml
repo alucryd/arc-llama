@@ -54,7 +54,6 @@ dev = [
 
 [project.scripts]
 arc-llama = "arc_llama.cli:main"
-arcllama = "arc_llama.cli:arcllama_main"
 
 [project.urls]
 Homepage = "https://github.com/offbyonebit/arc-llama"

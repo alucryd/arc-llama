@@ -41,19 +41,6 @@ let streamTokenCount = 0;
 const conversation = [];
 let attachments = [];
 
-const agentLog          = $("#agent-log");
-const agentEmptyState   = $("#agent-empty-state");
-const modeToggle        = $("#mode-toggle");
-const chatHint          = $("#chat-hint");
-const agentControls     = $("#agent-controls");
-const agentAutoConfirm  = $("#agent-auto-confirm");
-const agentPlanMode     = $("#agent-plan-mode");
-const agentMaxTurns     = $("#agent-max-turns");
-
-let agentMode = false;
-let agentRunning = false;
-let agentAbort = null;
-
 const ctxMeter   = $("#ctx-meter");
 const ctxBarFill = $("#ctx-bar-fill");
 const ctxLabelL  = $("#ctx-label-left");
@@ -74,9 +61,6 @@ const hImport        = $("#h-import");
 const hImportInput   = $("#h-import-input");
 const hFolder        = $("#h-folder");
 const hNewFolder     = $("#h-new-folder");
-const agentFolder    = $("#agent-folder");
-const agentFolderList = $("#agent-folder-list");
-const agentNewFolder = $("#agent-new-folder");
 
 const HISTORY_KEY    = "arc-llama-chats";
 const MAX_HISTORY    = 50;
@@ -162,14 +146,6 @@ if (hFolder) {
 
 if (hNewFolder) {
   hNewFolder.addEventListener("click", createFolder);
-}
-
-if (agentNewFolder) {
-  agentNewFolder.addEventListener("click", () => {
-    const name = prompt("Name for the new folder:");
-    if (!name || !name.trim()) return;
-    if (agentFolder) agentFolder.value = name.trim();
-  });
 }
 
 if (hExport) hExport.addEventListener("click", exportChats);
@@ -504,7 +480,7 @@ function getFolderLabel(name) {
 }
 
 function populateFolderSelects() {
-  if (!hFolder || !agentFolder) return;
+  if (!hFolder) return;
 
   const saved = hFolder.value;
   hFolder.innerHTML = `<option value="${ALL_FOLDERS}">All folders</option>`;
@@ -519,14 +495,6 @@ function populateFolderSelects() {
     currentFolder = ALL_FOLDERS;
   }
 
-  if (agentFolderList) {
-    agentFolderList.innerHTML = "";
-    for (const f of folders) {
-      if (!f.name) continue;
-      const label = getFolderLabel(f.name);
-      agentFolderList.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(f.name)}">${escapeHtml(label)}</option>`);
-    }
-  }
 }
 
 async function loadFolders() {
@@ -1287,194 +1255,6 @@ inputWrap.addEventListener("drop", (e) => {
   for (const file of files) addAttachment(file);
 });
 
-// ------------------------------------------------------------------
-// Agent mode
-// ------------------------------------------------------------------
-
-function setMode(mode) {
-  agentMode = mode === "agent";
-  for (const btn of modeToggle.querySelectorAll("button")) {
-    btn.classList.toggle("active", btn.dataset.mode === mode);
-  }
-  chatLog.classList.toggle("hidden", agentMode);
-  agentLog.classList.toggle("active", agentMode);
-  chatHint.style.display = agentMode ? "none" : "";
-  agentControls.style.display = agentMode ? "flex" : "none";
-  attachButton.style.display = agentMode ? "none" : "flex";
-  attachmentStrip.style.display = agentMode ? "none" : "flex";
-  sendButton.title = agentMode ? "Run task" : "Send";
-  input.placeholder = agentMode ? "Describe the coding task…" : "Message arc-llama…";
-  ctxMeter.classList.toggle("visible", !agentMode);
-  hideCommandPalette();
-  input.focus();
-}
-
-for (const btn of modeToggle.querySelectorAll("button")) {
-  btn.addEventListener("click", () => setMode(btn.dataset.mode));
-}
-
-const ICON_SEARCH = '<svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zM9.5 14C7.57 14 6 12.43 6 10.5S7.57 7 9.5 7 13 8.57 13 10.5 11.43 14 9.5 14z"/></svg>';
-const ICON_READ = '<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm4 18H6V4h7v5h5v11z"/></svg>';
-const ICON_WRITE = '<svg viewBox="0 0 24 24"><path d="M19 12h-2v8H7V4h8V2H5v20h14v-6h2v6c0 1.1-.9 2-2 2H5c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10l6 6v2h-2V7l-4-4zM8 13h6v-2H8v2zm0-4h4V7H8v2zm11.7 4.5-1.4-1.4-5.3 5.3-2.3-2.3-1.4 1.4 3.7 3.7 6.7-6.7z"/></svg>';
-const ICON_COMMAND = '<svg viewBox="0 0 24 24"><path d="M4 5h16v2H4V5zm0 6h10v2H4v-2zm0 6h13v2H4v-2z"/></svg>';
-const ICON_LIST = '<svg viewBox="0 0 24 24"><path d="M3 5h2v2H3V5zm4 0h14v2H7V5zM3 11h2v2H3v-2zm4 0h14v2H7v-2zm-4 6h2v2H3v-2zm4 0h14v2H7v-2z"/></svg>';
-const ICON_CHECK = '<svg viewBox="0 0 24 24"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-const ICON_X = '<svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
-const ICON_WARN = '<svg viewBox="0 0 24 24"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>';
-const ICON_BOT = '<svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm7-3H7V4h7v2zm5 6H7v-2h12v2z"/></svg>';
-
-function getToolIcon(name) {
-  if (name.includes("search")) return ICON_SEARCH;
-  if (name.includes("write")) return ICON_WRITE;
-  if (name.includes("read")) return ICON_READ;
-  if (name === "list_directory") return ICON_LIST;
-  if (name === "run_command") return ICON_COMMAND;
-  return ICON_BOT;
-}
-
-function getToolKind(name) {
-  if (name.includes("search")) return "Search";
-  if (name.includes("write")) return "Write file";
-  if (name.includes("read")) return "Read file";
-  if (name === "list_directory") return "List directory";
-  if (name === "run_command") return "Shell";
-  return "Tool";
-}
-
-function makeToggle(container, toggleClass, bodyClass) {
-  const toggle = container.querySelector(toggleClass);
-  const body = container.querySelector(bodyClass);
-  if (!toggle || !body) return;
-  toggle.classList.toggle("open");
-  body.classList.toggle("open");
-}
-
-// Robot llama mascot for the agent background. Every frame is built from the
-// same skeleton via center()/llamaBox() so widths can never drift between
-// frames - that's what kept the old hand-typed art from jittering as it
-// "animated" by swapping state.
-const LLAMA_WIDTH = 24;
-
-function center(str) {
-  str = str || "";
-  const pad = LLAMA_WIDTH - str.length;
-  const left = Math.floor(pad / 2);
-  const right = pad - left;
-  return " ".repeat(Math.max(left, 0)) + str + " ".repeat(Math.max(right, 0));
-}
-
-function llamaBox(left, innerWidth, content, right) {
-  content = content || "";
-  const pad = innerWidth - content.length;
-  const padLeft = Math.floor(pad / 2);
-  const padRight = pad - padLeft;
-  const inner = " ".repeat(Math.max(padLeft, 0)) + content + " ".repeat(Math.max(padRight, 0));
-  return center(left + inner + right);
-}
-
-function llamaFrame({ eyes = "", mouth = "", panel1 = "", panel2 = "" }) {
-  return [
-    center("/\\        /\\"),
-    center("/  \\      /  \\"),
-    center(".------------."),
-    llamaBox("|", 12, eyes, "|"),
-    llamaBox("|", 12, "", "|"),
-    llamaBox("|", 12, mouth, "|"),
-    center("'----,  ,----'"),
-    center("|  |"),
-    center(".--'--'--."),
-    llamaBox("| ", 8, panel1, " |"),
-    llamaBox("| ", 8, panel2, " |"),
-    center("'--------'"),
-  ].join("\n");
-}
-
-// Each state is a list of frame descriptors cycled by the interval below -
-// eyes/mouth/panel text change, the skeleton never does.
-const AGENT_ASCII = {
-  idle: [
-    { eyes: "o    o", mouth: "____", panel1: "ARC-LLAMA", panel2: "" },
-    { eyes: "-    -", mouth: "____", panel1: "ARC-LLAMA", panel2: "" },
-  ],
-  thinking: [
-    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "" },
-    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "." },
-    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: ".." },
-    { eyes: "o    o", mouth: "....", panel1: "THINKING", panel2: "..." },
-  ],
-  read: [
-    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[=  ]" },
-    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[ = ]" },
-    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[  =]" },
-    { eyes: "v    v", mouth: "____", panel1: "READING", panel2: "[ = ]" },
-  ],
-  write: [
-    { eyes: "o    o", mouth: "____", panel1: "WRITING", panel2: "code_" },
-    { eyes: "o    o", mouth: "____", panel1: "WRITING", panel2: "code " },
-  ],
-  command: [
-    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "/" },
-    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "-" },
-    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "\\" },
-    { eyes: "o    o", mouth: "____", panel1: "$ EXEC", panel2: "|" },
-  ],
-  search: [
-    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[o   ]" },
-    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[ o  ]" },
-    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[  o ]" },
-    { eyes: "O    O", mouth: "____", panel1: "SEARCH", panel2: "[   o]" },
-  ],
-  list: [
-    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "* - -" },
-    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "- * -" },
-    { eyes: "o    o", mouth: "____", panel1: "FILES", panel2: "- - *" },
-  ],
-  working: [
-    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "/" },
-    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "-" },
-    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "\\" },
-    { eyes: "o    o", mouth: "____", panel1: "WORKING", panel2: "|" },
-  ],
-  success: [
-    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "" },
-    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "\\o/" },
-  ],
-  done: [
-    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "" },
-    { eyes: "^    ^", mouth: "\\__/", panel1: "DONE", panel2: "\\o/" },
-  ],
-  error: [
-    { eyes: "x    x", mouth: "/??\\", panel1: "ERROR", panel2: "!!!" },
-    { eyes: "x    x", mouth: "/??\\", panel1: "ERROR", panel2: "" },
-  ],
-};
-
-const AGENT_ASCII_FRAME_MS = 450;
-const agentAsciiBg = $("#agent-ascii-bg");
-let agentAsciiState = "idle";
-let agentAsciiFrameIndex = 0;
-
-function renderAgentAscii() {
-  if (!agentAsciiBg) return;
-  const frames = AGENT_ASCII[agentAsciiState] || AGENT_ASCII.idle;
-  agentAsciiBg.textContent = llamaFrame(frames[agentAsciiFrameIndex % frames.length]);
-  agentAsciiBg.className = "agent-ascii-bg state-" + agentAsciiState;
-}
-
-function setAgentAscii(state) {
-  if (!agentAsciiBg) return;
-  if (state === agentAsciiState) return;
-  agentAsciiState = AGENT_ASCII[state] ? state : "idle";
-  agentAsciiFrameIndex = 0;
-  renderAgentAscii();
-}
-
-renderAgentAscii();
-setInterval(() => {
-  agentAsciiFrameIndex += 1;
-  renderAgentAscii();
-}, AGENT_ASCII_FRAME_MS);
-
 function shouldAutoScroll(container) {
   if (!container) return true;
   const threshold = 60;
@@ -1484,521 +1264,6 @@ function shouldAutoScroll(container) {
 function autoScroll(container) {
   if (!container) return;
   container.scrollTop = container.scrollHeight;
-}
-
-const agentRenderer = {
-  thinkingEl: null,
-  toolCards: new Map(),
-  stepNumber: 0,
-
-  clear() {
-    const bg = $("#agent-ascii-bg");
-    agentLog.innerHTML = "";
-    if (bg) agentLog.appendChild(bg);
-    if (agentEmptyState) agentEmptyState.style.display = "";
-    this.toolCards.clear();
-    this.thinkingEl = null;
-    this.stepNumber = 0;
-    setAgentAscii("idle");
-  },
-
-  renderPrompt(task) {
-    if (agentEmptyState) agentEmptyState.style.display = "none";
-    const el = document.createElement("div");
-    el.className = "agent-prompt";
-    el.textContent = task;
-    agentLog.appendChild(el);
-  },
-
-  setThinking(active) {
-    if (active) {
-      if (this.thinkingEl) return;
-      if (agentEmptyState) agentEmptyState.style.display = "none";
-      const el = document.createElement("div");
-      el.className = "agent-log-line thinking";
-      el.innerHTML = `<div class="agent-thinking"><span>Thinking</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
-      agentLog.appendChild(el);
-      if (shouldAutoScroll(agentLog)) autoScroll(agentLog);
-      this.thinkingEl = el;
-      setAgentAscii("thinking");
-    } else {
-      if (this.thinkingEl) {
-        this.thinkingEl.remove();
-        this.thinkingEl = null;
-      }
-    }
-  },
-
-  addEvent(event) {
-    if (agentEmptyState) agentEmptyState.style.display = "none";
-    switch (event.type) {
-      case "status":
-        this.renderStatus(event);
-        break;
-      case "plan":
-        this.renderPlan(event);
-        break;
-      case "assistant":
-        this.renderAssistant(event);
-        break;
-      case "tool_call":
-        this.renderToolCall(event);
-        break;
-      case "tool_result":
-        this.renderToolResult(event);
-        break;
-      case "confirm_required":
-        this.renderConfirm(event);
-        break;
-      case "checkpoint":
-        this.renderCheckpoint(event);
-        break;
-      case "error":
-        this.renderError(event);
-        break;
-      case "done":
-        this.renderDone(event);
-        break;
-      default:
-        this.renderRaw(event);
-    }
-    if (shouldAutoScroll(agentLog)) autoScroll(agentLog);
-  },
-
-  renderStatus(event) {
-    const el = document.createElement("div");
-    el.className = "agent-log-line status";
-    el.textContent = "# " + (event.message || "");
-    agentLog.appendChild(el);
-  },
-
-  renderPlan(event) {
-    this.setThinking(false);
-    setAgentAscii("thinking");
-    const line = document.createElement("div");
-    line.className = "agent-log-line plan";
-    const runId = event.run_id || "";
-    const content = event.content || "";
-    line.innerHTML = `
-      <div class="agent-plan-header">
-        <span class="agent-tool-icon">${ICON_BOT}</span>
-        <span class="agent-tool-title">Proposed plan</span>
-      </div>
-      <div class="agent-plan-body"><pre>${escapeHtml(content)}</pre></div>
-      <div class="agent-plan-actions">
-        <button class="agent-confirm-btn approve" data-action="approve">${ICON_CHECK} Approve & run</button>
-        <button class="agent-confirm-btn deny" data-action="deny">${ICON_X} Deny</button>
-      </div>`;
-    agentLog.appendChild(line);
-
-    if (!runId) return;
-    const approveBtn = line.querySelector('.agent-confirm-btn[data-action="approve"]');
-    const denyBtn = line.querySelector('.agent-confirm-btn[data-action="deny"]');
-
-    const submitApproval = async (approved) => {
-      if (approveBtn) approveBtn.disabled = true;
-      if (denyBtn) denyBtn.disabled = true;
-      const clicked = approved ? approveBtn : denyBtn;
-      if (clicked) clicked.innerHTML = '<span class="spinner"></span> ' + (approved ? "Approving…" : "Denying…");
-      try {
-        const r = await fetch(`/v1/agent/${encodeURIComponent(runId)}/plan`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ approved }),
-        });
-        if (!r.ok) {
-          const t = await r.text();
-          throw new Error(`${r.status} ${t}`);
-        }
-      } catch (e) {
-        if (approveBtn) {
-          approveBtn.disabled = false;
-          approveBtn.innerHTML = `${ICON_CHECK} Approve & run`;
-        }
-        if (denyBtn) {
-          denyBtn.disabled = false;
-          denyBtn.innerHTML = `${ICON_X} Deny`;
-        }
-        this.renderError({ message: "Plan approval failed: " + e.message });
-      }
-    };
-
-    if (approveBtn) approveBtn.addEventListener("click", () => submitApproval(true));
-    if (denyBtn) denyBtn.addEventListener("click", () => submitApproval(false));
-  },
-
-  renderAssistant(event) {
-    this.setThinking(false);
-    const parsed = parseThinking(event.content || "");
-    const line = document.createElement("div");
-    line.className = "agent-log-line assistant";
-
-    let html = "";
-    if (parsed.thinking) {
-      html += `
-        <div class="agent-thinking-block">
-          <div class="agent-thinking-toggle"><span class="chevron">▶</span> Thinking</div>
-          <div class="agent-thinking-content"></div>
-        </div>`;
-    }
-    html += `<div class="agent-assistant"></div>`;
-    line.innerHTML = html;
-    agentLog.appendChild(line);
-
-    const thinkingContent = line.querySelector(".agent-thinking-content");
-    if (thinkingContent && parsed.thinking) {
-      thinkingContent.textContent = parsed.thinking;
-    }
-    const assistantContent = line.querySelector(".agent-assistant");
-    if (assistantContent) {
-      renderMarkdown(assistantContent, parsed.content);
-    }
-
-    const toggle = line.querySelector(".agent-thinking-toggle");
-    if (toggle) {
-      toggle.addEventListener("click", () => makeToggle(line, ".agent-thinking-toggle", ".agent-thinking-content"));
-    }
-  },
-
-  _makeToolDetail(label, content, open = false) {
-    const detail = document.createElement("div");
-    detail.className = "agent-tool-detail";
-    const trimmed = String(content || "").trimEnd();
-    detail.innerHTML = `
-      <div class="agent-tool-detail-toggle${open ? " open" : ""}"><span class="chevron">▶</span> ${escapeHtml(label)}</div>
-      <div class="agent-tool-detail-body${open ? " open" : ""}"><pre>${escapeHtml(trimmed)}</pre></div>`;
-    const toggle = detail.querySelector(".agent-tool-detail-toggle");
-    toggle.addEventListener("click", () => makeToggle(detail, ".agent-tool-detail-toggle", ".agent-tool-detail-body"));
-    return detail;
-  },
-
-  _asciiForTool(name) {
-    if (name.includes("search")) return "search";
-    if (name.includes("write")) return "write";
-    if (name.includes("read")) return "read";
-    if (name === "list_directory") return "list";
-    if (name === "run_command") return "command";
-    return "working";
-  },
-
-  renderToolCall(event) {
-    this.setThinking(false);
-    this.stepNumber += 1;
-    const id = event.id || `orphan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const name = event.name || "unknown";
-    const args = event.arguments || {};
-    const icon = getToolIcon(name);
-    const kind = getToolKind(name);
-    const target = this._toolTarget(name, args);
-
-    setAgentAscii(this._asciiForTool(name));
-
-    const line = document.createElement("div");
-    line.className = "agent-log-line tool agent-tool pending";
-    line.dataset.callId = id;
-    line.innerHTML = `
-      <div class="agent-tool-header">
-        <span class="agent-step-number">${this.stepNumber}</span>
-        <span class="agent-tool-icon">${icon}</span>
-        <span class="agent-tool-title">
-          <span class="agent-tool-kind">${escapeHtml(kind)}</span>
-          ${target ? `<span class="agent-tool-target">${escapeHtml(target)}</span>` : ""}
-        </span>
-        <span class="agent-tool-status"><span class="spinner"></span> Running…</span>
-      </div>
-      <div class="agent-tool-details"></div>`;
-    agentLog.appendChild(line);
-
-    const details = line.querySelector(".agent-tool-details");
-    details.appendChild(this._makeToolDetail("Arguments", JSON.stringify(args, null, 2), false));
-    this.toolCards.set(id, { el: line, step: this.stepNumber });
-  },
-
-  _toolTarget(name, args) {
-    if (args.path) return String(args.path);
-    if (args.file_path) return String(args.file_path);
-    if (args.directory) return String(args.directory);
-    if (args.command) {
-      const cmd = String(args.command);
-      return cmd.length > 60 ? cmd.slice(0, 57) + "…" : cmd;
-    }
-    if (args.query) {
-      const q = String(args.query);
-      return q.length > 60 ? q.slice(0, 57) + "…" : q;
-    }
-    return "";
-  },
-
-  renderToolResult(event) {
-    const id = event.id;
-    let card = id ? this.toolCards.get(id) : null;
-    if (!card) {
-      const pending = [...this.toolCards.values()].find((c) => c.el.classList.contains("pending"));
-      card = pending;
-    }
-
-    if (!card) {
-      const line = document.createElement("div");
-      line.className = "agent-log-line tool agent-tool" + (event.error ? " error" : " success");
-      line.innerHTML = `
-        <div class="agent-tool-row">
-          <span class="agent-tool-icon">${event.error ? ICON_X : ICON_CHECK}</span>
-          <span class="agent-tool-name"><code>${escapeHtml(event.name || "")}</code></span>
-          <span class="agent-tool-status">${event.error ? "Failed" : "Done"}</span>
-        </div>
-        <div class="agent-tool-details"></div>`;
-      agentLog.appendChild(line);
-      const details = line.querySelector(".agent-tool-details");
-      details.appendChild(this._makeToolDetail("Result", event.content || "", true));
-      return;
-    }
-
-    const line = card.el;
-    line.classList.remove("pending");
-    line.classList.add(event.error ? "error" : "success");
-
-    const status = line.querySelector(".agent-tool-status");
-    if (status) {
-      status.innerHTML = event.error
-        ? `<span class="status-icon">${ICON_X}</span> Failed`
-        : `<span class="status-icon">${ICON_CHECK}</span> Done`;
-    }
-
-    const iconWrap = line.querySelector(".agent-tool-icon");
-    if (iconWrap) iconWrap.innerHTML = event.error ? ICON_X : getToolIcon(event.name || "");
-
-    const details = line.querySelector(".agent-tool-details");
-    const existingResult = details.querySelector(".agent-tool-result");
-    if (existingResult) existingResult.remove();
-    const resultDetail = this._makeToolDetail("Result", event.content || "", true);
-    resultDetail.classList.add("agent-tool-result");
-    details.appendChild(resultDetail);
-
-    setAgentAscii(event.error ? "error" : "success");
-    this.setThinking(true);
-  },
-
-  renderConfirm(event) {
-    this.setThinking(false);
-    const runId = event.run_id;
-    const id = event.id;
-    const tool = event.tool || "unknown";
-    const args = event.arguments || {};
-
-    let card = id ? this.toolCards.get(id) : null;
-
-    if (!card) {
-      // Build an inline confirmation line when no preceding tool_call card exists.
-      const line = document.createElement("div");
-      line.className = "agent-log-line tool agent-tool confirm-required";
-      line.dataset.runId = runId || "";
-      line.dataset.callId = id || "";
-      line.innerHTML = `
-        <div class="agent-confirm-row">
-          <span class="agent-tool-icon">${ICON_WARN}</span>
-          <span class="agent-tool-name"><code>${escapeHtml(tool)}</code> <span style="color:var(--fg-mute)">needs approval</span></span>
-          <span class="agent-confirm-actions">
-            <button class="agent-confirm-btn approve" data-action="approve">${ICON_CHECK} Allow</button>
-            <button class="agent-confirm-btn deny" data-action="deny">${ICON_X} Deny</button>
-          </span>
-        </div>
-        <div class="agent-tool-details"></div>`;
-      agentLog.appendChild(line);
-      const details = line.querySelector(".agent-tool-details");
-      details.appendChild(this._makeToolDetail("Arguments", JSON.stringify(args, null, 2), false));
-      card = { el: line };
-    } else {
-      // Replace the running status on the existing tool card with confirm buttons.
-      const line = card.el;
-      line.classList.add("confirm-required");
-      const status = line.querySelector(".agent-tool-status");
-      if (status) {
-        status.innerHTML = `
-          <span class="agent-confirm-actions">
-            <button class="agent-confirm-btn approve" data-action="approve">${ICON_CHECK} Allow</button>
-            <button class="agent-confirm-btn deny" data-action="deny">${ICON_X} Deny</button>
-          </span>`;
-      }
-      line.dataset.runId = runId || "";
-    }
-
-    if (!runId) return;
-    const line = card.el;
-    const approveBtn = line.querySelector('.agent-confirm-btn[data-action="approve"]');
-    const denyBtn = line.querySelector('.agent-confirm-btn[data-action="deny"]');
-
-    const submitConfirmation = async (approved) => {
-      if (approveBtn) approveBtn.disabled = true;
-      if (denyBtn) denyBtn.disabled = true;
-      const spinner = '<span class="spinner"></span>';
-      const label = approved ? "Allowing…" : "Denying…";
-      const clicked = approved ? approveBtn : denyBtn;
-      if (clicked) clicked.innerHTML = spinner + " " + label;
-      try {
-        const r = await fetch(`/v1/agent/${encodeURIComponent(runId)}/confirm`, {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ approved }),
-        });
-        if (!r.ok) {
-          const t = await r.text();
-          throw new Error(`${r.status} ${t}`);
-        }
-      } catch (e) {
-        if (approveBtn) {
-          approveBtn.disabled = false;
-          approveBtn.innerHTML = `${ICON_CHECK} Allow`;
-        }
-        if (denyBtn) {
-          denyBtn.disabled = false;
-          denyBtn.innerHTML = `${ICON_X} Deny`;
-        }
-        this.renderError({ message: "Confirmation failed: " + e.message });
-      }
-    };
-
-    if (approveBtn) approveBtn.addEventListener("click", () => submitConfirmation(true));
-    if (denyBtn) denyBtn.addEventListener("click", () => submitConfirmation(false));
-  },
-
-  renderCheckpoint(event) {
-    const line = document.createElement("div");
-    line.className = "agent-log-line checkpoint";
-    line.innerHTML = `<div class="agent-checkpoint">${ICON_CHECK} Checkpoint created: <code>${escapeHtml(event.id || "")}</code></div>`;
-    agentLog.appendChild(line);
-  },
-
-  renderError(event) {
-    this.setThinking(false);
-    setAgentAscii("error");
-    const line = document.createElement("div");
-    line.className = "agent-log-line error";
-    line.innerHTML = `<div class="agent-error"><span style="color:#d8a0a0">Error:</span> ${escapeHtml(event.message || "")}</div>`;
-    agentLog.appendChild(line);
-  },
-
-  renderDone(event) {
-    this.setThinking(false);
-    setAgentAscii("done");
-    const line = document.createElement("div");
-    line.className = "agent-log-line done";
-    line.innerHTML = `<div class="agent-done">${ICON_CHECK} Agent finished.</div>`;
-    agentLog.appendChild(line);
-  },
-
-  renderRaw(event) {
-    this.setThinking(false);
-    const line = document.createElement("div");
-    line.className = "agent-log-line";
-    line.innerHTML = `<pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>`;
-    agentLog.appendChild(line);
-  }
-};
-
-async function runAgentTask() {
-  const task = input.value.trim();
-  if (!task || agentRunning || !selectedModel) return;
-
-  input.value = "";
-  input.style.height = "auto";
-  agentRenderer.clear();
-  agentRenderer.renderPrompt(task);
-  agentRunning = true;
-  sendButton.disabled = true;
-  inputWrap.classList.add("generating");
-
-  // Ensure model is loaded
-  try {
-    await ensureModelLoaded();
-  } catch (e) {
-    agentRenderer.addEvent({ type: "error", message: e.message });
-    finishAgentRun();
-    return;
-  }
-
-  const autoConfirm = agentAutoConfirm.checked;
-  const planMode = agentPlanMode.checked;
-  const maxTurns = parseInt(agentMaxTurns.value, 10) || 30;
-  const agentChatFolder = agentFolder ? agentFolder.value : "";
-
-  const abortController = new AbortController();
-  agentAbort = () => abortController.abort();
-
-  agentRenderer.addEvent({
-    type: "status",
-    message: `Running task with ${autoConfirm ? "auto-confirm" : "manual confirmation"}${planMode ? " + plan mode" : ""}`,
-  });
-  agentRenderer.setThinking(true);
-
-  let agentStartTime = null;
-  let agentTokenCount = 0;
-
-  try {
-    const r = await fetch("/v1/agent", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        model: selectedModel,
-        task: task,
-        auto_confirm: autoConfirm,
-        plan_mode: planMode,
-        max_turns: maxTurns,
-        folder: agentChatFolder,
-      }),
-      signal: abortController.signal,
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`${r.status} ${t}`);
-    }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (payload === "[DONE]") continue;
-        try {
-          const event = JSON.parse(payload);
-          agentRenderer.addEvent(event);
-          if (event.type === "assistant" && event.content) {
-            if (agentStartTime === null) agentStartTime = Date.now();
-            agentTokenCount += Math.max(1, Math.round(event.content.length / 4));
-          }
-        } catch (e) {
-          // ignore malformed SSE payloads
-        }
-      }
-    }
-    if (agentStartTime && agentTokenCount > 0) {
-      const elapsed = (Date.now() - agentStartTime) / 1000;
-      const tps = elapsed > 0 ? (agentTokenCount / elapsed).toFixed(1) : null;
-      if (tps) ctxLabelTps.textContent = tps + " tok/s";
-    }
-  } catch (e) {
-    if (e.name !== "AbortError") {
-      agentRenderer.addEvent({ type: "error", message: "Agent failed: " + e.message });
-    }
-  } finally {
-    agentAbort = null;
-    finishAgentRun();
-    loadFolders().then(() => syncChatsFromServer()).catch(() => {});
-  }
-}
-
-function finishAgentRun() {
-  agentRunning = false;
-  sendButton.disabled = false;
-  inputWrap.classList.remove("generating");
-  agentRenderer.setThinking(false);
-  input.focus();
 }
 
 // ------------------------------------------------------------------
@@ -2072,7 +1337,7 @@ function renderCommandPalette(filter = "") {
 
 function updateCommandPalette() {
   const text = input.value;
-  if (!agentMode && text.startsWith("/") && !text.includes(" ")) {
+  if (text.startsWith("/") && !text.includes(" ")) {
     const prefix = text.slice(1);
     renderCommandPalette(prefix);
   } else {
@@ -2242,33 +1507,25 @@ input.addEventListener("keydown", async (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     const text = input.value.trim();
-    if (!agentMode && await executeSlashCommand(text)) {
+    if (await executeSlashCommand(text)) {
       input.value = "";
       input.style.height = "auto";
       hideCommandPalette();
       return;
     }
-    if (agentMode) {
-      runAgentTask();
-    } else {
-      sendMessage();
-    }
+    sendMessage();
   }
 });
 
 sendButton.addEventListener("click", async () => {
   const text = input.value.trim();
-  if (!agentMode && await executeSlashCommand(text)) {
+  if (await executeSlashCommand(text)) {
     input.value = "";
     input.style.height = "auto";
     hideCommandPalette();
     return;
   }
-  if (agentMode) {
-    runAgentTask();
-  } else {
-    sendMessage();
-  }
+  sendMessage();
 });
 
 input.addEventListener("input", () => {
