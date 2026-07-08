@@ -527,7 +527,7 @@ def list_models(ctx: click.Context) -> None:
 )
 @click.option(
     "--ubatch-size", "ubatch_size", type=int, default=None,
-    help="Ubatch size (-ub). Auto-set to 8 for MTP models.",
+    help="Ubatch size (-ub). Left unset by default; llama.cpp picks its own.",
 )
 @click.option(
     "--from-hf", is_flag=True,

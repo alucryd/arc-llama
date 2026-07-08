@@ -184,9 +184,9 @@ class FakeHttpxClient:
 
 @pytest.fixture
 def sample_cfg_with_model():
-    from arc_llama.config import Config, GPUConfig, ModelConfig
+    from arc_llama.config import Config, GPUConfig, ModelConfig, ServerConfig
     return Config(
-        server=type("S", (), {"host": "127.0.0.1", "port": 11437, "single_resident": True})(),
+        server=ServerConfig(host="127.0.0.1", port=11437, single_resident=True),
         paths=type("P", (), {"llama_server": "/bin/llama-server"})(),
         gpus=[
             GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24 * 1024),

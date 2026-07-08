@@ -265,7 +265,7 @@ def mock_recipe_and_mtp():
     """Patch default_recipe and has_mtp_heads for add_local_model/register_discovered."""
     from arc_llama.recipes import KVCacheType, LaunchRecipe
 
-    def _recipe(*, arch, vram_mb, model_file_mb, kv_class):
+    def _recipe(*, arch, vram_mb, model_file_mb, kv_class, backend=None):
         return LaunchRecipe(
             n_gpu_layers=999,
             ctx=8192,
@@ -417,7 +417,7 @@ def test_add_local_model_recipe_overrides_applied(tmp_path, mock_recipe_and_mtp)
 
 
 def test_add_local_model_auto_mtp_heads(tmp_path):
-    """When has_mtp_heads returns True, recipe should include draft-mtp settings."""
+    """When has_mtp_heads returns True, recipe should enable draft-mtp only."""
     cfg = _make_config_with_gpu(tmp_path)
     model_file = tmp_path / "model.gguf"
     model_file.write_bytes(b"fake")
@@ -444,7 +444,114 @@ def test_add_local_model_auto_mtp_heads(tmp_path):
         )
 
     assert mc.recipe["spec_type"] == "draft-mtp"
-    assert mc.recipe["ubatch_size"] == 8
+    assert "ubatch_size" not in mc.recipe
+
+
+def test_add_local_model_passes_backend_to_recipe(tmp_path):
+    """The GPU's configured backend is forwarded to default_recipe."""
+    from arc_llama.arch import Backend
+
+    cfg = _make_config_with_gpu(tmp_path)
+    cfg.gpus[0].backend = Backend.VULKAN.value
+    model_file = tmp_path / "model.gguf"
+    model_file.write_bytes(b"fake")
+
+    with (
+        patch("arc_llama.models.default_recipe") as mock_recipe,
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+    ):
+        from arc_llama.recipes import KVCacheType, LaunchRecipe
+
+        mock_recipe.return_value = LaunchRecipe(
+            n_gpu_layers=999,
+            ctx=8192,
+            parallel=1,
+            cache_type_k=KVCacheType.Q8_0,
+            cache_type_v=KVCacheType.Q8_0,
+        )
+
+        add_local_model(
+            cfg,
+            name="test-model",
+            path=str(model_file),
+            gpu_pci_slot="0000:03:00.0",
+        )
+
+    assert mock_recipe.call_count == 1
+    call_kwargs = mock_recipe.call_args.kwargs
+    assert call_kwargs["backend"] == Backend.VULKAN
+
+
+def test_add_local_model_moe_offload_on_tight_vram(tmp_path):
+    """MoE models on tight VRAM get n_cpu_moe set."""
+    cfg = _make_config_with_gpu(tmp_path)
+    cfg.gpus[0].vram_mb = 10 * 1024  # 10 GB
+    model_file = tmp_path / "model.gguf"
+    model_file.write_bytes(b"fake")
+
+    # Pretend the file is ~10 GB so it sits at the VRAM limit.
+    fake_stat = type("S", (), {"st_size": 10 * 1024 * 1024 * 1024})()
+
+    with (
+        patch("arc_llama.models.default_recipe") as mock_recipe,
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=True),
+        patch("arc_llama.models.expert_count", return_value=64),
+        patch.object(Path, "stat", return_value=fake_stat),
+    ):
+        from arc_llama.recipes import KVCacheType, LaunchRecipe
+
+        mock_recipe.return_value = LaunchRecipe(
+            n_gpu_layers=999,
+            ctx=4096,
+            parallel=1,
+            cache_type_k=KVCacheType.Q8_0,
+            cache_type_v=KVCacheType.Q8_0,
+        )
+
+        mc = add_local_model(
+            cfg,
+            name="moe-model",
+            path=str(model_file),
+            gpu_pci_slot="0000:03:00.0",
+        )
+
+    assert "n_cpu_moe" in mc.recipe
+    assert isinstance(mc.recipe["n_cpu_moe"], int)
+    assert 1 <= mc.recipe["n_cpu_moe"] <= 32
+
+
+def test_add_local_model_moe_no_offload_when_vram_headroom(tmp_path):
+    """MoE models with plenty of VRAM do not get n_cpu_moe."""
+    cfg = _make_config_with_gpu(tmp_path)  # 24 GB
+    model_file = tmp_path / "model.gguf"
+    model_file.write_bytes(b"fake")
+
+    with (
+        patch("arc_llama.models.default_recipe") as mock_recipe,
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=True),
+        patch("arc_llama.models.expert_count", return_value=64),
+    ):
+        from arc_llama.recipes import KVCacheType, LaunchRecipe
+
+        mock_recipe.return_value = LaunchRecipe(
+            n_gpu_layers=999,
+            ctx=8192,
+            parallel=1,
+            cache_type_k=KVCacheType.Q8_0,
+            cache_type_v=KVCacheType.Q8_0,
+        )
+
+        mc = add_local_model(
+            cfg,
+            name="moe-model",
+            path=str(model_file),
+            gpu_pci_slot="0000:03:00.0",
+        )
+
+    assert "n_cpu_moe" not in mc.recipe
 
 
 def test_add_local_model_auto_port(tmp_path, mock_recipe_and_mtp):
@@ -606,7 +713,7 @@ def test_register_discovered_auto_mtp(tmp_path):
 
     assert len(added) == 1
     assert added[0].recipe["spec_type"] == "draft-mtp"
-    assert added[0].recipe["ubatch_size"] == 8
+    assert "ubatch_size" not in added[0].recipe
 
 
 # ===========================================================================

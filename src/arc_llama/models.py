@@ -20,10 +20,29 @@ from arc_llama.config import (
     Config,
     ModelConfig,
 )
-from arc_llama.gguf_meta import has_mtp_heads
+from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe
 from arc_llama.recipes import default_recipe
 
 log = logging.getLogger("arc_llama.models")
+
+
+def _suggest_moe_offload(vram_mb: int, model_file_mb: int, num_experts: int) -> int | None:
+    """Conservatively suggest how many experts per layer to keep on CPU.
+
+    Returns ``None`` when there is enough headroom that offloading is unnecessary
+    or when the expert count is not known. The heuristic is intentionally simple:
+    only offload if the model file is within ~15% of the GPU's VRAM budget, and
+    never offload more than half the experts.
+    """
+    if num_experts <= 0:
+        return None
+    # No pressure: model fits with >15% VRAM headroom.
+    if model_file_mb < vram_mb * 0.85:
+        return None
+    # Pressure ratio: how much of the model exceeds the 85% threshold.
+    pressure = max(0.0, min(1.0, (model_file_mb - vram_mb * 0.85) / (vram_mb * 0.15)))
+    offload = max(1, int(num_experts * pressure * 0.5))
+    return min(offload, num_experts // 2)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 HF_SPEC_RE = re.compile(
@@ -113,13 +132,15 @@ def add_local_model(
     if any(m.name == name for m in cfg.models):
         raise ValueError(f"Model name '{name}' already registered.")
     # Build a recipe that fits this GPU.
-    from arc_llama.arch import Arch
+    from arc_llama.arch import Arch, Backend
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     recipe = default_recipe(
         arch=arch,
         vram_mb=gpu.vram_mb or 8192,
         model_file_mb=p.stat().st_size // (1024 * 1024),
         kv_class=kv_class,
+        backend=backend,
     )
     recipe_dict: dict[str, Any] = {
         "n_gpu_layers": recipe.n_gpu_layers,
@@ -131,11 +152,31 @@ def add_local_model(
     # Auto-enable draft-mtp for models that actually carry MTP heads.
     if has_mtp_heads(p):
         recipe_dict["spec_type"] = "draft-mtp"
-        recipe_dict["ubatch_size"] = 8
         log.info(
-            "model %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
+            "model %s has MTP heads; auto-enabling spec_type=draft-mtp",
             name,
         )
+    # Suggest MoE expert offload on VRAM-tight cards.
+    if is_moe(p):
+        num_experts = expert_count(p)
+        if num_experts is not None:
+            n_cpu = _suggest_moe_offload(
+                vram_mb=gpu.vram_mb or 8192,
+                model_file_mb=p.stat().st_size // (1024 * 1024),
+                num_experts=num_experts,
+            )
+            if n_cpu:
+                recipe_dict["n_cpu_moe"] = n_cpu
+                log.info(
+                    "model %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
+                    name, num_experts, n_cpu,
+                )
+        else:
+            log.debug(
+                "model %s looks like MoE but expert count could not be read; "
+                "manual --n-cpu-moe tuning may help",
+                name,
+            )
     if recipe_overrides:
         recipe_dict.update(recipe_overrides)
     mc = ModelConfig(
@@ -296,8 +337,9 @@ def register_discovered(
     gpu = cfg.find_gpu(gpu_pci_slot)
     if gpu is None:
         raise ValueError(f"Unknown GPU: {gpu_pci_slot}")
-    from arc_llama.arch import Arch
+    from arc_llama.arch import Arch, Backend
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     existing_paths = {Path(m.path).resolve() for m in cfg.models}
     used_names = {m.name for m in cfg.models}
     used_ports = {m.port for m in cfg.models}
@@ -317,6 +359,7 @@ def register_discovered(
             vram_mb=gpu.vram_mb or 8192,
             model_file_mb=rp.stat().st_size // (1024 * 1024),
             kv_class=kv_class,
+            backend=backend,
         )
         recipe_dict: dict[str, Any] = {
             "n_gpu_layers": recipe.n_gpu_layers,
@@ -328,11 +371,31 @@ def register_discovered(
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
         if has_mtp_heads(rp):
             recipe_dict["spec_type"] = "draft-mtp"
-            recipe_dict["ubatch_size"] = 8
             log.info(
-                "discovered %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
+                "discovered %s has MTP heads; auto-enabling spec_type=draft-mtp",
                 rp.name,
             )
+        # Suggest MoE expert offload on VRAM-tight cards.
+        if is_moe(rp):
+            num_experts = expert_count(rp)
+            if num_experts is not None:
+                n_cpu = _suggest_moe_offload(
+                    vram_mb=gpu.vram_mb or 8192,
+                    model_file_mb=rp.stat().st_size // (1024 * 1024),
+                    num_experts=num_experts,
+                )
+                if n_cpu:
+                    recipe_dict["n_cpu_moe"] = n_cpu
+                    log.info(
+                        "discovered %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
+                        rp.name, num_experts, n_cpu,
+                    )
+            else:
+                log.debug(
+                    "discovered %s looks like MoE but expert count could not be read; "
+                    "manual --n-cpu-moe tuning may help",
+                    rp.name,
+                )
         name = short_name_from_path(rp, used_names)
         used_names.add(name)
         port = port_start

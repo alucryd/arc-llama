@@ -36,6 +36,12 @@ class ArchProfile:
     """Human-readable notes shown in `arc-llama doctor`."""
     safe_kv_q8: bool = True
     """Whether q8_0 K/V cache produces correct generation on this arch."""
+    safe_kv_q8_vulkan: bool = False
+    """Whether q8_0 K/V cache is safe on the Vulkan backend for this arch.
+
+    Vulkan requires --flash-attn for quantized V-cache. Until that
+    combination is explicitly tested, default to False for every profile.
+    """
     prefer_uniform_quants: bool = True
     """If true, recommend Q4_K_M over Unsloth Dynamic XL/UD variants."""
 

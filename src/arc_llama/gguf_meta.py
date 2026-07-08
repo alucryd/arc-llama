@@ -53,6 +53,18 @@ def read_gguf_meta(path: Path | str) -> dict[str, Any]:
                 meta["block_count"] = int(n_layer_field.contents())
             except (TypeError, ValueError):
                 pass
+        # Expert count is the definitive MoE signal (some architectures,
+        # e.g. gemma4, use the same arch string for dense and MoE variants,
+        # so this field -- not the arch name -- is what actually tells them
+        # apart).
+        expert_count_field = reader.get_field(
+            gguf.Keys.LLM.EXPERT_COUNT.format(arch=arch)
+        )
+        if expert_count_field is not None:
+            try:
+                meta["expert_count"] = int(expert_count_field.contents())
+            except (TypeError, ValueError):
+                pass
 
     return meta
 
@@ -93,6 +105,81 @@ def is_hybrid_ssm(path: Path | str) -> bool:
     # qwen35 and qwen35moe (with or without the _mtp suffix) are the
     # known hybrid SSM+attention families today.
     return arch.startswith("qwen35")
+
+
+# ---------------------------------------------------------------------------
+# MoE detection
+# ---------------------------------------------------------------------------
+
+# Architecture strings that unambiguously indicate a Mixture-of-Experts model.
+# Keep this conservative: only add prefixes once they're confirmed by real
+# GGUF metadata.
+_MOE_ARCH_PREFIXES: tuple[str, ...] = (
+    "qwen2moe",
+    "qwen3moe",
+    "qwen35moe",
+    "qwen36moe",
+    "llama4",
+    "mixtral",
+    "deepseek2",
+    "deepseek3",
+    "glm4",
+)
+# Deliberately excludes "gemma4": dense and MoE Gemma-4 GGUFs share the same
+# architecture string, so prefix matching would false-positive on dense
+# models. is_moe() falls back to the expert_count metadata field for these.
+
+# GGUF keys that may hold the total number of experts per MoE layer. Different
+# converter paths use different names, so we try the common ones in order.
+_EXPERT_COUNT_KEYS: tuple[str, ...] = (
+    "expert_count",
+    "num_experts",
+    "moe_expert_count",
+    "n_experts",
+    "moe_num_experts",
+)
+
+
+def is_moe(path: Path | str) -> bool:
+    """Return True if the GGUF at *path* is a MoE architecture.
+
+    Detection is based on the architecture string from GGUF metadata. This
+    is a heuristic; it will miss MoE variants whose metadata uses a generic
+    architecture name until they're added to ``_MOE_ARCH_PREFIXES``.
+    """
+    meta = read_gguf_meta(path)
+    arch = meta.get("architecture", "").lower()
+    if not arch:
+        return False
+    if any(arch.startswith(prefix) for prefix in _MOE_ARCH_PREFIXES):
+        return True
+    # Some converters label generic architectures with an explicit MoE key.
+    return any(
+        meta.get(key) is not None for key in _EXPERT_COUNT_KEYS
+    )
+
+
+def expert_count(path: Path | str) -> int | None:
+    """Return the total number of experts per MoE layer, if known."""
+    meta = read_gguf_meta(path)
+    arch = meta.get("architecture", "")
+    # Try architecture-specific keys first, then generic ones.
+    keys: list[str] = []
+    if arch:
+        keys.extend(f"{arch}.{key}" for key in _EXPERT_COUNT_KEYS)
+    keys.extend(_EXPERT_COUNT_KEYS)
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str):
+            try:
+                n = int(value)
+                if n > 0:
+                    return n
+            except ValueError:
+                pass
+    return None
 
 
 # ---------------------------------------------------------------------------

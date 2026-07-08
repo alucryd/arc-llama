@@ -1,6 +1,8 @@
 """Tests for arc_llama.recipes — VRAM math, recipe generation, KV sizing."""
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from arc_llama.arch import Arch
 from arc_llama.recipes import (
     DEFAULT_CTX_CAP,
@@ -141,6 +143,38 @@ class TestDefaultRecipe:
         )
         assert moe.ctx > dense.ctx
 
+    def test_vulkan_defaults_to_f16_kv(self):
+        from arc_llama.arch import Backend
+
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            backend=Backend.VULKAN,
+        )
+        assert r.cache_type_k == KVCacheType.F16
+        assert r.cache_type_v == KVCacheType.F16
+
+    def test_vulkan_can_opt_into_q8_with_profile_flag(self):
+        from arc_llama.arch import ArchProfile, Backend
+
+        profile = ArchProfile(
+            arch=Arch.BATTLEMAGE,
+            display_name="Test",
+            sycl_env={},
+            safe_kv_q8=True,
+            safe_kv_q8_vulkan=True,
+        )
+        with patch("arc_llama.recipes.profile_for", return_value=profile):
+            r = default_recipe(
+                Arch.BATTLEMAGE,
+                vram_mb=24 * 1024,
+                model_file_mb=4 * 1024,
+                backend=Backend.VULKAN,
+            )
+        assert r.cache_type_k == KVCacheType.Q8_0
+        assert r.cache_type_v == KVCacheType.Q8_0
+
 
 class TestLaunchRecipeArgv:
     def test_all_fields_present(self):
@@ -190,3 +224,14 @@ class TestLaunchRecipeArgv:
         assert argv[argv.index("--spec-type") + 1] == "draft-mtp"
         assert "-ub" in argv
         assert argv[argv.index("-ub") + 1] == "8"
+
+    def test_n_cpu_moe_emitted_when_set(self):
+        r = LaunchRecipe(n_cpu_moe=4)
+        argv = r.to_argv()
+        assert "--n-cpu-moe" in argv
+        assert argv[argv.index("--n-cpu-moe") + 1] == "4"
+
+    def test_n_cpu_moe_omitted_when_none(self):
+        r = LaunchRecipe()
+        argv = r.to_argv()
+        assert "--n-cpu-moe" not in argv

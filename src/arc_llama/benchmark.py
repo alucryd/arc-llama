@@ -254,7 +254,8 @@ async def benchmark_model(
     vram_total = _read_vram_total(card_path) if card_path else None
     result.vram_total_mb = vram_total
 
-    async with httpx.AsyncClient(base_url=server_url, timeout=300.0) as client:
+    headers = {"Authorization": f"Bearer {cfg.server.admin_token}"} if cfg.server.admin_token else {}
+    async with httpx.AsyncClient(base_url=server_url, timeout=300.0, headers=headers) as client:
         # Ensure model is loaded
         if load:
             log.info("loading %s ...", model_name)
@@ -322,7 +323,8 @@ async def benchmark_sweep(
     original_recipe = dict(model.recipe or {})
     results: list[BenchmarkResult] = []
 
-    async with httpx.AsyncClient(base_url=server_url, timeout=300.0) as client:
+    headers = {"Authorization": f"Bearer {cfg.server.admin_token}"} if cfg.server.admin_token else {}
+    async with httpx.AsyncClient(base_url=server_url, timeout=300.0, headers=headers) as client:
         for ctx in ctx_values:
             for kv in kv_types:
                 # Apply config

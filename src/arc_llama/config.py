@@ -215,6 +215,7 @@ class ModelConfig:
             top_k=r.get("top_k"),
             spec_type=r.get("spec_type"),
             ubatch_size=r.get("ubatch_size"),
+            n_cpu_moe=r.get("n_cpu_moe"),
             extra_flags=list(r.get("extra_flags", [])),
         )
 

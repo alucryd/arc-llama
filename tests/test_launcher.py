@@ -10,6 +10,7 @@ import pytest
 from arc_llama.arch import Arch, Backend
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.launcher import LlamaServer, build_env, build_plan
+from arc_llama.recipes import KVCacheType
 
 
 def _gpu(sycl_index: int = 0, backend: Backend = Backend.SYCL) -> GPUConfig:
@@ -109,6 +110,47 @@ class TestBuildPlan:
         plan = build_plan(cfg, model, gpu)
         assert "-ub" not in plan.argv
 
+    def test_vulkan_q8_without_flash_attn_warns(self, caplog: pytest.LogCaptureFixture):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            build_plan(cfg, model, gpu)
+        assert "Vulkan backend with cache_type_v=q8_0 needs --flash-attn" in caplog.text
+
+    def test_vulkan_q8_with_flash_attn_no_warning(self, caplog: pytest.LogCaptureFixture):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+                "extra_flags": ["--flash-attn"],
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            build_plan(cfg, model, gpu)
+        assert "needs --flash-attn" not in caplog.text
+
 
 # Real GGUF fixtures for MTP integration tests.
 _MTP_QWEN = Path("/mnt/storage/models/qwen3.6-27b/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf")
@@ -120,7 +162,8 @@ def _have_mtp_fixture() -> bool:
 
 class TestBuildPlanMtp:
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
-    def test_auto_injects_ub_8_for_mtp(self):
+    def test_no_auto_ub_for_mtp(self):
+        """MTP detection must not force -ub 8; it regresses prompt-eval throughput."""
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="mtp-qwen",
@@ -130,9 +173,7 @@ class TestBuildPlanMtp:
         )
         gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
         plan = build_plan(cfg, model, gpu)
-        assert "-ub" in plan.argv
-        idx = plan.argv.index("-ub")
-        assert plan.argv[idx + 1] == "8"
+        assert "-ub" not in plan.argv
 
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
     def test_user_ubatch_size_not_overridden(self):
@@ -151,8 +192,8 @@ class TestBuildPlanMtp:
         assert plan.argv[idx + 1] == "16"
 
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
-    def test_mtp_on_lunar_lake_also_gets_ub_8(self):
-        """Xe2 iGPU (Lunar Lake) is the same generation as Battlemage — same fix."""
+    def test_no_auto_ub_for_mtp_on_lunar_lake(self):
+        """Xe2 iGPU (Lunar Lake) should also avoid the forced micro-ubatch."""
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="mtp-qwen",
@@ -162,9 +203,7 @@ class TestBuildPlanMtp:
         )
         gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="lunar_lake")
         plan = build_plan(cfg, model, gpu)
-        assert "-ub" in plan.argv
-        idx = plan.argv.index("-ub")
-        assert plan.argv[idx + 1] == "8"
+        assert "-ub" not in plan.argv
 
 
 class TestLlamaServerLifecycle:

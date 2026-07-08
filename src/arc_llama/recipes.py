@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from arc_llama.arch import Arch, ArchProfile, profile_for
+from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
 
 
 class KVCacheType(str, Enum):
@@ -55,7 +55,9 @@ class LaunchRecipe:
     spec_type: str | None = None
     """Speculative decoding type, e.g. 'draft-mtp'."""
     ubatch_size: int | None = None
-    """Ubatch size (-ub). Auto-set to 8 for MTP models to avoid SSM compute-buffer OOM."""
+    """Ubatch size (-ub). Leave unset to let llama.cpp pick the default."""
+    n_cpu_moe: int | None = None
+    """Number of MoE experts per layer to keep on CPU (--n-cpu-moe)."""
     extra_flags: list[str] = field(default_factory=list)
     """Anything else the user wants appended to the command line verbatim."""
 
@@ -79,6 +81,8 @@ class LaunchRecipe:
             argv += ["--spec-type", self.spec_type]
         if self.ubatch_size is not None:
             argv += ["-ub", str(self.ubatch_size)]
+        if self.n_cpu_moe is not None:
+            argv += ["--n-cpu-moe", str(self.n_cpu_moe)]
         argv += list(self.extra_flags)
         return argv
 
@@ -145,10 +149,18 @@ def default_recipe(
     model_file_mb: int,
     kv_class: str = "default",
     prefer_q8_kv: bool = True,
+    backend: Backend = Backend.SYCL,
 ) -> LaunchRecipe:
-    """A safe starting recipe for a freshly added model on a given arch."""
+    """A safe starting recipe for a freshly added model on a given arch/backend."""
     profile: ArchProfile = profile_for(arch)
-    kv_type = KVCacheType.Q8_0 if (prefer_q8_kv and profile.safe_kv_q8) else KVCacheType.F16
+    if backend == Backend.VULKAN:
+        # Quantized V-cache on Vulkan currently requires --flash-attn, which
+        # arc-llama does not emit. Stay conservative (f16) unless the profile
+        # explicitly opts in after a real launch test.
+        use_q8 = prefer_q8_kv and profile.safe_kv_q8_vulkan
+    else:
+        use_q8 = prefer_q8_kv and profile.safe_kv_q8
+    kv_type = KVCacheType.Q8_0 if use_q8 else KVCacheType.F16
     ctx = suggest_ctx(
         vram_mb=vram_mb,
         model_file_mb=model_file_mb,
