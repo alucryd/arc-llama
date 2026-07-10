@@ -21,7 +21,7 @@ from arc_llama.config import (
     ModelConfig,
 )
 from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe
-from arc_llama.recipes import default_recipe
+from arc_llama.recipes import default_recipe, recipe_to_dict
 
 log = logging.getLogger("arc_llama.models")
 
@@ -142,15 +142,7 @@ def add_local_model(
         kv_class=kv_class,
         backend=backend,
     )
-    recipe_dict: dict[str, Any] = {
-        "n_gpu_layers": recipe.n_gpu_layers,
-        "ctx": recipe.ctx,
-        "parallel": recipe.parallel,
-        "cache_type_k": recipe.cache_type_k.value,
-        "cache_type_v": recipe.cache_type_v.value,
-    }
-    if recipe.extra_flags:
-        recipe_dict["extra_flags"] = list(recipe.extra_flags)
+    recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
     # Auto-enable draft-mtp for models that actually carry MTP heads.
     # Measured B60/Qwen3.6-27B-MTP: draft-mtp n_max 1–4 ≈ +20% gen vs none;
     # n_max 5–6 regresses. Pin n_max=3 (llama default / mid of the good band).
@@ -367,15 +359,7 @@ def register_discovered(
             kv_class=kv_class,
             backend=backend,
         )
-        recipe_dict: dict[str, Any] = {
-            "n_gpu_layers": recipe.n_gpu_layers,
-            "ctx": recipe.ctx,
-            "parallel": recipe.parallel,
-            "cache_type_k": recipe.cache_type_k.value,
-            "cache_type_v": recipe.cache_type_v.value,
-        }
-        if recipe.extra_flags:
-            recipe_dict["extra_flags"] = list(recipe.extra_flags)
+        recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
         # n_max=3 pinned from B60 measurements (see bench_results/SUMMARY.md).
         if has_mtp_heads(rp):

@@ -218,6 +218,10 @@ class ModelConfig:
                 int(r["spec_draft_n_max"]) if r.get("spec_draft_n_max") is not None else None
             ),
             ubatch_size=r.get("ubatch_size"),
+            batch_size=r.get("batch_size"),
+            flash_attn=r.get("flash_attn"),
+            no_mmap=bool(r.get("no_mmap", False)),
+            mlock=bool(r.get("mlock", False)),
             n_cpu_moe=r.get("n_cpu_moe"),
             extra_flags=list(r.get("extra_flags", [])),
         )

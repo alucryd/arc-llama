@@ -94,12 +94,14 @@ def _drm_nodes(sysfs: Path) -> tuple[str | None, str | None]:
 
 
 def _vram_mib(sysfs: Path) -> int | None:
-    """Pull VRAM size from xe driver sysfs. i915 doesn't expose this consistently."""
-    # xe driver:  device/mem_info_vram_total (bytes, integer)
+    """Pull VRAM size from xe / i915 / amdgpu sysfs layouts."""
     candidates = [
-        sysfs / "mem_info_vram_total",
+        sysfs / "mem_info_vram_total",                       # amdgpu / some xe
         sysfs / "device" / "mem_info_vram_total",
-        sysfs / "tile0" / "physical_vram_size_bytes",
+        sysfs / "tile0" / "physical_vram_size_bytes",        # xe (Battlemage)
+        sysfs / "device" / "tile0" / "physical_vram_size_bytes",
+        sysfs / "lmem_total_bytes",                          # i915 dGPU
+        sysfs / "device" / "lmem_total_bytes",
     ]
     for c in candidates:
         v = _read_int(c)
