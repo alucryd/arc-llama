@@ -26,8 +26,8 @@ import httpx
 
 from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
 from arc_llama.config import Config, GPUConfig, ModelConfig
-from arc_llama.gguf_meta import has_mtp_heads, is_hybrid_ssm
-from arc_llama.recipes import KVCacheType
+from arc_llama.gguf_meta import has_mtp_heads
+from arc_llama.policy import apply_launch_policy
 
 log = logging.getLogger("arc_llama.launcher")
 
@@ -171,12 +171,12 @@ def build_plan(
 ) -> LaunchPlan:
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     profile = profile_for(arch)
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     env = build_env(profile, gpu)
     recipe = model.launch_recipe()
 
     # --- MTP head detection & safety wiring ---
     mtp_present = has_mtp_heads(model.path)
-    hybrid_ssm = is_hybrid_ssm(model.path)
 
     # 1. We no longer force -ub 8 for MTP models. Empirically it destroys
     #    prompt-eval throughput (~9.5x slower) and upstream's auto-fit handles
@@ -192,31 +192,16 @@ def build_plan(
             model.name,
         )
 
-    # 3. Backend recommendation for hybrid SSM + MTP on Xe2 (Battlemage,
-    #    Lunar Lake). GDN sequential state passes make SYCL MTP net-negative.
-    if mtp_present and hybrid_ssm and arch in (Arch.BATTLEMAGE, Arch.LUNAR_LAKE):
-        log.info(
-            "[%s] Hybrid SSM+attention model with MTP heads on Xe2 (%s): "
-            "SYCL MTP speculative decoding is net-negative here because GDN "
-            "layers force serial state passes. Consider a Vulkan backend "
-            "build for ~+9%% throughput with --spec-type draft-mtp.",
-            model.name,
-            arch.value,
-        )
-
-    # 4. Vulkan + quantized V-cache requires --flash-attn. If a pre-existing
-    #    recipe has q8_0 V-cache on Vulkan without that flag, warn rather than
-    #    silently fail or ignore the quant setting.
-    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
-    has_flash_attn = "--flash-attn" in recipe.extra_flags
-    if backend == Backend.VULKAN and recipe.cache_type_v == KVCacheType.Q8_0 and not has_flash_attn:
-        log.warning(
-            "[%s] Vulkan backend with cache_type_v=q8_0 needs --flash-attn "
-            "to actually use quantized V-cache. Either add --flash-attn to "
-            "extra_flags or use f16 V-cache. Launch may error or silently "
-            "fall back to f16.",
-            model.name,
-        )
+    # 3. Launch policy: only verified adjustments (e.g. Vulkan q8 needs
+    #    --flash-attn). Do not strip draft-mtp or auto-switch backends based
+    #    on unbenchmarked arch heuristics.
+    recipe = apply_launch_policy(
+        recipe,
+        arch=arch,
+        backend=backend,
+        model_path=model.path,
+        model_name=model.name,
+    )
 
     argv: list[str] = [
         cfg.paths.llama_server,

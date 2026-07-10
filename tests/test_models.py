@@ -444,6 +444,7 @@ def test_add_local_model_auto_mtp_heads(tmp_path):
         )
 
     assert mc.recipe["spec_type"] == "draft-mtp"
+    assert mc.recipe["spec_draft_n_max"] == 3
     assert "ubatch_size" not in mc.recipe
 
 
@@ -713,6 +714,7 @@ def test_register_discovered_auto_mtp(tmp_path):
 
     assert len(added) == 1
     assert added[0].recipe["spec_type"] == "draft-mtp"
+    assert added[0].recipe["spec_draft_n_max"] == 3
     assert "ubatch_size" not in added[0].recipe
 
 

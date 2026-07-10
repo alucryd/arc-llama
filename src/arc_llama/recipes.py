@@ -54,6 +54,12 @@ class LaunchRecipe:
     top_k: int | None = None
     spec_type: str | None = None
     """Speculative decoding type, e.g. 'draft-mtp'."""
+    spec_draft_n_max: int | None = None
+    """Tokens to draft for speculative decoding (--spec-draft-n-max).
+
+    Measured on Arc Pro B60 / Qwen3.6-27B-MTP (2026-07): n_max 1–4 give
+    similar gen (~19–20 tok/s); n_max 5–6 regress gen to ~13–15. Prefer ≤4.
+    """
     ubatch_size: int | None = None
     """Ubatch size (-ub). Leave unset to let llama.cpp pick the default."""
     n_cpu_moe: int | None = None
@@ -79,6 +85,8 @@ class LaunchRecipe:
             argv += ["--top-k", str(self.top_k)]
         if self.spec_type:
             argv += ["--spec-type", self.spec_type]
+        if self.spec_draft_n_max is not None:
+            argv += ["--spec-draft-n-max", str(self.spec_draft_n_max)]
         if self.ubatch_size is not None:
             argv += ["-ub", str(self.ubatch_size)]
         if self.n_cpu_moe is not None:
@@ -143,6 +151,22 @@ def suggest_ctx(
     return max(4096, min(rounded, ctx_cap))
 
 
+PERF_UBATCH_MIN_VRAM_MB = 16384
+"""Only default to a large ubatch on cards with real VRAM headroom — the
+compute buffer grows roughly linearly with ubatch, and on 8–12 GB cards a
+previously-fitting model could stop fitting."""
+
+PERF_UBATCH = 1024
+"""Prompt processing on Arc is very sensitive to ubatch. Measured on Arc Pro
+B60 / Qwen3.6-27B-MTP (2026-07): raising -ub 512→1024 lifts prompt-eval from
+~340 to ~420 tok/s (~23%, all runs non-overlapping) with no gen regression.
+See bench_results/SUMMARY.md."""
+
+PERF_COMPUTE_BUFFER_MB = 1536
+"""Compute-buffer estimate used for ctx sizing when the perf ubatch applies
+(vs. the conservative 768 MiB default at llama.cpp's stock ubatch of 512)."""
+
+
 def default_recipe(
     arch: Arch,
     vram_mb: int,
@@ -153,19 +177,26 @@ def default_recipe(
 ) -> LaunchRecipe:
     """A safe starting recipe for a freshly added model on a given arch/backend."""
     profile: ArchProfile = profile_for(arch)
+    extra_flags: list[str] = []
     if backend == Backend.VULKAN:
-        # Quantized V-cache on Vulkan currently requires --flash-attn, which
-        # arc-llama does not emit. Stay conservative (f16) unless the profile
-        # explicitly opts in after a real launch test.
+        # Vulkan quantized V-cache needs --flash-attn (llama.cpp requirement).
+        # SYCL production configs run fine with q8 V and no FA flag — do not
+        # inject it there (verified on B60 production stack).
         use_q8 = prefer_q8_kv and profile.safe_kv_q8_vulkan
+        if use_q8:
+            extra_flags.extend(["--flash-attn", "on"])
     else:
         use_q8 = prefer_q8_kv and profile.safe_kv_q8
     kv_type = KVCacheType.Q8_0 if use_q8 else KVCacheType.F16
+    # Bump ubatch above llama.cpp's stock 512 when the card can absorb the
+    # bigger compute buffer; budget the larger buffer into the ctx suggestion.
+    perf_batching = vram_mb >= PERF_UBATCH_MIN_VRAM_MB
     ctx = suggest_ctx(
         vram_mb=vram_mb,
         model_file_mb=model_file_mb,
         kv_type=kv_type,
         kv_class=kv_class,
+        compute_buffer_mb=PERF_COMPUTE_BUFFER_MB if perf_batching else 768,
     )
     return LaunchRecipe(
         n_gpu_layers=999,
@@ -173,4 +204,6 @@ def default_recipe(
         parallel=1,
         cache_type_k=kv_type,
         cache_type_v=kv_type,
+        ubatch_size=PERF_UBATCH if perf_batching else None,
+        extra_flags=extra_flags,
     )

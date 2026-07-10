@@ -39,8 +39,9 @@ class ArchProfile:
     safe_kv_q8_vulkan: bool = False
     """Whether q8_0 K/V cache is safe on the Vulkan backend for this arch.
 
-    Vulkan requires --flash-attn for quantized V-cache. Until that
-    combination is explicitly tested, default to False for every profile.
+    Vulkan requires --flash-attn for quantized V-cache. Profiles that set
+    this True must also emit ``--flash-attn`` (default_recipe / launch policy
+    do that automatically).
     """
     prefer_uniform_quants: bool = True
     """If true, recommend Q4_K_M over Unsloth Dynamic XL/UD variants."""
@@ -134,6 +135,8 @@ ALCHEMIST_PROFILE = ArchProfile(
         "Enable `intel-compute-runtime` and `intel-level-zero-gpu` packages.",
     ],
     safe_kv_q8=True,
+    # With auto --flash-attn (recipes + policy), q8 KV is the competitive default.
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 
@@ -165,8 +168,11 @@ BATTLEMAGE_PROFILE = ArchProfile(
         "First inference per cold start pays ~20s of SYCL JIT compile.",
         "q8_0 K/V cache works correctly but on some builds underutilises memory "
         "bandwidth on dense models. Verify perf if you care; correctness is OK.",
+        "Compare SYCL vs Vulkan and draft-mtp with `arc-llama benchmark` — "
+        "relative wins depend on model class and llama-server build.",
     ],
     safe_kv_q8=True,
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 
@@ -188,6 +194,7 @@ LUNAR_LAKE_PROFILE = ArchProfile(
         "Prefer smaller models (≤7B Q4_K_M) for usable speeds.",
     ],
     safe_kv_q8=True,
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 

@@ -110,7 +110,8 @@ class TestBuildPlan:
         plan = build_plan(cfg, model, gpu)
         assert "-ub" not in plan.argv
 
-    def test_vulkan_q8_without_flash_attn_warns(self, caplog: pytest.LogCaptureFixture):
+    def test_sycl_q8_does_not_inject_flash_attn(self):
+        # Matches production: q8 V, no --flash-attn, SYCL serves fine.
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="m",
@@ -123,14 +124,13 @@ class TestBuildPlan:
             },
         )
         gpu = GPUConfig(
-            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.SYCL.value
         )
-        import logging
-        with caplog.at_level(logging.WARNING):
-            build_plan(cfg, model, gpu)
-        assert "Vulkan backend with cache_type_v=q8_0 needs --flash-attn" in caplog.text
+        plan = build_plan(cfg, model, gpu)
+        assert "--flash-attn" not in plan.argv
+        assert "-fa" not in plan.argv
 
-    def test_vulkan_q8_with_flash_attn_no_warning(self, caplog: pytest.LogCaptureFixture):
+    def test_vulkan_q8_auto_injects_flash_attn(self):
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="m",
@@ -140,16 +140,33 @@ class TestBuildPlan:
             recipe={
                 "cache_type_k": KVCacheType.Q8_0.value,
                 "cache_type_v": KVCacheType.Q8_0.value,
-                "extra_flags": ["--flash-attn"],
             },
         )
         gpu = GPUConfig(
             pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
         )
-        import logging
-        with caplog.at_level(logging.WARNING):
-            build_plan(cfg, model, gpu)
-        assert "needs --flash-attn" not in caplog.text
+        plan = build_plan(cfg, model, gpu)
+        assert "--flash-attn" in plan.argv
+        assert plan.env.get("GGML_VK_VISIBLE_DEVICES") == "0"
+
+    def test_vulkan_q8_with_flash_attn_already_set(self):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+                "extra_flags": ["--flash-attn", "on"],
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+        )
+        plan = build_plan(cfg, model, gpu)
+        assert plan.argv.count("--flash-attn") == 1
 
 
 # Real GGUF fixtures for MTP integration tests.

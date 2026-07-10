@@ -149,11 +149,17 @@ def add_local_model(
         "cache_type_k": recipe.cache_type_k.value,
         "cache_type_v": recipe.cache_type_v.value,
     }
+    if recipe.extra_flags:
+        recipe_dict["extra_flags"] = list(recipe.extra_flags)
     # Auto-enable draft-mtp for models that actually carry MTP heads.
+    # Measured B60/Qwen3.6-27B-MTP: draft-mtp n_max 1–4 ≈ +20% gen vs none;
+    # n_max 5–6 regresses. Pin n_max=3 (llama default / mid of the good band).
     if has_mtp_heads(p):
         recipe_dict["spec_type"] = "draft-mtp"
+        recipe_dict["spec_draft_n_max"] = 3
         log.info(
-            "model %s has MTP heads; auto-enabling spec_type=draft-mtp",
+            "model %s has MTP heads; auto-enabling spec_type=draft-mtp "
+            "spec_draft_n_max=3 (B60 measured band 1–4)",
             name,
         )
     # Suggest MoE expert offload on VRAM-tight cards.
@@ -368,11 +374,15 @@ def register_discovered(
             "cache_type_k": recipe.cache_type_k.value,
             "cache_type_v": recipe.cache_type_v.value,
         }
+        if recipe.extra_flags:
+            recipe_dict["extra_flags"] = list(recipe.extra_flags)
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
+        # n_max=3 pinned from B60 measurements (see bench_results/SUMMARY.md).
         if has_mtp_heads(rp):
             recipe_dict["spec_type"] = "draft-mtp"
+            recipe_dict["spec_draft_n_max"] = 3
             log.info(
-                "discovered %s has MTP heads; auto-enabling spec_type=draft-mtp",
+                "discovered %s has MTP heads; auto-enabling draft-mtp n_max=3",
                 rp.name,
             )
         # Suggest MoE expert offload on VRAM-tight cards.

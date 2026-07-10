@@ -143,7 +143,21 @@ class TestDefaultRecipe:
         )
         assert moe.ctx > dense.ctx
 
-    def test_vulkan_defaults_to_f16_kv(self):
+    def test_sycl_q8_does_not_force_flash_attn(self):
+        from arc_llama.arch import Backend
+
+        # Production SYCL: q8 V without --flash-attn is fine.
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            backend=Backend.SYCL,
+        )
+        assert r.cache_type_k == KVCacheType.Q8_0
+        assert r.cache_type_v == KVCacheType.Q8_0
+        assert "--flash-attn" not in r.extra_flags
+
+    def test_vulkan_q8_includes_flash_attn_on(self):
         from arc_llama.arch import Backend
 
         r = default_recipe(
@@ -152,10 +166,31 @@ class TestDefaultRecipe:
             model_file_mb=4 * 1024,
             backend=Backend.VULKAN,
         )
-        assert r.cache_type_k == KVCacheType.F16
-        assert r.cache_type_v == KVCacheType.F16
+        assert r.cache_type_k == KVCacheType.Q8_0
+        assert r.cache_type_v == KVCacheType.Q8_0
+        assert "--flash-attn" in r.extra_flags
+        assert "on" in r.extra_flags
 
-    def test_vulkan_can_opt_into_q8_with_profile_flag(self):
+    def test_big_card_bumps_ubatch(self):
+        # >=16 GB VRAM: default up from llama.cpp's stock 512 for prompt speed.
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert r.ubatch_size == 1024
+
+    def test_small_card_keeps_default_ubatch(self):
+        # 8 GB card: leave ubatch unset so a fitting model doesn't OOM on the
+        # bigger compute buffer.
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=8 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert r.ubatch_size is None
+
+    def test_vulkan_f16_when_profile_disallows_q8(self):
         from arc_llama.arch import ArchProfile, Backend
 
         profile = ArchProfile(
@@ -163,7 +198,7 @@ class TestDefaultRecipe:
             display_name="Test",
             sycl_env={},
             safe_kv_q8=True,
-            safe_kv_q8_vulkan=True,
+            safe_kv_q8_vulkan=False,
         )
         with patch("arc_llama.recipes.profile_for", return_value=profile):
             r = default_recipe(
@@ -172,8 +207,9 @@ class TestDefaultRecipe:
                 model_file_mb=4 * 1024,
                 backend=Backend.VULKAN,
             )
-        assert r.cache_type_k == KVCacheType.Q8_0
-        assert r.cache_type_v == KVCacheType.Q8_0
+        assert r.cache_type_k == KVCacheType.F16
+        assert r.cache_type_v == KVCacheType.F16
+        assert "--flash-attn" not in r.extra_flags
 
 
 class TestLaunchRecipeArgv:

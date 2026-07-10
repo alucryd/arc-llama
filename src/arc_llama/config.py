@@ -214,6 +214,9 @@ class ModelConfig:
             top_p=r.get("top_p"),
             top_k=r.get("top_k"),
             spec_type=r.get("spec_type"),
+            spec_draft_n_max=(
+                int(r["spec_draft_n_max"]) if r.get("spec_draft_n_max") is not None else None
+            ),
             ubatch_size=r.get("ubatch_size"),
             n_cpu_moe=r.get("n_cpu_moe"),
             extra_flags=list(r.get("extra_flags", [])),
