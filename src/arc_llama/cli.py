@@ -46,7 +46,7 @@ from arc_llama.agent.checkpoints import CheckpointStore
 from arc_llama.agent.interactive import InteractiveAgent
 from arc_llama.agent.mcp_client import MCPClientManager
 from arc_llama.agent_tui import run_agent_tui
-from arc_llama.arch import Arch, Backend
+from arc_llama.arch import Arch, Backend, aot_arch_for
 from arc_llama.binary import detect_backends, detect_llama_server_backend
 from arc_llama.chat_store import ChatMessage, ChatStore
 from arc_llama.config import (
@@ -358,6 +358,19 @@ def doctor(ctx: click.Context) -> None:
                         severity="warn",
                         hint="Kernel 6.14+ recommended for stable xe on Battlemage.",
                     )
+            # AOT build guidance — eliminates the ~20s SYCL JIT cold start
+            # that every model swap pays on Battlemage (where the JIT cache is
+            # disabled to dodge a SIGSEGV). Compute the ocloc -device string
+            # from the user's actual detected device ID rather than a static
+            # hint, so an A770 owner sees `acm-g10` and a B580 owner sees
+            # `bmg-g21`.
+            aot = aot_arch_for(g.device_id)
+            if aot is not None:
+                console.print(
+                    f"        AOT:      [dim]build with "
+                    f"-DGGML_SYCL_DEVICE_ARCH={aot} "
+                    f"(ocloc -device {aot}) to skip the ~20s JIT cold start[/dim]"
+                )
         report.add("gpus", True, f"{len(gpus)} Intel GPU(s)")
     else:
         console.print("\n  [red]no Intel GPUs detected via sysfs[/red]")
@@ -890,6 +903,63 @@ def remove(ctx: click.Context, name: str) -> None:
 # serve
 # ===========================================================================
 
+def _print_serve_banner(cfg: Config) -> None:
+    """Print the applied Arc profile per GPU + model at serve startup.
+
+    Surfaces the gotchas arc-llama exists to encode — arch, backend, VRAM,
+    ReBAR status, and the JIT-vs-AOT cold-start situation — so the user can
+    see *why* their config is what it is without reading source comments.
+    """
+    console.print("[bold]arc-llama serve[/bold] — applied Arc profiles:")
+    # Re-detect so we can show live ReBAR + the exact device ID for AOT hints.
+    live: dict[str, object] = {}
+    if not _IS_WINDOWS:
+        try:
+            live = {g.pci_slot: g for g in detect_gpus(enrich=False)}
+        except Exception:
+            live = {}
+    for gpu in cfg.gpus:
+        if not gpu.enabled:
+            continue
+        backend = gpu.backend or Backend.SYCL.value
+        vram = f"{gpu.vram_mb} MB" if gpu.vram_mb else "VRAM unknown"
+        parts = [f"GPU {gpu.pci_slot}: {gpu.arch} ({backend}) · {vram}"]
+        det = live.get(gpu.pci_slot)
+        if det is not None and getattr(det, "sysfs_path", ""):
+            r = rebar_likely_enabled(det.sysfs_path, det.vram_mb)
+            parts.append("ReBAR on" if r else ("ReBAR OFF" if r is False else "ReBAR ?"))
+        if backend == Backend.SYCL.value:
+            aot = aot_arch_for(det.device_id) if det is not None else None
+            if aot is None:
+                # Fall back to a generation-level default from the configured
+                # arch when the live PCI slot doesn't match (e.g. stale config
+                # or running somewhere sysfs isn't available).
+                try:
+                    a = Arch(gpu.arch) if gpu.arch else None
+                except ValueError:
+                    a = None
+                if a == Arch.BATTLEMAGE:
+                    aot = "bmg-g21"
+                elif a == Arch.ALCHEMIST:
+                    aot = "acm-g10"
+            if aot is not None:
+                parts.append(
+                    f"JIT cold-start ~20s (AOT: -DGGML_SYCL_DEVICE_ARCH={aot})"
+                )
+            else:
+                parts.append("JIT cold-start")
+        console.print("  " + " · ".join(parts))
+    for m in cfg.models:
+        r = m.recipe or {}
+        ctx = r.get("ctx", "?")
+        kv_k = r.get("cache_type_k", "f16")
+        kv_v = r.get("cache_type_v", "f16")
+        kv_txt = kv_k if kv_k == kv_v else f"{kv_k}/{kv_v}"
+        console.print(f"  model {m.name}: ctx={ctx} · KV {kv_txt} · port {m.port}")
+    if not cfg.models:
+        console.print("  [dim]no models registered — `arc-llama add` something first[/dim]")
+
+
 @cli.command("serve")
 @click.option("--host", default=None, help="Override server host.")
 @click.option("--port", type=int, default=None, help="Override server port.")
@@ -938,6 +1008,7 @@ def serve(
         f"[dim]Admin token: {cfg.server.admin_token} "
         "(required for admin endpoints and auto_confirm agent runs)[/dim]"
     )
+    _print_serve_banner(cfg)
     try:
         import uvicorn
     except ImportError:

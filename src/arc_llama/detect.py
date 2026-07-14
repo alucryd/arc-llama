@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from arc_llama.arch import Arch, arch_for_device_id
+from arc_llama.arch import Arch, arch_for_device_id, known_vram_mib
 
 INTEL_VENDOR_ID = 0x8086
 PCI_CLASS_VGA = 0x030000      # 0x03_00_00 — VGA-compatible controller
@@ -130,6 +130,15 @@ def _scan_pci() -> list[DetectedGPU]:
         driver = _driver_name(slot_dir)
         card, render = _drm_nodes(slot_dir)
         vram = _vram_mib(slot_dir)
+        vram_from_table = False
+        if vram is None:
+            # Driver didn't expose VRAM via sysfs (common on older i915 and some
+            # early xe releases). Fall back to the known-size table keyed by
+            # PCI device ID so context sizing still works without clinfo.
+            known = known_vram_mib(device_id)
+            if known is not None:
+                vram = known
+                vram_from_table = True
         gpu = DetectedGPU(
             pci_slot=slot_dir.name,
             device_id=device_id,
@@ -141,6 +150,11 @@ def _scan_pci() -> list[DetectedGPU]:
             drm_render=render,
             sysfs_path=str(slot_dir),
         )
+        if vram_from_table:
+            gpu.notes.append(
+                f"VRAM {vram // 1024} GB from device-ID fallback table "
+                f"(driver exposed no mem_info_vram_total)."
+            )
         if driver is None:
             gpu.notes.append("No kernel driver bound — install `xe` or `i915` modules.")
         found.append(gpu)

@@ -104,8 +104,9 @@ curl http://127.0.0.1:11437/v1/chat/completions \
 
 ## Requirements
 
-- Linux, kernel **6.8+** for Battlemage (`xe` driver) or 5.17+ for Alchemist
-  (`i915`).
+- Linux, kernel **6.14+ recommended** for Battlemage (`xe` driver; 6.8 is the
+  minimum where `xe` exists, but 6.14+ is stable for BMG) or 5.17+ for
+  Alchemist (`i915`). This matches the threshold `arc-llama doctor` warns on.
 - ReBAR enabled in BIOS , without it llama.cpp falls back to slow paths on Arc.
 - A `llama-server` built with the SYCL backend. The Intel oneAPI Base Toolkit
   is the supported build path:

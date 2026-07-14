@@ -20,7 +20,7 @@ from arc_llama.config import (
     Config,
     ModelConfig,
 )
-from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe
+from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe, read_gguf_meta
 from arc_llama.recipes import default_recipe, recipe_to_dict
 
 log = logging.getLogger("arc_llama.models")
@@ -125,6 +125,14 @@ def add_local_model(
     gpu = cfg.find_gpu(gpu_pci_slot)
     if gpu is None:
         raise ValueError(f"GPU {gpu_pci_slot} not in config — run `arc-llama init` first.")
+    # Prefer GGUF metadata over the filename heuristic for kv_class unless the
+    # caller passed an explicit (non-default) hint. MoE models in particular
+    # (Gemma-4 A4B, Qwen3 A3B) share a filename family with dense variants.
+    if kv_class == "default":
+        inferred = infer_kv_class_from_path(p)
+        if inferred is not None:
+            kv_class = inferred
+            log.info("model %s: kv_class=%s from GGUF metadata", name, kv_class)
     used_ports = {m.port for m in cfg.models}
     port = port or _next_free_port(used_ports)
     if port in used_ports:
@@ -220,6 +228,47 @@ def infer_kv_class(filename: str) -> str:
         if pattern.search(filename):
             return kv_class
     return "default"
+
+
+def infer_kv_class_from_path(path: Path) -> str | None:
+    """Infer kv_class from GGUF metadata when available.
+
+    More reliable than the filename heuristic for families that share a name
+    across dense and MoE variants (e.g. Gemma-4, Qwen3): the architecture
+    string is identical, so ``expert_count`` metadata is what actually tells
+    dense and MoE apart. Returns None when metadata can't decide, so the
+    caller falls back to ``infer_kv_class`` (filename) or ``"default"``.
+    """
+    meta = read_gguf_meta(path)
+    if not meta:
+        return None
+    # MoE is the highest-value signal: dense and MoE variants of the same
+    # family share an architecture string, so expert_count distinguishes them.
+    if is_moe(path):
+        return "moe_a3b"
+    arch = str(meta.get("architecture", "")).lower()
+    if arch.startswith("gemma"):
+        return "gemma_swa"
+    if arch == "phi4" or arch.startswith("phi4"):
+        return "phi4"
+    return None
+
+
+def resolve_kv_class(path: Path, explicit: str = "default") -> str:
+    """Pick the kv_class for VRAM sizing.
+
+    Order of precedence:
+      1. an explicit, non-default override from the caller (CLI flag),
+      2. GGUF metadata (MoE / Gemma / Phi-4 — the cases the filename gets wrong),
+      3. the filename heuristic,
+      4. ``"default"``.
+    """
+    if explicit != "default":
+        return explicit
+    meta_kv = infer_kv_class_from_path(path)
+    if meta_kv is not None:
+        return meta_kv
+    return infer_kv_class(path.name)
 
 
 def short_name_from_path(path: Path, used: set[str]) -> str:
@@ -351,7 +400,7 @@ def register_discovered(
             continue
         if not rp.exists():
             continue
-        kv_class = infer_kv_class(rp.name)
+        kv_class = resolve_kv_class(rp)
         recipe = default_recipe(
             arch=arch,
             vram_mb=gpu.vram_mb or 8192,
