@@ -28,7 +28,6 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +55,13 @@ from arc_llama.config import (
     load_config,
 )
 from arc_llama.detect import detect_gpus, lspci_intel_gpus
+from arc_llama.models import (
+    add_local_model,
+    discover_ggufs,
+    download_from_hf,
+    parse_hf_spec,
+    register_discovered,
+)
 from arc_llama.platform_checks import (
     DoctorReport,
     format_bytes,
@@ -66,13 +72,6 @@ from arc_llama.platform_checks import (
     parse_kernel_version,
     rebar_likely_enabled,
     user_in_groups,
-)
-from arc_llama.models import (
-    add_local_model,
-    discover_ggufs,
-    download_from_hf,
-    parse_hf_spec,
-    register_discovered,
 )
 from arc_llama.skills import load_skills
 
