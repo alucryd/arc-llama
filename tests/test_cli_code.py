@@ -9,9 +9,9 @@ import arc_llama.cli
 os.environ["ARC_LLAMA_EXPERIMENTAL_AGENT"] = "1"
 importlib.reload(arc_llama.cli)
 
-from click.testing import CliRunner
+from click.testing import CliRunner  # noqa: E402
 
-from arc_llama.cli import cli
+from arc_llama.cli import cli  # noqa: E402
 
 
 def test_code_command_help() -> None:
