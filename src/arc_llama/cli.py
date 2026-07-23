@@ -207,30 +207,41 @@ def init(
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
     server_bin = Path(server_path).expanduser()
-    if not server_bin.exists():
-        console.print(
-            f"[red]llama-server binary not found: {server_path}[/red]"
-        )
-        if llama_server is None:
-            console.print(
-                "Pass --llama-server /path/to/llama-server or ensure it is on PATH."
-            )
-            console.print(
-                "[dim]Or run [bold]arc-llama install-runtime[/bold] to download a "
-                "portable Vulkan build.[/dim]"
-            )
+    runtime_missing = not server_bin.exists()
+    if runtime_missing and llama_server is not None:
+        # An explicit --llama-server path that does not exist is a mistake to surface.
+        console.print(f"[red]llama-server binary not found: {server_path}[/red]")
         sys.exit(3)
-    bin_backend = detect_llama_server_backend(server_bin)
-    if bin_backend is None:
+
+    bin_backend = None
+    if runtime_missing:
+        # No binary yet: still write the config (GPUs are detected) and point the
+        # user at install-runtime, which fills in paths.llama_server for them.
+        console.print("[yellow]No llama-server binary found yet.[/yellow]")
         console.print(
-            f"[yellow]Could not determine backend of {server_bin}; "
-            f"ensure it supports the GPUs you configured.[/yellow]"
+            "[dim]Run [bold]arc-llama install-runtime[/bold] to download a portable "
+            "Vulkan build (no oneAPI needed), then [bold]arc-llama serve[/bold].[/dim]"
         )
     else:
-        console.print(
-            f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
-        )
-    cfg = init_config_from_detection(gpus, llama_server_path=server_path)
+        bin_backend = detect_llama_server_backend(server_bin)
+        if bin_backend is None:
+            console.print(
+                f"[yellow]Could not determine backend of {server_bin}; "
+                f"ensure it supports the GPUs you configured.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
+            )
+
+    cfg = init_config_from_detection(
+        gpus, llama_server_path=None if runtime_missing else server_path
+    )
+    # init_config_from_detection defaults every GPU to SYCL; align to the binary
+    # we actually have so `serve` applies the right backend env.
+    if bin_backend is not None:
+        for gpu_cfg in cfg.gpus:
+            gpu_cfg.backend = bin_backend.value
     if scan_paths:
         cfg.paths.scan_paths = list(scan_paths)
     _save_or_die(cfg, config_path)
