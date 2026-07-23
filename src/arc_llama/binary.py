@@ -11,6 +11,13 @@ from arc_llama.arch import Backend
 # Byte signatures that reliably appear in llama.cpp binaries built with the
 # corresponding backend enabled.  We search for these instead of relying on
 # `--version`, which does not currently print backend tags.
+# NOTE: bare backend NAMES ("sycl", "vulkan", "oneapi") are deliberately excluded
+# from the markers below. llama.cpp's meta-loader libggml.so enumerates every
+# backend name as a plain string in ALL builds, regardless of which backends are
+# actually compiled, so those bare names are not evidence a backend is present.
+# Only registration symbols (ggml_backend_*) and real runtime library / API
+# symbols (libsycl, libze_intel_gpu, libze_loader, libvulkan,
+# vkGetInstanceProcAddr) are used as evidence.
 _BACKEND_MARKERS: dict[Backend, list[bytes]] = {
     Backend.SYCL: [
         b"ggml_backend_sycl",
@@ -18,14 +25,11 @@ _BACKEND_MARKERS: dict[Backend, list[bytes]] = {
         b"libsycl",
         b"libze_intel_gpu",
         b"libze_loader",
-        b"oneapi",
-        b"sycl",
     ],
     Backend.VULKAN: [
         b"ggml_backend_vulkan",
         b"ggml_backend_vulkan_reg",
         b"libvulkan",
-        b"vulkan",
         b"vkGetInstanceProcAddr",
     ],
 }
@@ -69,21 +73,37 @@ def _scan_with_python(path: Path, chunk_size: int = 1_048_576) -> set[Backend]:
     return found
 
 
-def detect_backends(binary_path: str | Path) -> set[Backend]:
-    """Return the set of compute backends embedded in a ``llama-server`` binary.
-
-    The detection is heuristic: it searches the binary for backend-specific
-    strings/symbols.  It deliberately does not execute the binary, so it is
-    safe to run on headless machines and will not wake a GPU.
-    """
-    path = Path(binary_path)
-    if not path.exists() or not path.is_file():
-        return set()
-
+def _scan_file(path: Path) -> set[Backend]:
+    """Scan a single file for backend markers, falling back to pure Python."""
     try:
         return _scan_with_strings(path)
     except (FileNotFoundError, RuntimeError, subprocess.SubprocessError):
         return _scan_with_python(path)
+
+
+def detect_backends(binary_path: str | Path) -> set[Backend]:
+    """Return the set of compute backends embedded in a ``llama-server`` binary.
+
+    Modern official llama.cpp release builds are modular: the compute backend
+    lives in sibling shared libraries next to the executable (e.g.
+    ``libggml-vulkan.so`` holds the Vulkan markers, ``libggml-sycl.so`` holds
+    the SYCL markers). This function scans the target file AND its sibling
+    ``libggml*.so*`` files, unioning the results. It never executes the binary.
+    """
+    path = Path(binary_path)
+    if not path.exists() or not path.is_file():
+        return set()
+    found = _scan_file(path)
+    for sibling in sorted(path.parent.glob("libggml*.so*")):
+        if not sibling.is_file() or sibling == path:
+            continue
+        try:
+            found |= _scan_file(sibling)
+        except OSError:
+            continue
+        if {Backend.SYCL, Backend.VULKAN} <= found:
+            break
+    return found
 
 
 def detect_llama_server_backend(binary_path: str | Path) -> Backend | None:
