@@ -55,3 +55,57 @@ class TestDetectBackends:
     def test_alternative_markers(self, tmp_path: Path, marker: bytes, expected: Backend):
         binary = _make_fake_binary(tmp_path, b"header " + marker + b" footer")
         assert detect_backends(binary) == {expected}
+
+
+def test_detects_vulkan_from_sibling_lib(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
+    (tmp_path / "libggml-vulkan.so").write_bytes(b"ggml_backend_vulkan")
+    assert Backend.VULKAN in detect_backends(binary)
+    assert detect_llama_server_backend(binary) == Backend.VULKAN
+
+
+def test_detects_sycl_from_sibling_lib(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
+    (tmp_path / "libggml-sycl.so").write_bytes(b"ggml_backend_sycl")
+    assert detect_llama_server_backend(binary) == Backend.SYCL
+
+
+def test_prefers_sycl_across_sibling_libs(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
+    (tmp_path / "libggml-sycl.so").write_bytes(b"ggml_backend_sycl")
+    (tmp_path / "libggml-vulkan.so").write_bytes(b"ggml_backend_vulkan")
+    assert detect_backends(binary) == {Backend.SYCL, Backend.VULKAN}
+    assert detect_llama_server_backend(binary) == Backend.SYCL
+
+
+def test_sibling_scan_does_not_break_bare_binary(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
+    assert detect_backends(binary) == set()
+    assert detect_llama_server_backend(binary) is None
+
+
+def test_backend_name_enumeration_is_not_detected(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe")
+    (tmp_path / "libggml.so").write_bytes(
+        b"available backends: cpu sycl vulkan cuda blas"
+    )
+    assert detect_backends(binary) == set()
+    assert detect_llama_server_backend(binary) is None
+
+
+def test_strong_vulkan_markers_still_detect_in_sibling(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe")
+    (tmp_path / "libggml-vulkan.so").write_bytes(
+        b"libvulkan.so.1 and vkGetInstanceProcAddr symbol"
+    )
+    assert detect_llama_server_backend(binary) == Backend.VULKAN
+
+
+def test_vulkan_build_not_misdetected_as_sycl(tmp_path):
+    binary = _make_fake_binary(tmp_path, b"cpu only exe")
+    (tmp_path / "libggml.so").write_bytes(b"cpu sycl vulkan cuda")
+    (tmp_path / "libggml-vulkan.so").write_bytes(
+        b"libvulkan.so.1 vkGetInstanceProcAddr"
+    )
+    assert detect_backends(binary) == {Backend.VULKAN}
+    assert detect_llama_server_backend(binary) == Backend.VULKAN
