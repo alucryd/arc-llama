@@ -217,6 +217,10 @@ class ModelConfig:
             spec_draft_n_max=(
                 int(r["spec_draft_n_max"]) if r.get("spec_draft_n_max") is not None else None
             ),
+            spec_draft_model=r.get("spec_draft_model"),
+            spec_draft_ngl=(
+                int(r["spec_draft_ngl"]) if r.get("spec_draft_ngl") is not None else None
+            ),
             ubatch_size=r.get("ubatch_size"),
             batch_size=r.get("batch_size"),
             flash_attn=r.get("flash_attn"),

@@ -261,6 +261,24 @@ class TestLaunchRecipeArgv:
         assert "-ub" in argv
         assert argv[argv.index("-ub") + 1] == "8"
 
+    def test_spec_draft_model_and_ngl_emitted(self):
+        r = LaunchRecipe(
+            spec_type="draft-mtp",
+            spec_draft_model="/models/mtp-gemma.gguf",
+            spec_draft_ngl=999,
+            spec_draft_n_max=3,
+        )
+        argv = r.to_argv()
+        assert argv[argv.index("--spec-draft-model") + 1] == "/models/mtp-gemma.gguf"
+        assert argv[argv.index("--spec-draft-ngl") + 1] == "999"
+        assert argv[argv.index("--spec-draft-n-max") + 1] == "3"
+
+    def test_spec_draft_model_omitted_when_none(self):
+        r = LaunchRecipe(spec_type="draft-mtp")
+        argv = r.to_argv()
+        assert "--spec-draft-model" not in argv
+        assert "--spec-draft-ngl" not in argv
+
     def test_n_cpu_moe_emitted_when_set(self):
         r = LaunchRecipe(n_cpu_moe=4)
         argv = r.to_argv()

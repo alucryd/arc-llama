@@ -11,6 +11,7 @@ need to type `arc-llama add` for a GGUF they already have on disk.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,12 +157,24 @@ def add_local_model(
     # n_max 5–6 regresses. Pin n_max=3 (llama default / mid of the good band).
     if has_mtp_heads(p):
         recipe_dict["spec_type"] = "draft-mtp"
-        recipe_dict["spec_draft_n_max"] = 3
+        recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
         log.info(
-            "model %s has MTP heads; auto-enabling spec_type=draft-mtp "
-            "spec_draft_n_max=3 (B60 measured band 1–4)",
-            name,
+            "model %s has embedded MTP heads; auto-enabling spec_type=draft-mtp "
+            "spec_draft_n_max=%d (B60 measured band 1–4)",
+            name, DEFAULT_SPEC_DRAFT_N_MAX,
         )
+    else:
+        draft = find_draft_model(p)
+        if draft is not None:
+            recipe_dict["spec_type"] = "draft-mtp"
+            recipe_dict["spec_draft_model"] = str(draft)
+            recipe_dict["spec_draft_ngl"] = DEFAULT_SPEC_DRAFT_NGL
+            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+            log.info(
+                "model %s: found sidecar draft %s; auto-enabling draft-mtp "
+                "with --spec-draft-model (spec_draft_n_max=%d)",
+                name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+            )
     # Suggest MoE expert offload on VRAM-tight cards.
     if is_moe(p):
         num_experts = expert_count(p)
@@ -220,6 +233,96 @@ _QUANT_TIER_RE = re.compile(
     r"\b(IQ\d_[A-Z_]*|Q\d_[KS]_[A-Z]+|Q\d_K|Q\d_\d|Q8_0|UD-[A-Z0-9_]+)\b",
     re.IGNORECASE,
 )
+
+
+# --- Speculative sidecar-draft detection -----------------------------------
+# Some models ship their MTP/EAGLE draft heads as a separate small GGUF next to
+# the main weights (e.g. `mtp-gemma-4-26B-A4B-it.gguf`). We auto-pair them so
+# the fast speculative recipe works without the user knowing the file exists.
+
+# A draft carries the marker as a *prefix*. This deliberately does NOT match a
+# mid-name 'MTP' (e.g. `Qwen3.6-27B-MTP-...`), which is a full model with
+# *embedded* heads, not a sidecar draft.
+_DRAFT_PREFIX_RE = re.compile(r"^(mtp|draft|eagle|medusa)[-_.]", re.IGNORECASE)
+
+DEFAULT_SPEC_DRAFT_N_MAX = 3  # B60-measured good band is 1–4; 5–6 regress.
+DEFAULT_SPEC_DRAFT_NGL = 999  # fully offload the (small) draft to the GPU.
+
+
+def _sibling_ggufs(directory: Path) -> list[Path]:
+    """List *.gguf files in `directory` via os.listdir.
+
+    Deliberately avoids Path.glob, which stats the directory's mode and so
+    trips test stat-mocks; os.listdir needs no stat on the entries.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(directory / n for n in names if n.lower().endswith(".gguf"))
+
+
+def _model_key(name: str) -> str:
+    """Normalise a GGUF filename to a comparable base key.
+
+    Drops the extension, a leading draft marker, quant-tier tokens, and every
+    non-alphanumeric, so `mtp-gemma-4-26B-A4B-it.gguf` and
+    `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf` reduce to comparable stems
+    (`gemma426ba4bit` vs `gemma426ba4bitqat`).
+    """
+    stem = name[:-5] if name.lower().endswith(".gguf") else name
+    stem = _DRAFT_PREFIX_RE.sub("", stem)
+    stem = _QUANT_TIER_RE.sub("", stem)
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def find_draft_model(main_path: Path | str, siblings: list[Path] | None = None) -> Path | None:
+    """Return a sidecar speculative-draft GGUF for `main_path`, or None.
+
+    A sibling in the same directory qualifies when it carries a draft-marker
+    prefix, is smaller than the main model, and shares its base name.
+    """
+    main = Path(main_path)
+    try:
+        main_size = main.stat().st_size
+    except OSError:
+        return None
+    if siblings is None:
+        siblings = _sibling_ggufs(main.parent)
+    main_key = _model_key(main.name)
+    if not main_key:
+        return None
+    for s in siblings:
+        if s.name == main.name or not _DRAFT_PREFIX_RE.match(s.name):
+            continue
+        try:
+            if s.stat().st_size >= main_size:  # a draft is smaller than its target
+                continue
+        except OSError:
+            continue
+        draft_key = _model_key(s.name)
+        if draft_key and main_key.startswith(draft_key):
+            return s
+    return None
+
+
+def looks_like_draft(path: Path | str, siblings: list[Path] | None = None) -> bool:
+    """True if `path` is a sidecar draft belonging to some larger sibling.
+
+    Used by scan to avoid registering a draft GGUF as a standalone model.
+    """
+    p = Path(path)
+    if not _DRAFT_PREFIX_RE.match(p.name):
+        return False
+    if siblings is None:
+        siblings = _sibling_ggufs(p.parent)
+    for s in siblings:
+        if s.name == p.name:
+            continue
+        d = find_draft_model(s, siblings)
+        if d is not None and d.name == p.name:
+            return True
+    return False
 
 
 def infer_kv_class(filename: str) -> str:
@@ -400,6 +503,9 @@ def register_discovered(
             continue
         if not rp.exists():
             continue
+        if looks_like_draft(rp):
+            log.info("skipping %s (speculative draft for a sibling model)", rp.name)
+            continue
         kv_class = resolve_kv_class(rp)
         recipe = default_recipe(
             arch=arch,
@@ -413,11 +519,22 @@ def register_discovered(
         # n_max=3 pinned from B60 measurements (see bench_results/SUMMARY.md).
         if has_mtp_heads(rp):
             recipe_dict["spec_type"] = "draft-mtp"
-            recipe_dict["spec_draft_n_max"] = 3
+            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
             log.info(
-                "discovered %s has MTP heads; auto-enabling draft-mtp n_max=3",
-                rp.name,
+                "discovered %s has embedded MTP heads; auto-enabling draft-mtp n_max=%d",
+                rp.name, DEFAULT_SPEC_DRAFT_N_MAX,
             )
+        else:
+            draft = find_draft_model(rp)
+            if draft is not None:
+                recipe_dict["spec_type"] = "draft-mtp"
+                recipe_dict["spec_draft_model"] = str(draft)
+                recipe_dict["spec_draft_ngl"] = DEFAULT_SPEC_DRAFT_NGL
+                recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+                log.info(
+                    "discovered %s: sidecar draft %s; auto-enabling draft-mtp n_max=%d",
+                    rp.name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+                )
         # Suggest MoE expert offload on VRAM-tight cards.
         if is_moe(rp):
             num_experts = expert_count(rp)

@@ -685,7 +685,17 @@ def list_models(ctx: click.Context) -> None:
 @click.option("--alias", "aliases", multiple=True, help="Extra match strings (repeatable).")
 @click.option(
     "--spec-type", "spec_type", default=None,
-    help="Speculative decoding type (e.g. draft-mtp). Auto-detected for MTP models.",
+    help="Speculative decoding type (e.g. draft-mtp). Auto-detected for models "
+         "with embedded MTP heads or a sidecar draft GGUF.",
+)
+@click.option(
+    "--spec-draft-model", "spec_draft_model", default=None,
+    help="Path to a sidecar speculative-draft GGUF (--spec-draft-model). "
+         "Auto-detected from a sibling mtp-/draft- file when present.",
+)
+@click.option(
+    "--spec-draft-ngl", "spec_draft_ngl", type=int, default=None,
+    help="GPU layers for the draft model (--spec-draft-ngl); default 999.",
 )
 @click.option(
     "--ubatch-size", "ubatch_size", type=int, default=None,
@@ -710,6 +720,8 @@ def add(
     kv_class: str,
     aliases: tuple[str, ...],
     spec_type: str | None,
+    spec_draft_model: str | None,
+    spec_draft_ngl: int | None,
     ubatch_size: int | None,
     from_hf: bool,
     hf_token: str | None,
@@ -781,6 +793,12 @@ def add(
         overrides["cache_type_v"] = kv_type
     if spec_type is not None:
         overrides["spec_type"] = spec_type
+    if spec_draft_model is not None:
+        overrides["spec_draft_model"] = str(Path(spec_draft_model).expanduser().resolve())
+        overrides.setdefault("spec_type", "draft-mtp")
+        overrides.setdefault("spec_draft_ngl", 999)
+    if spec_draft_ngl is not None:
+        overrides["spec_draft_ngl"] = spec_draft_ngl
     if ubatch_size is not None:
         overrides["ubatch_size"] = ubatch_size
 

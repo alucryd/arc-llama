@@ -12,6 +12,8 @@ from arc_llama.models import (
     add_local_model,
     discover_ggufs,
     download_from_hf,
+    find_draft_model,
+    looks_like_draft,
     parse_hf_spec,
     register_discovered,
     short_name_from_path,
@@ -789,3 +791,98 @@ def test_discover_and_register_ggufs_skips_hidden_symlink_and_existing_files(tmp
     assert added[0].kv_class == "qwen3_dense"
     assert added_again == []
     assert len(cfg.models) == 1
+
+
+# ===========================================================================
+# Sidecar speculative-draft detection
+# ===========================================================================
+
+
+def _write_gguf(p: Path, size: int) -> Path:
+    p.write_bytes(b"\0" * size)
+    return p
+
+
+def test_find_draft_model_pairs_sidecar(tmp_path):
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    draft = _write_gguf(tmp_path / "mtp-gemma-4-26B-A4B-it.gguf", 200)
+    assert find_draft_model(main) == draft
+
+
+def test_find_draft_model_none_without_sibling(tmp_path):
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    assert find_draft_model(main) is None
+
+
+def test_find_draft_model_ignores_mid_name_mtp(tmp_path):
+    # A full model with *embedded* MTP heads must not be read as a draft.
+    main = _write_gguf(tmp_path / "Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf", 4000)
+    assert find_draft_model(main) is None
+    assert looks_like_draft(main) is False
+
+
+def test_find_draft_model_ignores_larger_sibling(tmp_path):
+    # A draft-prefixed file bigger than the main model is not its draft.
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 1000)
+    _write_gguf(tmp_path / "mtp-gemma-4-26B-A4B-it.gguf", 5000)
+    assert find_draft_model(main) is None
+
+
+def test_find_draft_model_requires_name_match(tmp_path):
+    # A draft from a different model family is not paired.
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    _write_gguf(tmp_path / "mtp-llama-3-8b-instruct.gguf", 200)
+    assert find_draft_model(main) is None
+
+
+def test_looks_like_draft(tmp_path):
+    _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    draft = _write_gguf(tmp_path / "mtp-gemma-4-26B-A4B-it.gguf", 200)
+    assert looks_like_draft(draft) is True
+
+
+def test_add_local_model_wires_sidecar_draft(tmp_path):
+    cfg = _make_config_with_gpu(tmp_path)
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    draft = _write_gguf(tmp_path / "mtp-gemma-4-26B-A4B-it.gguf", 200)
+    with (
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+    ):
+        mc = add_local_model(
+            cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0"
+        )
+    assert mc.recipe["spec_type"] == "draft-mtp"
+    assert Path(mc.recipe["spec_draft_model"]).resolve() == draft.resolve()
+    assert mc.recipe["spec_draft_ngl"] == 999
+    assert mc.recipe["spec_draft_n_max"] == 3
+
+
+def test_add_local_model_no_spec_without_draft(tmp_path):
+    cfg = _make_config_with_gpu(tmp_path)
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    with (
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+    ):
+        mc = add_local_model(
+            cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0"
+        )
+    assert "spec_type" not in mc.recipe
+    assert "spec_draft_model" not in mc.recipe
+
+
+def test_register_discovered_skips_draft_and_wires_parent(tmp_path):
+    cfg = _make_config_with_gpu(tmp_path)
+    main = _write_gguf(tmp_path / "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 4000)
+    draft = _write_gguf(tmp_path / "mtp-gemma-4-26B-A4B-it.gguf", 200)
+    with (
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+    ):
+        added = register_discovered(cfg, [main, draft])
+    # The draft is not registered as its own standalone model.
+    assert len(added) == 1
+    mc = added[0]
+    assert Path(mc.path).resolve() == main.resolve()
+    assert Path(mc.recipe["spec_draft_model"]).resolve() == draft.resolve()

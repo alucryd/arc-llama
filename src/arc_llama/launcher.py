@@ -183,15 +183,31 @@ def build_plan(
     #    prompt-eval throughput (~9.5x slower) and upstream's auto-fit handles
     #    memory sizing better than a blanket micro-ubatch.
 
-    # 2. Warn if the user explicitly asked for draft-mtp on a model that
-    #    does not actually contain MTP heads.
-    if recipe.spec_type == "draft-mtp" and not mtp_present:
-        log.warning(
-            "[%s] recipe.spec_type='draft-mtp' but GGUF has no MTP heads "
-            "(nextn_predict_layers == 0). Speculative decoding will likely "
-            "degenerate or crash.",
-            model.name,
-        )
+    # 2. Validate the draft-mtp wiring. A model may carry MTP heads either
+    #    embedded in its own GGUF, or in a sidecar draft (--spec-draft-model).
+    #    Warn only when neither source actually provides them.
+    if recipe.spec_type == "draft-mtp":
+        if recipe.spec_draft_model:
+            draft_path = Path(recipe.spec_draft_model)
+            if not draft_path.exists():
+                log.warning(
+                    "[%s] spec_draft_model %s does not exist; speculative "
+                    "decoding will fail.",
+                    model.name, draft_path,
+                )
+            elif not has_mtp_heads(draft_path):
+                log.warning(
+                    "[%s] spec_draft_model %s has no MTP heads; draft-mtp will "
+                    "likely degenerate or crash.",
+                    model.name, draft_path,
+                )
+        elif not mtp_present:
+            log.warning(
+                "[%s] recipe.spec_type='draft-mtp' but neither the GGUF nor a "
+                "spec_draft_model provides MTP heads. Speculative decoding will "
+                "likely degenerate or crash.",
+                model.name,
+            )
 
     # 3. Launch policy: only verified adjustments (e.g. Vulkan q8 needs
     #    --flash-attn). Do not strip draft-mtp or auto-switch backends based

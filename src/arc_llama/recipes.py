@@ -63,6 +63,15 @@ class LaunchRecipe:
     Measured on Arc Pro B60 / Qwen3.6-27B-MTP (2026-07): n_max 1–4 give
     similar gen (~19–20 tok/s); n_max 5–6 regress gen to ~13–15. Prefer ≤4.
     """
+    spec_draft_model: str | None = None
+    """Path to a sidecar speculative-draft GGUF (--spec-draft-model).
+
+    Some models ship their MTP/EAGLE heads as a separate small GGUF next to
+    the main weights (e.g. `mtp-gemma-*.gguf`) rather than embedded. When set,
+    llama-server loads it as the draft — this is what makes draft-mtp work for
+    models whose main GGUF has no embedded MTP heads."""
+    spec_draft_ngl: int | None = None
+    """GPU layers for the draft model (--spec-draft-ngl); 999 = fully offloaded."""
     ubatch_size: int | None = None
     """Ubatch size (-ub). Leave unset to let llama.cpp pick the default."""
     batch_size: int | None = None
@@ -102,6 +111,10 @@ class LaunchRecipe:
             argv += ["--top-k", str(self.top_k)]
         if self.spec_type:
             argv += ["--spec-type", self.spec_type]
+        if self.spec_draft_model:
+            argv += ["--spec-draft-model", self.spec_draft_model]
+        if self.spec_draft_ngl is not None:
+            argv += ["--spec-draft-ngl", str(self.spec_draft_ngl)]
         if self.spec_draft_n_max is not None:
             argv += ["--spec-draft-n-max", str(self.spec_draft_n_max)]
         if self.ubatch_size is not None:
@@ -274,6 +287,10 @@ def recipe_to_dict(recipe: LaunchRecipe) -> dict:
         d["batch_size"] = recipe.batch_size
     if recipe.spec_type is not None:
         d["spec_type"] = recipe.spec_type
+    if recipe.spec_draft_model is not None:
+        d["spec_draft_model"] = recipe.spec_draft_model
+    if recipe.spec_draft_ngl is not None:
+        d["spec_draft_ngl"] = recipe.spec_draft_ngl
     if recipe.spec_draft_n_max is not None:
         d["spec_draft_n_max"] = recipe.spec_draft_n_max
     if recipe.n_cpu_moe is not None:
