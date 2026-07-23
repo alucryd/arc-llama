@@ -1,13 +1,22 @@
 """Tests for host/driver competitive-inference checks."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+import pytest
 
 from arc_llama.platform_checks import (
     format_bytes,
     max_memory_bar_bytes,
     parse_kernel_version,
     rebar_likely_enabled,
+)
+
+_skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fakes a Linux /sys/bus/pci/devices/<slot> resource file; the colon "
+    "in the slot dir name is illegal on Windows and there's no sysfs to fake there",
 )
 
 
@@ -19,6 +28,7 @@ def _write_resource(path: Path, lines: list[str]) -> Path:
 
 
 class TestMaxMemoryBar:
+    @_skip_on_windows
     def test_reads_largest_mem_bar(self, tmp_path: Path):
         # 256 MiB BAR (typical without ReBAR) + tiny IO region
         sysfs = _write_resource(
@@ -32,6 +42,7 @@ class TestMaxMemoryBar:
         size = max_memory_bar_bytes(sysfs)
         assert size == 256 * 1024 * 1024
 
+    @_skip_on_windows
     def test_large_rebar_aperture(self, tmp_path: Path):
         # 16 GiB aperture
         start = 0x0000380000000000
@@ -45,6 +56,7 @@ class TestMaxMemoryBar:
 
 
 class TestRebarHeuristic:
+    @_skip_on_windows
     def test_small_bar_is_off(self, tmp_path: Path):
         sysfs = _write_resource(
             tmp_path,
@@ -52,6 +64,7 @@ class TestRebarHeuristic:
         )
         assert rebar_likely_enabled(sysfs, vram_mb=24 * 1024) is False
 
+    @_skip_on_windows
     def test_large_bar_is_on(self, tmp_path: Path):
         start = 0x0000380000000000
         end = start + 24 * 1024**3 - 1
