@@ -1210,7 +1210,11 @@ def benchmark_cmd(
 
 
 @cli.command("tune")
-@click.argument("model")
+@click.argument("model", required=False)
+@click.option(
+    "--all", "all_models", is_flag=True,
+    help="Tune every registered model sequentially.",
+)
 @click.option(
     "--server", "server_url", default=None,
     help="Base URL of a running `arc-llama serve` (default: http://HOST:PORT from config).",
@@ -1230,7 +1234,8 @@ def benchmark_cmd(
 @click.pass_context
 def tune_cmd(
     ctx: click.Context,
-    model: str,
+    model: str | None,
+    all_models: bool,
     server_url: str | None,
     target: str,
     prompt_tokens: int,
@@ -1242,20 +1247,48 @@ def tune_cmd(
 
     Staged sweep over KV cache type, ubatch size, and flash attention —
     roughly 6–9 measured configs, each paying one model reload. Expect
-    ~10 minutes on a Battlemage-class card. Requires a running
-    `arc-llama serve`.
+    ~10 minutes on a Battlemage-class card. Pass `--all` to sweep every
+    registered model in one run. Requires a running `arc-llama serve`.
     """
     from dataclasses import asdict
 
-    from arc_llama.tune import print_report, tune_model
+    from arc_llama.tune import print_multi_summary, print_report, tune_all, tune_model
 
     cfg = load_config(ctx.obj["config_path"])
-    if cfg.find_model(model) is None:
-        console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
+
+    if all_models and model:
+        console.print("[red]Pass either MODEL or --all, not both.[/red]")
         sys.exit(1)
+    if not all_models and not model:
+        console.print("[red]Specify a MODEL to tune, or --all for every registered model.[/red]")
+        sys.exit(1)
+
     url = _server_url_from(ctx, server_url)
 
     try:
+        if all_models:
+            model_names = [m.name for m in cfg.models]
+            if not model_names:
+                console.print("[yellow]No models registered.[/yellow]")
+                sys.exit(0)
+
+            def on_start(name: str, i: int, total: int) -> None:
+                console.print(f"[bold]\\[{i}/{total}] tuning {name}[/bold]")
+
+            reports = asyncio.run(tune_all(
+                url, model_names,
+                target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+                apply=apply_, cfg=cfg, on_start=on_start,
+            ))
+            if as_json:
+                click.echo(json.dumps([asdict(r) for r in reports], indent=2, default=str))
+            else:
+                print_multi_summary(reports)
+            sys.exit(1 if any(r.error for r in reports) else 0)
+
+        if cfg.find_model(model) is None:
+            console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
+            sys.exit(1)
         report = asyncio.run(tune_model(
             url, model,
             target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,

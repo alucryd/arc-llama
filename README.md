@@ -338,6 +338,7 @@ docker run ... \
 - ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅
 - ~~`arc-llama benchmark` , quick prompt-eval/gen tok/s harness.~~ ✅
 - ~~`arc-llama tune` , measure-and-persist recipe autotuner.~~ ✅
+- ~~`arc-llama tune --all` , sweep every registered model in one run.~~ ✅
 
 ## Contributing
 

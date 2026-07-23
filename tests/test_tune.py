@@ -6,10 +6,13 @@ import pytest
 from arc_llama.benchmark import BenchmarkResult
 from arc_llama.config import Config, GPUConfig, ModelConfig, PathsConfig
 from arc_llama.tune import (
+    TuneReport,
     _restore_edits,
     _ubatch_candidates,
     build_stages,
+    print_multi_summary,
     score_result,
+    tune_all,
     tune_model,
 )
 
@@ -249,3 +252,57 @@ async def test_tune_baseline_failure_aborts(cfg, monkeypatch):
     report = await tune_model("http://127.0.0.1:11437", "m", cfg=cfg)
     assert report.error is not None
     assert "baseline" in report.error
+
+
+# ---------------------------------------------------------------------------
+# tune_all: fleet-wide sweep orchestration
+# ---------------------------------------------------------------------------
+
+async def test_tune_all_runs_each_model_in_order(monkeypatch, cfg):
+    calls: list[str] = []
+    starts: list[tuple[str, int, int]] = []
+
+    async def fake_tune_model(server_url, model_name, **kwargs):
+        calls.append(model_name)
+        return TuneReport(model=model_name, target="balanced", applied=True)
+
+    monkeypatch.setattr("arc_llama.tune.tune_model", fake_tune_model)
+
+    def on_start(name, i, total):
+        starts.append((name, i, total))
+
+    reports = await tune_all("http://x", ["a", "b", "c"], cfg=cfg, on_start=on_start)
+
+    assert len(reports) == 3
+    assert [r.model for r in reports] == ["a", "b", "c"]
+    assert calls == ["a", "b", "c"]
+    assert starts == [("a", 1, 3), ("b", 2, 3), ("c", 3, 3)]
+
+
+async def test_tune_all_one_failure_does_not_abort(monkeypatch, cfg):
+    async def fake_tune_model(server_url, model_name, **kwargs):
+        if model_name == "b":
+            raise RuntimeError("boom")
+        return TuneReport(model=model_name, target="balanced", applied=True)
+
+    monkeypatch.setattr("arc_llama.tune.tune_model", fake_tune_model)
+
+    reports = await tune_all("http://x", ["a", "b", "c"], cfg=cfg)
+
+    assert len(reports) == 3
+    assert [r.model for r in reports] == ["a", "b", "c"]
+    assert reports[0].error is None
+    assert reports[1].error is not None
+    assert "boom" in reports[1].error
+    assert reports[2].error is None
+
+
+def test_print_multi_summary_smoke():
+    ok = TuneReport(model="a", target="balanced", applied=True)
+    ok.baseline = _result(100.0, 50.0)
+    ok.best = _result(120.0, 60.0)
+
+    errored = TuneReport(model="b", target="balanced", error="broke")
+
+    # Must not raise.
+    print_multi_summary([ok, errored])

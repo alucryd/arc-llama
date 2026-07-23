@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -318,6 +319,49 @@ async def tune_model(
     return report
 
 
+async def tune_all(
+    server_url: str,
+    model_names: list[str],
+    *,
+    target: str = "balanced",
+    prompt_tokens: int = TUNE_PROMPT_TOKENS,
+    gen_tokens: int = DEFAULT_GEN_TOKENS,
+    apply: bool = True,
+    cfg: Config | None = None,
+    on_start: Callable[[str, int, int], None] | None = None,
+    on_done: Callable[[TuneReport], None] | None = None,
+) -> list[TuneReport]:
+    """Tune every model in *model_names* sequentially, returning one report per attempt.
+
+    A failure on one model never aborts the rest.  ``KeyboardInterrupt`` is
+    re-raised so the caller can stop the whole sweep.
+    """
+    reports: list[TuneReport] = []
+    total = len(model_names)
+    for idx, name in enumerate(model_names, start=1):
+        log.info("tune-all: [%d/%d] %s", idx, total, name)
+        if on_start is not None:
+            on_start(name, idx, total)
+        try:
+            report = await tune_model(
+                server_url,
+                name,
+                target=target,
+                prompt_tokens=prompt_tokens,
+                gen_tokens=gen_tokens,
+                apply=apply,
+                cfg=cfg,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            report = TuneReport(model=name, target=target, error=str(exc))
+        reports.append(report)
+        if on_done is not None:
+            on_done(report)
+    return reports
+
+
 # ------------------------------------------------------------------
 # Console output
 # ------------------------------------------------------------------
@@ -376,3 +420,64 @@ def print_report(report: TuneReport) -> None:
         console.print("[green]Applied to the model's recipe and persisted.[/green]")
     else:
         console.print("[yellow]Dry run — original recipe restored. Re-run without --dry-run to keep it.[/yellow]")
+
+
+def print_multi_summary(reports: list[TuneReport]) -> None:
+    """Print a combined rich table summarising multiple ``TuneReport`` results."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    table = Table(title="Tune summary")
+    table.add_column("Model")
+    table.add_column("Gen tok/s (base→best)")
+    table.add_column("Prompt tok/s (base→best)")
+    table.add_column("Gen Δ")
+    table.add_column("Applied")
+    table.add_column("Status")
+
+    def _pair(base: float | None, best: float | None) -> str:
+        if base is None or best is None:
+            return "-"
+        return f"{base:.1f} → {best:.1f}"
+
+    n_ok = 0
+    n_applied = 0
+    for report in reports:
+        if report.error is None:
+            n_ok += 1
+        if report.applied:
+            n_applied += 1
+
+        baseline = report.baseline
+        best = report.best
+        if report.error is not None or baseline is None or best is None:
+            gen_cell = "-"
+            prompt_cell = "-"
+        else:
+            gen_cell = _pair(baseline.generation_tok_s, best.generation_tok_s)
+            prompt_cell = _pair(baseline.prompt_eval_tok_s, best.prompt_eval_tok_s)
+
+        gen_delta = report.improvement_pct.get("generation")
+        if gen_delta is None:
+            delta_cell = "-"
+        else:
+            delta_cell = f"{gen_delta:+.1f}%"
+
+        applied_cell = "yes" if report.applied else "no"
+        if report.error is None:
+            status_cell = "ok"
+        else:
+            status_cell = report.error[:40]
+
+        table.add_row(
+            report.model,
+            gen_cell,
+            prompt_cell,
+            delta_cell,
+            applied_cell,
+            status_cell,
+        )
+
+    console.print(table)
+    console.print(f"{n_ok}/{len(reports)} tuned OK, {n_applied} recipe(s) updated.")
