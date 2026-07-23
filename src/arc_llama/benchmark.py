@@ -195,32 +195,41 @@ def _build_prompt(target_tokens: int) -> str:
 # Core measurement
 # ------------------------------------------------------------------
 
-async def _measure_once(
+async def _complete(
     client: httpx.AsyncClient,
     model: str,
     prompt: str,
     max_tokens: int,
-) -> tuple[float, float]:
-    """Send one completion and return (time_to_first_token_s, total_time_s).
+    ignore_eos: bool = False,
+    cache_prompt: bool = True,
+) -> tuple[float, dict[str, Any]]:
+    """Send one non-streamed completion. Returns (wall_seconds, response_json).
 
-    For generation measurement we use stream=True and time the arrival
-    of the first chunk (TFT) and the final chunk (total).
+    Non-streamed on purpose: llama-server reports an exact ``timings`` block
+    (prompt/predicted tok/s measured inside the engine), which is far more
+    reliable than timing SSE chunks from the client -- llama.cpp batches
+    several tokens per chunk, so client-side inter-token timing overstates
+    the rate. We keep the wall time only as a fallback for non-llama.cpp
+    upstreams that omit ``timings``.
+
+    ``cache_prompt=False`` forces a full re-prefill each call; prompt-eval
+    needs it so repeated runs measure real prefill instead of a cache hit.
     """
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "stream": True,
+        "stream": False,
     }
+    if ignore_eos:
+        body["ignore_eos"] = True
+    if not cache_prompt:
+        body["cache_prompt"] = False
     t0 = time.perf_counter()
-    first_chunk_at: float | None = None
-    async with client.stream("POST", "/v1/chat/completions", json=body) as resp:
-        async for _chunk in resp.aiter_text():
-            if first_chunk_at is None:
-                first_chunk_at = time.perf_counter()
-    t1 = time.perf_counter()
-    tft = first_chunk_at if first_chunk_at is not None else t1
-    return tft - t0, t1 - t0
+    resp = await client.post("/v1/chat/completions", json=body)
+    wall = time.perf_counter() - t0
+    resp.raise_for_status()
+    return wall, resp.json()
 
 
 async def _measure_prompt_eval(
@@ -229,18 +238,28 @@ async def _measure_prompt_eval(
     prompt_tokens: int,
     repeats: int = REPEAT_PROMPT_EVAL,
 ) -> tuple[float, float]:
-    """Return (tok/s, elapsed_ms) averaged over *repeats* runs.
+    """Return (prompt-eval tok/s, elapsed_ms) for the best of *repeats* runs.
 
-    We use max_tokens=1 so almost all time is prompt eval.
+    Prefers llama-server's ``timings.prompt_per_second``; falls back to
+    ``prompt_tokens / wall`` (with max_tokens=1) for upstreams without it.
     """
     prompt = _build_prompt(prompt_tokens)
-    times: list[float] = []
+    best_tok_s = 0.0
+    best_ms = 0.0
     for _ in range(repeats):
-        _, total = await _measure_once(client, model, prompt, max_tokens=1)
-        times.append(total)
-    best = min(times)  # use best-of-N to discard scheduler jitter
-    tok_s = prompt_tokens / best if best > 0 else 0.0
-    return tok_s, best * 1000
+        # cache_prompt=False so every run does a real full prefill.
+        wall, obj = await _complete(client, model, prompt, max_tokens=1, cache_prompt=False)
+        t = obj.get("timings") or {}
+        if t.get("prompt_per_second"):
+            tok_s = float(t["prompt_per_second"])
+            ms = float(t.get("prompt_ms", wall * 1000))
+        else:
+            tok_s = prompt_tokens / wall if wall > 0 else 0.0
+            ms = wall * 1000
+        if tok_s > best_tok_s:  # best-of-N discards scheduler jitter
+            best_tok_s = tok_s
+            best_ms = ms
+    return best_tok_s, best_ms
 
 
 async def _measure_generation(
@@ -249,18 +268,32 @@ async def _measure_generation(
     gen_tokens: int,
     repeats: int = REPEAT_GENERATION,
 ) -> tuple[float, float]:
-    """Return (tok/s, elapsed_ms) averaged over *repeats* runs.
+    """Return (generation tok/s, elapsed_ms) for the best of *repeats* runs.
 
-    We use a very short prompt so generation dominates.
+    ``ignore_eos`` forces the model to emit the full ``gen_tokens`` instead
+    of stopping early on a short reply. Prefers llama-server's
+    ``timings.predicted_per_second`` (pure decode rate, excludes prefill);
+    falls back to ``completion_tokens / wall`` for upstreams without timings.
     """
     prompt = "Hello"
-    times: list[float] = []
+    best_tok_s = 0.0
+    best_ms = 0.0
     for _ in range(repeats):
-        _, total = await _measure_once(client, model, prompt, max_tokens=gen_tokens)
-        times.append(total)
-    best = min(times)
-    tok_s = gen_tokens / best if best > 0 else 0.0
-    return tok_s, best * 1000
+        wall, obj = await _complete(
+            client, model, prompt, max_tokens=gen_tokens, ignore_eos=True
+        )
+        t = obj.get("timings") or {}
+        if t.get("predicted_per_second"):
+            tok_s = float(t["predicted_per_second"])
+            ms = float(t.get("predicted_ms", wall * 1000))
+        else:
+            n = (obj.get("usage") or {}).get("completion_tokens") or 0
+            tok_s = n / wall if wall > 0 and n else 0.0
+            ms = wall * 1000
+        if tok_s > best_tok_s:  # best-of-N discards scheduler jitter
+            best_tok_s = tok_s
+            best_ms = ms
+    return best_tok_s, best_ms
 
 
 async def _warmup(
@@ -273,7 +306,7 @@ async def _warmup(
     t0 = time.perf_counter()
     prompt = _build_prompt(prompt_tokens)
     try:
-        await _measure_once(client, model, prompt, max_tokens=gen_tokens)
+        await _complete(client, model, prompt, max_tokens=gen_tokens)
     except Exception as e:
         log.warning("warmup failed: %s", e)
     return time.perf_counter() - t0

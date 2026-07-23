@@ -205,6 +205,10 @@ class FakeHttpxResponse:
     def json(self):
         return self._json or {}
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class FakeStreamContext:
     """Async context manager that yields a fake streamed response."""
@@ -246,6 +250,17 @@ class FakeHttpxClient:
         if path.startswith("/admin/models/") and "/edit" in path:
             status = 200 if self._edit_ok else 400
             return FakeHttpxResponse(status_code=status, json_data={"changed": ["ctx"]})
+        if "/v1/chat/completions" in path:
+            # Mimic a llama-server response with a timings block so the
+            # benchmark reads engine-measured tok/s (not client wall time).
+            return FakeHttpxResponse(200, json_data={
+                "choices": [{"message": {"content": "Hello there world!"},
+                             "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 512, "completion_tokens": 256,
+                          "total_tokens": 768},
+                "timings": {"prompt_per_second": 4000.0, "prompt_ms": 128.0,
+                            "predicted_per_second": 40.0, "predicted_ms": 6400.0},
+            })
         return FakeHttpxResponse(200)
 
     def stream(self, method: str, path: str, **kwargs):
