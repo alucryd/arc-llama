@@ -993,6 +993,11 @@ def _print_serve_banner(cfg: Config) -> None:
         "(overrides config; also settable via ARC_LLAMA_ADMIN_TOKEN)."
     ),
 )
+@click.option(
+    "--scan/--no-scan", "scan", default=True,
+    help="Auto-register any new GGUFs found in models_dir/scan_paths on startup "
+         "(default: on). Drop a model in and it just appears.",
+)
 @click.pass_context
 def serve(
     ctx: click.Context,
@@ -1000,6 +1005,7 @@ def serve(
     port: int | None,
     profile: str | None,
     admin_token: str | None,
+    scan: bool,
 ) -> None:
     """Run the OpenAI-compatible router."""
     cfg = load_config(ctx.obj["config_path"])
@@ -1011,9 +1017,28 @@ def serve(
         cfg.agent.profile = profile
     if admin_token:
         cfg.server.admin_token = admin_token
+
+    # Zero-config discovery: pick up any GGUF dropped into models_dir/scan_paths
+    # since the last run, so `serve` reflects the filesystem without a manual
+    # `scan`. Idempotent (already-registered paths are skipped) and best-effort
+    # — a discovery failure must never stop the router from coming up.
+    if scan and cfg.gpus:
+        try:
+            added = _do_scan(cfg, [])
+        except Exception as e:  # noqa: BLE001 - discovery must not block serve
+            added = []
+            console.print(f"[yellow]Startup scan failed: {e}[/yellow]")
+        if added:
+            _save_or_die(cfg, ctx.obj["config_path"])
+            console.print(
+                f"[green]Auto-registered {len(added)} new model(s):[/green] "
+                + ", ".join(m.name for m in added)
+            )
+
     if not cfg.models:
         console.print(
-            "[yellow]No models registered yet — `arc-llama add` something first.[/yellow]"
+            "[yellow]No models registered yet — drop a GGUF in "
+            f"{cfg.paths.models_dir} or run `arc-llama add`.[/yellow]"
         )
     if cfg.server.host not in ("127.0.0.1", "localhost", "::1"):
         console.print(
