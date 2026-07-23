@@ -2,13 +2,24 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from arc_llama.arch import Arch
+from arc_llama.arch import Arch, Backend
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.launcher import LlamaServer, build_env, build_plan
+from arc_llama.recipes import KVCacheType
+
+
+def _gpu(sycl_index: int = 0, backend: Backend = Backend.SYCL) -> GPUConfig:
+    return GPUConfig(
+        pci_slot="00:00.0",
+        sycl_index=sycl_index,
+        arch="battlemage",
+        backend=backend.value,
+    )
 
 
 class TestBuildEnv:
@@ -16,7 +27,7 @@ class TestBuildEnv:
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=2)
+        env = build_env(profile, _gpu(sycl_index=2))
         assert env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:2"
 
     def test_strips_bad_vars(self, monkeypatch: pytest.MonkeyPatch):
@@ -27,7 +38,7 @@ class TestBuildEnv:
         })
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=0)
+        env = build_env(profile, _gpu(sycl_index=0))
         assert "GGML_SYCL_DISABLE_OPT" not in env
         assert "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS" not in env
 
@@ -35,9 +46,31 @@ class TestBuildEnv:
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, sycl_index=0)
+        env = build_env(profile, _gpu(sycl_index=0))
         assert env["SYCL_CACHE_PERSISTENT"] == "0"
         assert env["ZES_ENABLE_SYSMAN"] == "1"
+
+    def test_vulkan_uses_visible_devices(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+        env = build_env(profile, _gpu(sycl_index=2, backend=Backend.VULKAN))
+        assert env["GGML_VK_VISIBLE_DEVICES"] == "2"
+        assert "ONEAPI_DEVICE_SELECTOR" not in env
+
+    def test_vulkan_strips_sycl_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(os, "environ", {
+            "PATH": "/usr/bin",
+            "ONEAPI_DEVICE_SELECTOR": "level_zero:0",
+            "SYCL_CACHE_PERSISTENT": "1",
+            "ZES_ENABLE_SYSMAN": "1",
+        })
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+        env = build_env(profile, _gpu(sycl_index=0, backend=Backend.VULKAN))
+        assert "ONEAPI_DEVICE_SELECTOR" not in env
+        assert "SYCL_CACHE_PERSISTENT" not in env
+        assert "ZES_ENABLE_SYSMAN" not in env
 
 
 class TestBuildPlan:
@@ -77,6 +110,64 @@ class TestBuildPlan:
         plan = build_plan(cfg, model, gpu)
         assert "-ub" not in plan.argv
 
+    def test_sycl_q8_does_not_inject_flash_attn(self):
+        # Matches production: q8 V, no --flash-attn, SYCL serves fine.
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.SYCL.value
+        )
+        plan = build_plan(cfg, model, gpu)
+        assert "--flash-attn" not in plan.argv
+        assert "-fa" not in plan.argv
+
+    def test_vulkan_q8_auto_injects_flash_attn(self):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+        )
+        plan = build_plan(cfg, model, gpu)
+        assert "--flash-attn" in plan.argv
+        assert plan.env.get("GGML_VK_VISIBLE_DEVICES") == "0"
+
+    def test_vulkan_q8_with_flash_attn_already_set(self):
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m",
+            path="/m.gguf",
+            port=18080,
+            gpu_pci_slot="00:00.0",
+            recipe={
+                "cache_type_k": KVCacheType.Q8_0.value,
+                "cache_type_v": KVCacheType.Q8_0.value,
+                "extra_flags": ["--flash-attn", "on"],
+            },
+        )
+        gpu = GPUConfig(
+            pci_slot="00:00.0", sycl_index=0, arch="battlemage", backend=Backend.VULKAN.value
+        )
+        plan = build_plan(cfg, model, gpu)
+        assert plan.argv.count("--flash-attn") == 1
+
 
 # Real GGUF fixtures for MTP integration tests.
 _MTP_QWEN = Path("/mnt/storage/models/qwen3.6-27b/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf")
@@ -88,7 +179,8 @@ def _have_mtp_fixture() -> bool:
 
 class TestBuildPlanMtp:
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
-    def test_auto_injects_ub_8_for_mtp(self):
+    def test_no_auto_ub_for_mtp(self):
+        """MTP detection must not force -ub 8; it regresses prompt-eval throughput."""
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="mtp-qwen",
@@ -98,9 +190,7 @@ class TestBuildPlanMtp:
         )
         gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
         plan = build_plan(cfg, model, gpu)
-        assert "-ub" in plan.argv
-        idx = plan.argv.index("-ub")
-        assert plan.argv[idx + 1] == "8"
+        assert "-ub" not in plan.argv
 
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
     def test_user_ubatch_size_not_overridden(self):
@@ -119,8 +209,8 @@ class TestBuildPlanMtp:
         assert plan.argv[idx + 1] == "16"
 
     @pytest.mark.skipif(not _have_mtp_fixture(), reason="MTP fixture GGUF not on disk")
-    def test_mtp_on_lunar_lake_also_gets_ub_8(self):
-        """Xe2 iGPU (Lunar Lake) is the same generation as Battlemage — same fix."""
+    def test_no_auto_ub_for_mtp_on_lunar_lake(self):
+        """Xe2 iGPU (Lunar Lake) should also avoid the forced micro-ubatch."""
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
             name="mtp-qwen",
@@ -130,9 +220,7 @@ class TestBuildPlanMtp:
         )
         gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="lunar_lake")
         plan = build_plan(cfg, model, gpu)
-        assert "-ub" in plan.argv
-        idx = plan.argv.index("-ub")
-        assert plan.argv[idx + 1] == "8"
+        assert "-ub" not in plan.argv
 
 
 class TestLlamaServerLifecycle:
@@ -191,7 +279,6 @@ class TestLlamaServerLifecycle:
         srv.started_at = 0.0
 
         import httpx
-        original_get = httpx.AsyncClient.get
 
         async def _fake_get(self, url):
             if "/health" in url:
@@ -225,3 +312,204 @@ class TestLlamaServerLifecycle:
         # Should not raise when not running
         srv.stop()
         assert srv.is_running is False
+
+
+class TestLogHandling:
+    def test_log_rotation_renames_existing_large_log(self, tmp_path):
+        from arc_llama import launcher as launcher_mod
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_path = log_dir / "m.log"
+        log_path.write_bytes(b"x" * (launcher_mod._MAX_LOG_BYTES + 1))
+        launcher_mod._rotate_log(log_path)
+        assert not log_path.exists()
+        assert (log_dir / "m.log.1").exists()
+
+    def test_tail_log_returns_last_lines(self, tmp_path):
+        from arc_llama.config import Config, GPUConfig, ModelConfig
+
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        log_dir = tmp_path / "logs"
+        original_popen = subprocess.Popen
+
+        def _fake_popen(*args, **kwargs):
+            class FakeProc:
+                pid = 12345
+                def poll(self):
+                    return None
+                def send_signal(self, sig):
+                    pass
+                def wait(self, timeout):
+                    self._waited = True
+            return FakeProc()
+
+        subprocess.Popen = _fake_popen
+        try:
+            srv.start(log_dir=log_dir)
+            srv._log_file.write(b"line1\nline2\nline3\n")
+            srv._log_file.flush()
+            assert srv.tail_log(lines=2) == "line2\nline3"
+        finally:
+            subprocess.Popen = original_popen
+        srv.stop()
+
+
+class TestWindowsLifecycle:
+    def test_start_uses_create_new_process_group(self, monkeypatch, tmp_path):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        log_dir = tmp_path / "logs"
+        called = {}
+        original_popen = subprocess.Popen
+
+        def _fake_popen(*args, **kwargs):
+            called["kwargs"] = kwargs
+            class FakeProc:
+                pid = 12345
+                def poll(self):
+                    return None
+            return FakeProc()
+
+        subprocess.Popen = _fake_popen
+        try:
+            srv.start(log_dir=log_dir)
+        finally:
+            subprocess.Popen = original_popen
+        assert called["kwargs"]["creationflags"] == getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        assert "preexec_fn" not in called["kwargs"]
+
+    def test_stop_sends_ctrl_break_then_force_kills_tree_on_timeout(self, monkeypatch):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        calls = []
+
+        class FakeProc:
+            pid = 12345
+            def poll(self):
+                return None
+            def send_signal(self, sig):
+                calls.append(("send_signal", sig))
+            def wait(self, timeout):
+                if not any(c[0] == "taskkill" for c in calls):
+                    raise subprocess.TimeoutExpired("cmd", timeout)
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(("taskkill", cmd))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        srv.process = FakeProc()
+        srv.stop(drain_seconds=0.1)
+        assert calls[0] == ("send_signal", launcher_mod._CTRL_BREAK_EVENT)
+        assert calls[1][0] == "taskkill"
+        assert calls[1][1] == ["taskkill", "/F", "/T", "/PID", "12345"]
+
+    def test_stop_skips_force_kill_when_ctrl_break_succeeds(self, monkeypatch):
+        from arc_llama import launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "_IS_WINDOWS", True)
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        calls = []
+
+        class FakeProc:
+            pid = 12345
+            def poll(self):
+                return None
+            def send_signal(self, sig):
+                calls.append(("send_signal", sig))
+            def wait(self, timeout):
+                return None
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(("taskkill", cmd))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        srv.process = FakeProc()
+        srv.stop(drain_seconds=0.1)
+        assert calls == [("send_signal", launcher_mod._CTRL_BREAK_EVENT)]
+
+
+class TestBuildPlanFlashAttn:
+    def _plan(self, recipe, caps, monkeypatch):
+        from arc_llama.server_caps import ServerCaps
+        monkeypatch.setattr(
+            "arc_llama.launcher.probe_server_caps", lambda path: ServerCaps(**caps)
+        )
+        cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
+        model = ModelConfig(
+            name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0", recipe=recipe,
+        )
+        gpu = GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage")
+        return build_plan(cfg, model, gpu)
+
+    def test_modern_binary_gets_fa_with_value(self, monkeypatch):
+        plan = self._plan(
+            {"flash_attn": "on"},
+            {"supports_flash_attn": True, "flash_attn_takes_value": True, "probed": True},
+            monkeypatch,
+        )
+        idx = plan.argv.index("-fa")
+        assert plan.argv[idx + 1] == "on"
+
+    def test_old_binary_gets_bare_fa_for_on(self, monkeypatch):
+        plan = self._plan(
+            {"flash_attn": "on"},
+            {"supports_flash_attn": True, "flash_attn_takes_value": False, "probed": True},
+            monkeypatch,
+        )
+        idx = plan.argv.index("-fa")
+        # bare flag: next token (if any) is another option, not a value
+        assert idx == len(plan.argv) - 1 or plan.argv[idx + 1].startswith("-")
+
+    def test_old_binary_auto_omitted(self, monkeypatch):
+        plan = self._plan(
+            {"flash_attn": "auto"},
+            {"supports_flash_attn": True, "flash_attn_takes_value": False, "probed": True},
+            monkeypatch,
+        )
+        assert "-fa" not in plan.argv
+
+    def test_unsupported_binary_omits_fa(self, monkeypatch):
+        plan = self._plan(
+            {"flash_attn": "on"},
+            {"supports_flash_attn": False, "flash_attn_takes_value": False, "probed": True},
+            monkeypatch,
+        )
+        assert "-fa" not in plan.argv
+
+    def test_batch_flags_from_recipe(self, monkeypatch):
+        plan = self._plan(
+            {"ubatch_size": 1024, "batch_size": 2048},
+            {"supports_flash_attn": True, "flash_attn_takes_value": True, "probed": True},
+            monkeypatch,
+        )
+        assert plan.argv[plan.argv.index("-ub") + 1] == "1024"
+        assert plan.argv[plan.argv.index("-b") + 1] == "2048"

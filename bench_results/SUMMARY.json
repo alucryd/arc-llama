@@ -1,0 +1,271 @@
+{
+  "hardware": "Intel Arc Pro B60 (0xe211), SYCL0, 24480 MiB",
+  "model": "/mnt/storage/models/qwen3.6-27b/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf",
+  "llama_server": "/mnt/storage/llama.cpp/build/bin/llama-server",
+  "methodology": {
+    "endpoint": "POST /completion",
+    "cache_prompt": false,
+    "metrics": [
+      "timings.prompt_per_second",
+      "timings.predicted_per_second"
+    ],
+    "prompt_tokens_approx": 1024,
+    "n_predict": 64,
+    "repeats": "best-of-2",
+    "ignore_eos": true,
+    "temperature": 0.7
+  },
+  "rows": [
+    {
+      "name": "A_prod_manual",
+      "prompt_tok_s": 340.5,
+      "gen_tok_s": 16.86,
+      "ctx_reported": 32768,
+      "notes": "fit off, -c 32768, b=2048 ub=512, fa on, q8 KV, draft-mtp nmax=3"
+    },
+    {
+      "name": "B_fit_on_minimal",
+      "prompt_tok_s": 339.33,
+      "gen_tok_s": 20.03,
+      "ctx_reported": 120832,
+      "notes": "fit on, no manual -c/-b/-ub, fa auto, q8 KV, draft-mtp nmax=3"
+    },
+    {
+      "name": "C_fit_on_keep_batch",
+      "prompt_tok_s": 339.58,
+      "gen_tok_s": 20.98,
+      "ctx_reported": 120832,
+      "notes": "fit on, b=2048 ub=512, fa auto, q8 KV, draft-mtp nmax=3"
+    },
+    {
+      "name": "D_fa_auto_sycl",
+      "prompt_tok_s": 336.62,
+      "gen_tok_s": 19.89,
+      "ctx_reported": 32768,
+      "notes": "fit off -c 32768, fa auto, q8 KV, draft-mtp nmax=3"
+    },
+    {
+      "name": "E_fa_off_f16v",
+      "prompt_tok_s": 339.59,
+      "gen_tok_s": 24.59,
+      "ctx_reported": 32768,
+      "notes": "fit off -c 32768, fa off, ctk q8 ctv f16, draft-mtp nmax=3"
+    },
+    {
+      "name": "F_batch_b512",
+      "prompt_tok_s": 337.81,
+      "gen_tok_s": 16.89,
+      "ctx_reported": 32768,
+      "notes": "b=512 ub=512 fa on q8 mtp3"
+    },
+    {
+      "name": "F_batch_b1024",
+      "prompt_tok_s": 340.2,
+      "gen_tok_s": 20.78,
+      "ctx_reported": 32768,
+      "notes": "b=1024 ub=512 fa on q8 mtp3"
+    },
+    {
+      "name": "F_batch_b2048",
+      "prompt_tok_s": 337.87,
+      "gen_tok_s": 16.21,
+      "ctx_reported": 32768,
+      "notes": "b=2048 ub=512 fa on q8 mtp3"
+    },
+    {
+      "name": "F_batch_b4096",
+      "prompt_tok_s": 337.56,
+      "gen_tok_s": 19.24,
+      "ctx_reported": 32768,
+      "notes": "b=4096 ub=512 fa on q8 mtp3"
+    },
+    {
+      "name": "G_mtp_nmax1",
+      "prompt_tok_s": 340.8205420894887,
+      "gen_tok_s": 19.65220510023853,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2705.236,
+        "prompt_per_token_ms": 2.9340954446854663,
+        "prompt_per_second": 340.8205420894887,
+        "predicted_n": 64,
+        "predicted_ms": 3256.632,
+        "predicted_per_token_ms": 50.884875,
+        "predicted_per_second": 19.65220510023853,
+        "draft_n": 36,
+        "draft_n_accepted": 27
+      }
+    },
+    {
+      "name": "G_mtp_nmax2",
+      "prompt_tok_s": 340.56624124205473,
+      "gen_tok_s": 18.88921945022927,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2707.256,
+        "prompt_per_token_ms": 2.936286334056399,
+        "prompt_per_second": 340.56624124205473,
+        "predicted_n": 64,
+        "predicted_ms": 3388.176,
+        "predicted_per_token_ms": 52.94025,
+        "predicted_per_second": 18.88921945022927,
+        "draft_n": 60,
+        "draft_n_accepted": 33
+      }
+    },
+    {
+      "name": "G_mtp_nmax3",
+      "prompt_tok_s": 340.24086248475464,
+      "gen_tok_s": 19.459074222381947,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2709.8450000000003,
+        "prompt_per_token_ms": 2.9390943600867683,
+        "prompt_per_second": 340.24086248475464,
+        "predicted_n": 64,
+        "predicted_ms": 3288.954,
+        "predicted_per_token_ms": 51.38990625,
+        "predicted_per_second": 19.459074222381947,
+        "draft_n": 69,
+        "draft_n_accepted": 39
+      }
+    },
+    {
+      "name": "G_mtp_nmax4",
+      "prompt_tok_s": 336.3099070259954,
+      "gen_tok_s": 19.57131481316122,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2741.5190000000002,
+        "prompt_per_token_ms": 2.9734479392624733,
+        "prompt_per_second": 336.3099070259954,
+        "predicted_n": 64,
+        "predicted_ms": 3270.092,
+        "predicted_per_token_ms": 51.0951875,
+        "predicted_per_second": 19.57131481316122,
+        "draft_n": 78,
+        "draft_n_accepted": 43
+      }
+    },
+    {
+      "name": "G_mtp_nmax5",
+      "prompt_tok_s": 333.5852710163243,
+      "gen_tok_s": 13.716524447025819,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2763.911,
+        "prompt_per_token_ms": 2.997734273318872,
+        "prompt_per_second": 333.5852710163243,
+        "predicted_n": 64,
+        "predicted_ms": 4665.905,
+        "predicted_per_token_ms": 72.904765625,
+        "predicted_per_second": 13.716524447025819,
+        "draft_n": 117,
+        "draft_n_accepted": 38
+      }
+    },
+    {
+      "name": "G_mtp_nmax6",
+      "prompt_tok_s": 334.8556797443184,
+      "gen_tok_s": 15.253148643125177,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2753.425,
+        "prompt_per_token_ms": 2.9863611713665947,
+        "prompt_per_second": 334.8556797443184,
+        "predicted_n": 64,
+        "predicted_ms": 4195.8550000000005,
+        "predicted_per_token_ms": 65.56023437500001,
+        "predicted_per_second": 15.253148643125177,
+        "draft_n": 112,
+        "draft_n_accepted": 43
+      }
+    },
+    {
+      "name": "H_no_mtp",
+      "prompt_tok_s": 374.95633304093246,
+      "gen_tok_s": 16.29920449695052,
+      "ctx_reported": 32768,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2458.953,
+        "prompt_per_token_ms": 2.666977223427332,
+        "prompt_per_second": 374.95633304093246,
+        "predicted_n": 64,
+        "predicted_ms": 3926.572,
+        "predicted_per_token_ms": 61.3526875,
+        "predicted_per_second": 16.29920449695052
+      }
+    },
+    {
+      "name": "I_ctx131k_fa_on",
+      "prompt_tok_s": 338.77989999011584,
+      "gen_tok_s": 16.458009959153276,
+      "ctx_reported": 131072,
+      "error": null,
+      "notes": "",
+      "raw_best": {
+        "cache_n": 0,
+        "prompt_n": 922,
+        "prompt_ms": 2721.531,
+        "prompt_per_token_ms": 2.9517689804772234,
+        "prompt_per_second": 338.77989999011584,
+        "predicted_n": 64,
+        "predicted_ms": 3888.684,
+        "predicted_per_token_ms": 60.7606875,
+        "predicted_per_second": 16.458009959153276,
+        "draft_n": 83,
+        "draft_n_accepted": 35
+      }
+    },
+    {
+      "name": "J_ctx131k_fa_off_f16v",
+      "prompt_tok_s": null,
+      "gen_tok_s": null,
+      "ctx_reported": null,
+      "error": "health timeout\n0.00.083.644 I log_info: verbosity = 3 (adjust with the `-lv N` CLI arg)\n0.00.083.646 I device_info:\n0.00.083.910 I   - SYCL0   : Intel(R) Arc(TM) Pro B60 Graphics (24480 MiB, 24342 MiB free)\n0.00.083.916 I   - CPU     : AMD Ryzen 5 5600 6-Core Processor (32018 MiB, 32018 MiB free)\n0.00.083.953 I system_info: n_threads = 6 (n_threads_batch = 6) / 12 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | \n0.00.083.994 I srv          init: running without SSL\n0.00.084.035 I srv          init: using 11 threads for HTTP server\n0.00.084.288 I srv         start: binding port with default address family\n0.00.085.441 I srv  llama_server: loading model\n0.00.085.450 I srv    load_model: loading model '/mnt/storage/models/qwen3.6-27b/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf'\n0.13.932.537 W llama_context: n_ctx_seq (131072) < n_ctx_train (262144) -- the full capacity of the model will not be utilized\n0.14.004.401 I common_init_from_params: warming up the model with an empty run - please wait ... (--no-warmup to disable)",
+      "notes": "",
+      "raw_best": {}
+    }
+  ],
+  "conclusions": [
+    "Prompt-eval is ~flat (334\u2013375 tok/s) across fit/manual/batch; only no-MTP jumps prompt to ~375.",
+    "draft-mtp n_max 1\u20134: good gen band; n_max 5\u20136 regresses well outside ~20% same-config noise. Keep auto draft-mtp; pin n_max=3; warn if >4.",
+    "SYCL + q8 V does NOT require flash-attn (production serves without it). Earlier hard-abort claim was wrong for SYCL \u2014 dropped. FA inject is Vulkan-only for quantized KV.",
+    "Gen absolute tok/s from best-of-2 is imprecise (~20% spread on identical config over 5 runs). Prefer \u22655 repeats before ranking rows.",
+    "fit on does not beat manual on prompt; it auto-sizes larger ctx.",
+    "batch -b sweep: no clean winner under noise \u2014 no default change."
+  ],
+  "methodology_notes": {
+    "repeats_used_in_table": "best-of-2 (too low for gen ranking)",
+    "recommended_repeats": 5,
+    "gen_noise_same_config_5runs": "approx 19.4\u201323.8 tok/s production config (Claude verification)"
+  }
+}

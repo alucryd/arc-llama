@@ -93,3 +93,49 @@ def test_summary(store: ChatStore) -> None:
     assert "updated_at" in summary
 
 
+def test_create_with_folder(store: ChatStore) -> None:
+    chat = store.create("chat-1", "Work chat", folder="work")
+    assert chat.folder == "work"
+    assert (store.directory / "work" / "chat-1.json").exists()
+
+
+def test_list_chats_by_folder(store: ChatStore) -> None:
+    store.create("a", "Root chat")
+    store.create("b", "Work chat", folder="work")
+    store.create("c", "Personal chat", folder="personal")
+
+    root_chats = store.list_chats(folder="")
+    assert [c.id for c in root_chats] == ["a"]
+
+    work_chats = store.list_chats(folder="work")
+    assert [c.id for c in work_chats] == ["b"]
+
+    all_chats = store.list_chats()
+    assert {c.id for c in all_chats} == {"a", "b", "c"}
+
+
+def test_move_chat_between_folders(store: ChatStore) -> None:
+    store.create("chat-1", "Work chat", folder="work")
+    moved = store.move("chat-1", "personal")
+    assert moved.folder == "personal"
+    assert (store.directory / "personal" / "chat-1.json").exists()
+    assert not (store.directory / "work" / "chat-1.json").exists()
+
+
+def test_list_folders(store: ChatStore) -> None:
+    store.create("a", "Root chat")
+    store.create("b", "Work chat", folder="work")
+    store.create("c", "Another work chat", folder="work")
+
+    folders = store.list_folders()
+    by_name = {f["name"]: f["count"] for f in folders}
+    assert by_name.get("") == 1
+    assert by_name.get("work") == 2
+
+
+def test_folder_duplicate_id_global(store: ChatStore) -> None:
+    store.create("chat-1", "Root chat")
+    with pytest.raises(FileExistsError):
+        store.create("chat-1", "Work chat", folder="work")
+
+

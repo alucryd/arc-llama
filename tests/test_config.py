@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from arc_llama.config import Config, GPUConfig, ModelConfig, load_config
+from pathlib import Path
+
+import pytest
+
+from arc_llama.config import (
+    Config,
+    GPUConfig,
+    MCPServerConfig,
+    ModelConfig,
+    ProfileConfig,
+    load_config,
+    migrate_config,
+)
 
 
 def test_config_round_trips_models_gpus_and_paths(tmp_path):
@@ -57,3 +69,125 @@ def test_find_model_matches_name_alias_display_name_and_filename(tmp_path):
     assert cfg.find_model("qwen 3").name == "qwen"
     assert cfg.find_model("Q4_K_M").name == "qwen"
     assert cfg.find_model("missing") is None
+
+
+def test_windows_default_paths_use_appdata(monkeypatch):
+    import os
+
+    from arc_llama import config as config_mod
+
+    monkeypatch.setattr(config_mod.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", r"C:\Users\test\AppData\Roaming")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\test\AppData\Local")
+    appdata = Path(os.environ["APPDATA"])
+    localappdata = Path(os.environ["LOCALAPPDATA"])
+    assert config_mod.default_config_path() == appdata / "arc-llama" / "config.toml"
+    assert config_mod.default_models_dir() == localappdata / "arc-llama" / "models"
+    assert config_mod.default_state_dir() == localappdata / "arc-llama"
+
+
+def test_migrate_config_adds_missing_sections():
+    from arc_llama.config import CONFIG_VERSION, migrate_config
+
+    raw = migrate_config({})
+    assert raw["version"] == CONFIG_VERSION
+    assert raw["server"] == {"admin_token": None}
+    assert raw["paths"] == {}
+    assert raw["agent"] == {"root": ".", "profile": None}
+    assert raw["gpus"] == []
+    assert raw["models"] == []
+    assert raw["upstreams"] == []
+    assert raw["profiles"] == []
+
+
+def test_validate_config_rejects_bad_structure():
+    from arc_llama.config import validate_config
+
+    with pytest.raises(ValueError, match="version"):
+        validate_config({"version": "not-an-int"})
+    with pytest.raises(ValueError, match="gpus"):
+        validate_config({"version": 1, "gpus": {}})
+    with pytest.raises(ValueError, match="profiles"):
+        validate_config({"version": 1, "profiles": {}})
+
+
+def test_load_config_generates_and_persists_admin_token(tmp_path):
+    path = tmp_path / "config.toml"
+    Config().save(path)
+
+    loaded = load_config(path)
+    assert loaded.server.admin_token
+
+    reloaded = load_config(path)
+    assert reloaded.server.admin_token == loaded.server.admin_token
+
+
+def test_load_config_generates_admin_token_when_no_file_exists(tmp_path):
+    path = tmp_path / "does-not-exist.toml"
+
+    cfg = load_config(path)
+    assert cfg.server.admin_token
+    assert not path.exists()
+
+
+def test_load_config_env_var_overrides_and_is_not_persisted(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    Config().save(path)
+    monkeypatch.setenv("ARC_LLAMA_ADMIN_TOKEN", "env-token")
+
+    cfg = load_config(path)
+    assert cfg.server.admin_token == "env-token"
+
+    monkeypatch.delenv("ARC_LLAMA_ADMIN_TOKEN")
+    reloaded = load_config(path)
+    assert reloaded.server.admin_token != "env-token"
+
+
+def test_load_config_keeps_existing_admin_token(tmp_path):
+    path = tmp_path / "config.toml"
+    cfg = Config()
+    cfg.server.admin_token = "existing-token"
+    cfg.save(path)
+
+    loaded = load_config(path)
+    assert loaded.server.admin_token == "existing-token"
+
+
+def test_profiles_round_trip(tmp_path):
+    path = tmp_path / "config.toml"
+    cfg = Config()
+    cfg.agent.profile = "work"
+    cfg.mcp_servers = [
+        MCPServerConfig(name="fs", command="npx", args=["-y", "@mcp/fs"]),
+        MCPServerConfig(name="gh", command="npx", args=["-y", "@mcp/gh"]),
+    ]
+    cfg.profiles = [
+        ProfileConfig(name="work", mcp_servers=["fs"]),
+        ProfileConfig(name="oss", mcp_servers=["fs", "gh"]),
+    ]
+    cfg.save(path)
+    loaded = load_config(path)
+
+    assert loaded.agent.profile == "work"
+    assert [p.name for p in loaded.profiles] == ["work", "oss"]
+    assert loaded.profiles[0].mcp_servers == ["fs"]
+    assert loaded.profiles[1].mcp_servers == ["fs", "gh"]
+
+
+def test_active_mcp_servers_filters_by_profile():
+    cfg = Config()
+    cfg.mcp_servers = [
+        MCPServerConfig(name="fs", command="npx"),
+        MCPServerConfig(name="gh", command="npx"),
+    ]
+    cfg.profiles = [ProfileConfig(name="work", mcp_servers=["fs"])]
+
+    assert [s.name for s in cfg.active_mcp_servers()] == ["fs", "gh"]
+    assert [s.name for s in cfg.active_mcp_servers("work")] == ["fs"]
+    assert cfg.active_mcp_servers("missing") == cfg.mcp_servers
+
+
+def test_migrate_config_adds_profiles_and_agent_profile():
+    raw = migrate_config({})
+    assert raw["profiles"] == []
+    assert "profile" in raw["agent"]

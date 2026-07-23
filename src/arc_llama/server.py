@@ -20,6 +20,8 @@ import asyncio
 import io
 import json
 import logging
+import secrets
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -27,12 +29,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from arc_llama.agent import run_agent
+from arc_llama.agent.checkpoints import CheckpointStore
+from arc_llama.agent.mcp_client import MCPClientManager
+from arc_llama.agent.repo_map import SemanticIndex
 from arc_llama.chat_store import ChatMessage, ChatStore
 from arc_llama.config import Config, load_config
 from arc_llama.router import Router
@@ -51,6 +56,26 @@ def _strip_response_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
+async def _require_admin(request: Request) -> None:
+    """Require the configured admin token in the Authorization header.
+
+    When ``cfg.server.admin_token`` is unset the dependency is a no-op so
+    existing single-user deployments keep working. If a token is configured,
+    callers must supply ``Authorization: Bearer <token>``.
+    """
+    cfg: Config = request.app.state.cfg
+    token = cfg.server.admin_token
+    if not token:
+        return
+
+    auth = request.headers.get("Authorization", "")
+    scheme, _, provided = auth.partition(" ")
+    if scheme.lower() != "bearer" or not provided:
+        raise HTTPException(status_code=401, detail="Admin token required")
+    if not secrets.compare_digest(provided, token):
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     state_dir = None
@@ -62,22 +87,93 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         app.state.router = Router(cfg, log_dir=state_dir)
         app.state.upstream_mgr = UpstreamManager(cfg.upstreams)
         app.state.cfg = cfg
-        app.state.pending_confirmations: dict[str, tuple[asyncio.Event, dict[str, bool]]] = {}
+        app.state.started_at = time.time()
+        pending_confirmations: dict[str, tuple[asyncio.Event, dict[str, bool]]] = {}
+        pending_plan_approvals: dict[str, tuple[asyncio.Event, dict[str, bool]]] = {}
+        app.state.pending_confirmations = pending_confirmations
+        app.state.pending_plan_approvals = pending_plan_approvals
         if state_dir:
             app.state.chat_store = ChatStore(state_dir / "chats")
+            app.state.checkpoint_store = CheckpointStore(state_dir / "checkpoints")
+            app.state.semantic_index = SemanticIndex(state_dir / "semantic_index")
         else:
             app.state.chat_store = ChatStore(Path(".arc_llama_chats"))
+            app.state.checkpoint_store = CheckpointStore(Path(".arc_llama_checkpoints"))
+            app.state.semantic_index = SemanticIndex(Path(".arc_llama_semantic_index"))
         load_skills(cfg.paths.skills_dir)
+        app.state.mcp_manager = MCPClientManager(cfg.active_mcp_servers())
         try:
+            await app.state.mcp_manager.start()
             yield
         finally:
+            await app.state.mcp_manager.stop()
             await app.state.router.shutdown()
 
     app = FastAPI(title="arc-llama", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health(request: Request) -> dict[str, Any]:
+        """Liveness probe for the arc-llama router itself."""
+        rt: Router = request.app.state.router
+        uptime = time.time() - request.app.state.started_at
+        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        return {
+            "status": "ok",
+            "uptime_seconds": round(uptime, 2),
+            "loaded_models": loaded,
+            "loaded_model_count": len(loaded),
+        }
+
+    @app.get("/admin/session-token")
+    async def admin_session_token(request: Request) -> dict[str, str | None]:
+        """Hand the bundled first-party web UI its own admin token.
+
+        Deliberately not gated by ``_require_admin`` -- it exists so the
+        static page served by this same process can bootstrap itself without
+        the user copy-pasting a token. Instead it's gated on the *connection*
+        being loopback: the browser talking to the bundled UI on the same
+        machine always looks like a loopback peer to us, so this stays
+        zero-friction for the default deployment. But if the server is bound
+        to a LAN/public address, a remote caller's TCP peer address won't be
+        loopback, so they get refused here and have to obtain the token
+        out-of-band (CLI startup output, config file) like any other
+        non-local caller -- this endpoint must never become a way to fetch
+        the secret over the network it's meant to guard.
+        """
+        peer = request.client.host if request.client else ""
+        if peer not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            raise HTTPException(status_code=403, detail="Loopback connections only")
+        c: Config = request.app.state.cfg
+        return {"admin_token": c.server.admin_token}
+
+    @app.get("/admin/metrics")
+    async def admin_metrics(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, Any]:
+        """Operational counters and current GPU/model state."""
+        rt: Router = request.app.state.router
+        c: Config = request.app.state.cfg
+        uptime = time.time() - request.app.state.started_at
+        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        return {
+            "uptime_seconds": round(uptime, 2),
+            "loads": rt.metrics["loads"],
+            "stops": rt.metrics["stops"],
+            "load_errors": rt.metrics["load_errors"],
+            "last_load_at": rt.metrics["last_load_at"],
+            "last_error": rt.metrics["last_error"],
+            "active_models": loaded,
+            "gpus": [
+                {
+                    "pci_slot": g.pci_slot,
+                    "name": g.name,
+                    "arch": g.arch,
+                    "vram_mb": g.vram_mb,
+                    "enabled": g.enabled,
+                }
+                for g in c.gpus
+            ],
+        }
 
     @app.get("/v1/models")
     async def list_models(request: Request) -> dict:
@@ -145,12 +241,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "model": "model-id",
                 "task": "user task",
                 "auto_confirm": false,
+                "plan_mode": false,
                 "max_turns": 30,
-                "root": "/optional/project/root"
+                "root": "/optional/project/root",  // defaults to agent.root in config
+                "profile": "optional-profile-name" // must match the server's active profile
             }
 
         Returns a text/event-stream of JSON objects:
             {"type": "status", "message": "..."}
+            {"type": "plan", "content": "..."}
             {"type": "assistant", "content": "..."}
             {"type": "tool_call", "id": "...", "name": "...", "arguments": {...}}
             {"type": "tool_result", "id": "...", "name": "...", "content": "...", "error": false}
@@ -169,8 +268,24 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="'model' and 'task' are required")
 
         auto_confirm = bool(body.get("auto_confirm", False))
+        if auto_confirm:
+            await _require_admin(request)
+        plan_mode = bool(body.get("plan_mode", False))
         max_turns = int(body.get("max_turns", 30))
-        root = Path(body.get("root", ".")).resolve()
+        folder = body.get("folder") if body.get("folder") is not None else ""
+        root_path = body.get("root") or cfg.agent.root
+        root = Path(root_path).expanduser().resolve()
+        requested_profile = body.get("profile")
+        active_profile = cfg.agent.profile
+        if requested_profile is not None and requested_profile != active_profile:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Server is running profile {active_profile!r}; "
+                    f"requested profile {requested_profile!r} is not active. "
+                    "Start a server with the requested profile or omit the field."
+                ),
+            )
 
         run_id = str(uuid.uuid4())
         pending = request.app.state.pending_confirmations
@@ -178,14 +293,36 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         confirm_result: dict[str, bool] = {"approved": False}
         pending[run_id] = (confirm_event, confirm_result)
 
+        pending_plans = request.app.state.pending_plan_approvals
+        plan_event = asyncio.Event()
+        plan_result: dict[str, bool] = {"approved": False}
+        if plan_mode:
+            pending_plans[run_id] = (plan_event, plan_result)
+
         base_url = f"http://{cfg.server.host}:{cfg.server.port}"
         chat_store: ChatStore = request.app.state.chat_store
+        checkpoint_store: CheckpointStore = request.app.state.checkpoint_store
+        semantic_index: SemanticIndex = request.app.state.semantic_index
+
+        # Create a chat to hold the agent run transcript.
+        agent_chat_id: str | None = None
+        try:
+            title = task.strip().split("\n")[0][:80] or "Agent task"
+            agent_chat = chat_store.create(str(uuid.uuid4()), title, folder=folder)
+            agent_chat_id = agent_chat.id
+        except Exception as e:
+            log.warning("Could not create agent chat: %s", e)
 
         async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
             await confirm_event.wait()
             return confirm_result["approved"]
 
+        async def plan_callback(plan_text: str) -> bool:
+            await plan_event.wait()
+            return plan_result["approved"]
+
         async def event_stream() -> AsyncIterator[str]:
+            transcript: list[ChatMessage] = [ChatMessage(role="user", content=task)]
             try:
                 async for event in run_agent(
                     task=task,
@@ -194,14 +331,39 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     root=root,
                     auto_confirm=auto_confirm,
                     confirm_callback=confirm_callback,
+                    plan_mode=plan_mode,
+                    plan_callback=plan_callback,
+                    run_id=run_id,
+                    checkpoint_store=checkpoint_store,
                     max_turns=max_turns,
                     chat_store=chat_store,
+                    extra={"semantic_index": semantic_index},
                 ):
                     if event.get("type") == "confirm_required":
                         event = {**event, "run_id": run_id}
+                    if event.get("type") == "plan":
+                        event = {**event, "run_id": run_id}
+                    if event.get("type") == "checkpoint":
+                        event = {**event, "run_id": run_id}
                     yield f"data: {json.dumps(event)}\n\n"
+
+                    if event.get("type") == "assistant" and event.get("content"):
+                        transcript.append(ChatMessage(role="assistant", content=event["content"]))
+                    elif event.get("type") == "tool_result":
+                        label = event.get("name", "tool")
+                        content = event.get("content", "")
+                        transcript.append(ChatMessage(role="tool", content=f"{label}:\n{content}"))
             finally:
                 pending.pop(run_id, None)
+                pending_plans.pop(run_id, None)
+                if agent_chat_id is not None:
+                    try:
+                        chat = chat_store.get(agent_chat_id)
+                        if chat is not None:
+                            chat.messages.extend(transcript)
+                            chat_store.save(chat)
+                    except Exception as e:
+                        log.warning("Could not save agent transcript: %s", e)
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -211,7 +373,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         )
 
     @app.post("/v1/agent/{run_id}/confirm")
-    async def confirm_agent_run(run_id: str, request: Request) -> dict[str, bool]:
+    async def confirm_agent_run(
+        run_id: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, bool]:
         """Approve or deny a pending agent tool confirmation.
 
         Request body: {"approved": true|false}
@@ -230,23 +394,56 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         event.set()
         return {"ok": True}
 
+    @app.post("/v1/agent/{run_id}/plan")
+    async def approve_agent_plan(
+        run_id: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, bool]:
+        """Approve or deny the plan for a planning-mode agent run.
+
+        Request body: {"approved": true|false}
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+
+        entry = request.app.state.pending_plan_approvals.get(run_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Run not found or not awaiting plan approval")
+
+        event, result = entry
+        result["approved"] = bool(body.get("approved", False))
+        event.set()
+        return {"ok": True}
+
     # ------------------------------------------------------------------
     # Chat history persistence
     # ------------------------------------------------------------------
 
     @app.get("/v1/chats")
-    async def list_chats(request: Request) -> dict[str, Any]:
-        """Return a list of chat summaries ordered by most recently updated first."""
+    async def list_chats(request: Request, folder: str | None = Query(None)) -> dict[str, Any]:
+        """Return a list of chat summaries ordered by most recently updated first.
+
+        Pass ``?folder=...`` to filter; omit for all folders. Pass
+        ``?folder=`` for the root/legacy folder only.
+        """
         store: ChatStore = request.app.state.chat_store
-        chats = store.list_chats()
+        chats = store.list_chats(folder=folder)
         return {"object": "list", "data": [c.summary() for c in chats]}
+
+    @app.get("/v1/chats/folders")
+    async def list_chat_folders(request: Request) -> dict[str, Any]:
+        """Return all folders with chat counts."""
+        store: ChatStore = request.app.state.chat_store
+        return {"object": "list", "data": store.list_folders()}
 
     @app.post("/v1/chats")
     async def create_chat(request: Request) -> dict[str, Any]:
         """Create a new chat.
 
-        Body: {"id": "optional-id", "title": "optional title"}
-        If no id is provided a UUID is generated.
+        Body: {"id": "optional-id", "title": "optional title", "folder": "optional folder"}
+        If no id is provided a UUID is generated. If no folder is provided,
+        the chat is placed in the ``default`` folder.
         """
         try:
             body = await request.json()
@@ -255,12 +452,72 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
         chat_id = body.get("id") or str(uuid.uuid4())
         title = body.get("title") or "Untitled chat"
+        folder = body.get("folder") if body.get("folder") is not None else ""
         store: ChatStore = request.app.state.chat_store
         try:
-            chat = store.create(chat_id, title)
+            chat = store.create(chat_id, title, folder=folder)
         except FileExistsError:
             raise HTTPException(status_code=409, detail=f"Chat already exists: {chat_id}") from None
         return chat.to_dict()
+
+    @app.post("/v1/chats/search")
+    async def search_chats(request: Request) -> dict[str, Any]:
+        """Search chat titles and messages.
+
+        Body: {"query": "string", "limit": 20}
+        Returns matching chats with the indices of matching messages.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        query = body.get("query", "")
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        limit = int(body.get("limit", 20))
+        store: ChatStore = request.app.state.chat_store
+        results = store.search(query, limit=limit)
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "chat": chat.summary(),
+                    "matching_message_indices": indices,
+                }
+                for chat, indices in results
+            ],
+        }
+
+    @app.get("/v1/chats/export")
+    async def export_chats(request: Request) -> dict[str, Any]:
+        """Export every chat as a portable JSON document."""
+        store: ChatStore = request.app.state.chat_store
+        return {"version": 1, "exported_at": time.time(), "chats": store.export_all()}
+
+    @app.post("/v1/chats/import")
+    async def import_chats(request: Request) -> dict[str, Any]:
+        """Import chats from an export document.
+
+        Body: {"chats": [...], "overwrite": false}
+        Existing chats are skipped unless ``overwrite`` is true.
+        """
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        chats = body.get("chats")
+        if not isinstance(chats, list):
+            raise HTTPException(status_code=400, detail="'chats' must be an array")
+        store: ChatStore = request.app.state.chat_store
+        result = store.import_chats(chats, overwrite=bool(body.get("overwrite", False)))
+        return {
+            "imported": result["imported"],
+            "skipped": result["skipped"],
+            "errors": result["errors"],
+            "error_details": result["error_details"],
+        }
 
     @app.get("/v1/chats/{chat_id}")
     async def get_chat(chat_id: str, request: Request) -> dict[str, Any]:
@@ -293,11 +550,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.patch("/v1/chats/{chat_id}")
     async def patch_chat(chat_id: str, request: Request) -> dict[str, Any]:
-        """Append messages or update a chat's title without replacing everything.
+        """Append messages or update a chat's title/folder without replacing everything.
 
         Body:
             {
                 "title": "new title",          // optional
+                "folder": "new folder",        // optional; moves the chat
                 "messages": [                  // optional; appended to existing
                     {"role": "user", "content": "..."},
                     ...
@@ -318,6 +576,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
         if "title" in body:
             chat.title = str(body["title"])
+        if "folder" in body and body["folder"] is not None:
+            chat.folder = str(body["folder"])
         if "messages" in body and isinstance(body["messages"], list):
             for m in body["messages"]:
                 chat.messages.append(ChatMessage.from_dict(m))
@@ -332,56 +592,35 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Chat not found")
         return {"deleted": True}
 
-    @app.post("/v1/chats/search")
-    async def search_chats(request: Request) -> dict[str, Any]:
-        """Search chat titles and messages.
-
-        Body: {"query": "string", "limit": 20}
-        Returns matching chats with the indices of matching messages.
-        """
-        try:
-            body = await request.json()
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
-        query = body.get("query", "")
-        if not query:
-            raise HTTPException(status_code=400, detail="query is required")
-        limit = int(body.get("limit", 20))
-        store: ChatStore = request.app.state.chat_store
-        results = store.search(query, limit=limit)
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "chat": chat.summary(),
-                    "matching_message_indices": indices,
-                }
-                for chat, indices in results
-            ],
-        }
-
     # ------------------------------------------------------------------
     # Admin (used by the web UI / TUI)
     # ------------------------------------------------------------------
 
     @app.get("/admin/status")
-    async def admin_status(request: Request) -> dict:
+    async def admin_status(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         rt: Router = request.app.state.router
         c: Config = request.app.state.cfg
         models = []
         for m in rt.all_models():
             srv = rt._servers.get(m.name)
             r = m.recipe or {}
+            running = bool(srv and srv.is_running)
             models.append({
                 "name": m.name,
                 "display_name": m.display_name,
                 "path": m.path,
                 "gpu_pci_slot": m.gpu_pci_slot,
                 "port": m.port,
-                "loaded": bool(srv and srv.is_running),
+                "loaded": running,
+                "pid": getattr(getattr(srv, "process", None), "pid", None) if running else None,
                 "ctx": r.get("ctx"),
                 "cache_type_k": r.get("cache_type_k"),
                 "cache_type_v": r.get("cache_type_v"),
+                "flash_attn": r.get("flash_attn"),
+                "ubatch_size": r.get("ubatch_size"),
+                "batch_size": r.get("batch_size"),
                 "kv_class": m.kv_class,
                 "aliases": list(m.aliases),
             })
@@ -406,7 +645,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         }
 
     @app.post("/admin/load/{name}")
-    async def admin_load(name: str, request: Request) -> dict:
+    async def admin_load(
+        name: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
         if mgr.find_model(name) is not None:
@@ -420,7 +661,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         return {"name": model.name, "loaded": srv.is_running}
 
     @app.post("/admin/stop/{name}")
-    async def admin_stop(name: str, request: Request) -> dict:
+    async def admin_stop(
+        name: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
         if mgr.find_model(name) is not None:
@@ -431,13 +674,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         return {"name": name, "was_running": was_running, "loaded": False}
 
     @app.post("/admin/stop-all")
-    async def admin_stop_all(request: Request) -> dict:
+    async def admin_stop_all(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         rt: Router = request.app.state.router
         stopped = await rt.stop_all()
         return {"stopped": stopped}
 
     @app.post("/admin/parse-pdf")
-    async def admin_parse_pdf(file: UploadFile) -> dict:
+    async def admin_parse_pdf(
+        request: Request,
+        file: UploadFile,
+        _auth: None = Depends(_require_admin),
+    ) -> dict:
         """Extract text from an uploaded PDF using pypdf.
 
         Returns the original filename and the concatenated text of all pages.
@@ -471,17 +720,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         return {"filename": file.filename, "text": text}
 
     @app.post("/admin/models/{name}/edit")
-    async def admin_edit_model(name: str, request: Request) -> dict:
+    async def admin_edit_model(
+        name: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         """Update a model's recipe in-place.
 
         Body is a partial recipe dict — only provided fields change. Recognised
         fields: `ctx`, `cache_type_k`, `cache_type_v`, `parallel`, `kv_class`,
-        `spec_type`, `ubatch_size`.
+        `spec_type`, `ubatch_size`, `batch_size`, `flash_attn` (null clears).
         If the model is currently loaded, the server is stopped first; callers
         decide whether to reload it afterwards via /admin/load.
         """
         from arc_llama.config import default_config_path
-        from arc_llama.recipes import KVCacheType
+        from arc_llama.recipes import FLASH_ATTN_VALUES, KVCacheType
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
@@ -497,7 +748,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if model is None:
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
         valid_kv = {kv.value for kv in KVCacheType}
-        valid_classes = {"default", "moe_a3b", "qwen3_27b_dense", "gemma_swa"}
+        valid_classes = {
+            "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
+            "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
+        }
         recipe = dict(model.recipe or {})
         changed: list[str] = []
         if "ctx" in body:
@@ -550,6 +804,27 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 raise HTTPException(status_code=400, detail="ubatch_size must be 1..4096")
             recipe["ubatch_size"] = ub
             changed.append("ubatch_size")
+        if "batch_size" in body:
+            try:
+                b = int(body["batch_size"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="batch_size must be an integer") from None
+            if not (1 <= b <= 8192):
+                raise HTTPException(status_code=400, detail="batch_size must be 1..8192")
+            recipe["batch_size"] = b
+            changed.append("batch_size")
+        if "flash_attn" in body:
+            v = body["flash_attn"]
+            if v is None:
+                recipe.pop("flash_attn", None)
+            elif str(v) in FLASH_ATTN_VALUES:
+                recipe["flash_attn"] = str(v)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"flash_attn must be one of {list(FLASH_ATTN_VALUES)} or null",
+                )
+            changed.append("flash_attn")
         if not changed:
             raise HTTPException(status_code=400, detail="no recognised fields to edit")
         model.recipe = recipe
@@ -568,7 +843,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         }
 
     @app.post("/admin/scan")
-    async def admin_scan(request: Request) -> dict:
+    async def admin_scan(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict:
         """Re-walk scan paths for new GGUFs and auto-register them.
 
         Mutates the in-memory Config and persists it to disk so subsequent

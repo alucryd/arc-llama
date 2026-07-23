@@ -1,7 +1,7 @@
 """Tests for arc_llama.benchmark — measurement, formatting, sweep."""
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from arc_llama.benchmark import (
     _fmt_speed,
     _fmt_time,
     _fmt_vram,
+    _read_pid_vram_mb,
     _read_vram_total,
     _read_vram_used,
     benchmark_model,
@@ -55,10 +56,35 @@ class TestVramHelpers:
         (d / "mem_info_vram_total").write_text("25769803776\n")
         assert _read_vram_total(tmp_path) == 24576  # 24 GiB
 
+    def test_read_vram_total_xe_layout(self, tmp_path: Path):
+        # Intel xe driver: total is per-tile, no amdgpu-style attrs.
+        tile = tmp_path / "device" / "tile0"
+        tile.mkdir(parents=True)
+        (tile / "physical_vram_size_bytes").write_text("25769803776\n")
+        assert _read_vram_total(tmp_path) == 24576
+
+    def test_read_vram_total_i915_layout(self, tmp_path: Path):
+        d = tmp_path / "device"
+        d.mkdir()
+        (d / "lmem_total_bytes").write_text("17179869184\n")
+        assert _read_vram_total(tmp_path) == 16384
+
+    def test_read_vram_used_absent_on_intel(self, tmp_path: Path):
+        # xe/i915 expose no global used counter — must return None, not 0.
+        tile = tmp_path / "device" / "tile0"
+        tile.mkdir(parents=True)
+        (tile / "physical_vram_size_bytes").write_text("25769803776\n")
+        assert _read_vram_used(tmp_path) is None
+
     def test_find_drm_card_no_sys(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr("arc_llama.benchmark.Path", lambda p: tmp_path / p)
         assert _find_drm_card("0000:03:00.0") is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="fakes a Linux /sys/bus/pci/devices/<slot> path; colon in the "
+        "slot name is illegal on Windows and there's no sysfs to fake there",
+    )
     def test_find_drm_card_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         drm = tmp_path / "sys" / "class" / "drm"
         card = drm / "card1"
@@ -72,6 +98,59 @@ class TestVramHelpers:
         found = _find_drm_card("0000:03:00.0")
         assert found is not None
         assert found.name == "card1"
+
+
+class TestPidVram:
+    def _fdinfo(self, tmp_path: Path, pid: int, files: dict[str, str]) -> Path:
+        d = tmp_path / str(pid) / "fdinfo"
+        d.mkdir(parents=True)
+        for name, content in files.items():
+            (d / name).write_text(content)
+        return tmp_path
+
+    def test_xe_fdinfo(self, tmp_path: Path):
+        proc = self._fdinfo(tmp_path, 42, {
+            "5": (
+                "drm-driver:\txe\n"
+                "drm-client-id:\t7\n"
+                "drm-total-vram0:\t8192 MiB\n"
+                "drm-resident-vram0:\t6144 MiB\n"
+            ),
+        })
+        assert _read_pid_vram_mb(42, proc_root=proc) == 6144
+
+    def test_i915_fdinfo_total_fallback(self, tmp_path: Path):
+        proc = self._fdinfo(tmp_path, 42, {
+            "5": (
+                "drm-driver:\ti915\n"
+                "drm-client-id:\t3\n"
+                "drm-total-local0:\t4194304 KiB\n"
+            ),
+        })
+        assert _read_pid_vram_mb(42, proc_root=proc) == 4096
+
+    def test_duplicate_clients_counted_once(self, tmp_path: Path):
+        fd = (
+            "drm-driver:\txe\n"
+            "drm-client-id:\t7\n"
+            "drm-resident-vram0:\t1024 MiB\n"
+        )
+        proc = self._fdinfo(tmp_path, 42, {"5": fd, "6": fd, "7": fd})
+        assert _read_pid_vram_mb(42, proc_root=proc) == 1024
+
+    def test_distinct_clients_summed(self, tmp_path: Path):
+        proc = self._fdinfo(tmp_path, 42, {
+            "5": "drm-client-id:\t1\ndrm-resident-vram0:\t1024 MiB\n",
+            "6": "drm-client-id:\t2\ndrm-resident-vram0:\t512 MiB\n",
+        })
+        assert _read_pid_vram_mb(42, proc_root=proc) == 1536
+
+    def test_no_drm_fds(self, tmp_path: Path):
+        proc = self._fdinfo(tmp_path, 42, {"0": "pos:\t0\nflags:\t0100002\n"})
+        assert _read_pid_vram_mb(42, proc_root=proc) is None
+
+    def test_missing_pid(self, tmp_path: Path):
+        assert _read_pid_vram_mb(99999, proc_root=tmp_path) is None
 
 
 class TestBenchmarkResult:
@@ -126,6 +205,10 @@ class FakeHttpxResponse:
     def json(self):
         return self._json or {}
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 class FakeStreamContext:
     """Async context manager that yields a fake streamed response."""
@@ -167,6 +250,17 @@ class FakeHttpxClient:
         if path.startswith("/admin/models/") and "/edit" in path:
             status = 200 if self._edit_ok else 400
             return FakeHttpxResponse(status_code=status, json_data={"changed": ["ctx"]})
+        if "/v1/chat/completions" in path:
+            # Mimic a llama-server response with a timings block so the
+            # benchmark reads engine-measured tok/s (not client wall time).
+            return FakeHttpxResponse(200, json_data={
+                "choices": [{"message": {"content": "Hello there world!"},
+                             "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 512, "completion_tokens": 256,
+                          "total_tokens": 768},
+                "timings": {"prompt_per_second": 4000.0, "prompt_ms": 128.0,
+                            "predicted_per_second": 40.0, "predicted_ms": 6400.0},
+            })
         return FakeHttpxResponse(200)
 
     def stream(self, method: str, path: str, **kwargs):
@@ -179,9 +273,9 @@ class FakeHttpxClient:
 
 @pytest.fixture
 def sample_cfg_with_model():
-    from arc_llama.config import Config, GPUConfig, ModelConfig
+    from arc_llama.config import Config, GPUConfig, ModelConfig, ServerConfig
     return Config(
-        server=type("S", (), {"host": "127.0.0.1", "port": 11437, "single_resident": True})(),
+        server=ServerConfig(host="127.0.0.1", port=11437, single_resident=True),
         paths=type("P", (), {"llama_server": "/bin/llama-server"})(),
         gpus=[
             GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24 * 1024),

@@ -8,18 +8,16 @@ benchmark inherits the correct SYCL env, arch profile, and router policy.
 """
 from __future__ import annotations
 
-import json
 import logging
-import statistics
+import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from arc_llama.config import Config, ModelConfig, load_config
-from arc_llama.recipes import KVCacheType, default_recipe, suggest_ctx
+from arc_llama.config import Config, load_config
 
 log = logging.getLogger("arc_llama.benchmark")
 
@@ -86,20 +84,94 @@ def _find_drm_card(pci_slot: str) -> Path | None:
     return None
 
 
-def _read_vram_used(card_path: Path) -> int | None:
+def _read_int(p: Path) -> int | None:
     try:
-        p = card_path / "device" / "mem_info_vram_used"
-        return int(p.read_text().strip()) // (1024 * 1024)
+        return int(p.read_text().strip())
     except (OSError, ValueError):
         return None
+
+
+def _read_vram_used(card_path: Path) -> int | None:
+    """Card-global VRAM usage in MiB.
+
+    Only amdgpu exposes this; Intel's xe/i915 don't have a global counter, so
+    on Arc this returns None and callers fall back to per-process fdinfo
+    accounting (`_read_pid_vram_mb`).
+    """
+    v = _read_int(card_path / "device" / "mem_info_vram_used")
+    return None if v is None else v // (1024 * 1024)
 
 
 def _read_vram_total(card_path: Path) -> int | None:
+    """Total VRAM in MiB, trying amdgpu, xe, and i915 sysfs layouts in turn."""
+    device = card_path / "device"
+    candidates = [
+        device / "mem_info_vram_total",                  # amdgpu
+        device / "tile0" / "physical_vram_size_bytes",   # xe (Battlemage, DG2 on xe)
+        device / "lmem_total_bytes",                     # i915 dGPU
+        card_path / "lmem_total_bytes",                  # i915 (older layout)
+    ]
+    for c in candidates:
+        v = _read_int(c)
+        if v:
+            return v // (1024 * 1024)
+    return None
+
+
+# DRM fdinfo memory-region keys, per kernel driver:
+#   xe:     drm-resident-vram0 / drm-total-vram0
+#   i915:   drm-resident-local0 / drm-total-local0
+#   amdgpu: drm-memory-vram (legacy spelling of drm-total-vram)
+_FDINFO_VRAM_RE = re.compile(
+    r"^drm-(?P<kind>resident|total|memory)-(?:vram|local)\d*:\s*(?P<num>\d+)\s*(?P<unit>[KMG]iB)?",
+)
+_FDINFO_UNIT = {None: 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+
+
+def _read_pid_vram_mb(pid: int, proc_root: Path = Path("/proc")) -> int | None:
+    """VRAM held by one process in MiB, from DRM fdinfo.
+
+    A process usually has several fds open on the same DRM client (device node
+    dup'd by the driver stack); fdinfo repeats identical stats for each, so we
+    de-duplicate by `drm-client-id` before summing. Resident is preferred over
+    total when the driver reports both.
+    """
+    fdinfo_dir = proc_root / str(pid) / "fdinfo"
     try:
-        p = card_path / "device" / "mem_info_vram_total"
-        return int(p.read_text().strip()) // (1024 * 1024)
-    except (OSError, ValueError):
+        entries = list(fdinfo_dir.iterdir())
+    except OSError:
         return None
+    per_client: dict[str, dict[str, int]] = {}
+    anon = 0
+    for entry in entries:
+        try:
+            text = entry.read_text()
+        except OSError:
+            continue
+        if "drm-client-id" not in text and "drm-" not in text:
+            continue
+        client_id: str | None = None
+        sums = {"resident": 0, "total": 0}
+        for line in text.splitlines():
+            if line.startswith("drm-client-id:"):
+                client_id = line.split(":", 1)[1].strip()
+                continue
+            m = _FDINFO_VRAM_RE.match(line)
+            if m:
+                kind = "total" if m.group("kind") == "memory" else m.group("kind")
+                sums[kind] += int(m.group("num")) * _FDINFO_UNIT[m.group("unit")]
+        if sums["resident"] == 0 and sums["total"] == 0:
+            continue
+        if client_id is None:
+            client_id = f"_anon{anon}"
+            anon += 1
+        per_client[client_id] = sums
+    if not per_client:
+        return None
+    total_bytes = sum(
+        s["resident"] if s["resident"] > 0 else s["total"] for s in per_client.values()
+    )
+    return total_bytes // (1024 * 1024)
 
 
 # ------------------------------------------------------------------
@@ -123,32 +195,41 @@ def _build_prompt(target_tokens: int) -> str:
 # Core measurement
 # ------------------------------------------------------------------
 
-async def _measure_once(
+async def _complete(
     client: httpx.AsyncClient,
     model: str,
     prompt: str,
     max_tokens: int,
-) -> tuple[float, float]:
-    """Send one completion and return (time_to_first_token_s, total_time_s).
+    ignore_eos: bool = False,
+    cache_prompt: bool = True,
+) -> tuple[float, dict[str, Any]]:
+    """Send one non-streamed completion. Returns (wall_seconds, response_json).
 
-    For generation measurement we use stream=True and time the arrival
-    of the first chunk (TFT) and the final chunk (total).
+    Non-streamed on purpose: llama-server reports an exact ``timings`` block
+    (prompt/predicted tok/s measured inside the engine), which is far more
+    reliable than timing SSE chunks from the client -- llama.cpp batches
+    several tokens per chunk, so client-side inter-token timing overstates
+    the rate. We keep the wall time only as a fallback for non-llama.cpp
+    upstreams that omit ``timings``.
+
+    ``cache_prompt=False`` forces a full re-prefill each call; prompt-eval
+    needs it so repeated runs measure real prefill instead of a cache hit.
     """
-    body = {
+    body: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "stream": True,
+        "stream": False,
     }
+    if ignore_eos:
+        body["ignore_eos"] = True
+    if not cache_prompt:
+        body["cache_prompt"] = False
     t0 = time.perf_counter()
-    first_chunk_at: float | None = None
-    async with client.stream("POST", "/v1/chat/completions", json=body) as resp:
-        async for _chunk in resp.aiter_text():
-            if first_chunk_at is None:
-                first_chunk_at = time.perf_counter()
-    t1 = time.perf_counter()
-    tft = first_chunk_at if first_chunk_at is not None else t1
-    return tft - t0, t1 - t0
+    resp = await client.post("/v1/chat/completions", json=body)
+    wall = time.perf_counter() - t0
+    resp.raise_for_status()
+    return wall, resp.json()
 
 
 async def _measure_prompt_eval(
@@ -157,18 +238,28 @@ async def _measure_prompt_eval(
     prompt_tokens: int,
     repeats: int = REPEAT_PROMPT_EVAL,
 ) -> tuple[float, float]:
-    """Return (tok/s, elapsed_ms) averaged over *repeats* runs.
+    """Return (prompt-eval tok/s, elapsed_ms) for the best of *repeats* runs.
 
-    We use max_tokens=1 so almost all time is prompt eval.
+    Prefers llama-server's ``timings.prompt_per_second``; falls back to
+    ``prompt_tokens / wall`` (with max_tokens=1) for upstreams without it.
     """
     prompt = _build_prompt(prompt_tokens)
-    times: list[float] = []
+    best_tok_s = 0.0
+    best_ms = 0.0
     for _ in range(repeats):
-        _, total = await _measure_once(client, model, prompt, max_tokens=1)
-        times.append(total)
-    best = min(times)  # use best-of-N to discard scheduler jitter
-    tok_s = prompt_tokens / best if best > 0 else 0.0
-    return tok_s, best * 1000
+        # cache_prompt=False so every run does a real full prefill.
+        wall, obj = await _complete(client, model, prompt, max_tokens=1, cache_prompt=False)
+        t = obj.get("timings") or {}
+        if t.get("prompt_per_second"):
+            tok_s = float(t["prompt_per_second"])
+            ms = float(t.get("prompt_ms", wall * 1000))
+        else:
+            tok_s = prompt_tokens / wall if wall > 0 else 0.0
+            ms = wall * 1000
+        if tok_s > best_tok_s:  # best-of-N discards scheduler jitter
+            best_tok_s = tok_s
+            best_ms = ms
+    return best_tok_s, best_ms
 
 
 async def _measure_generation(
@@ -177,18 +268,32 @@ async def _measure_generation(
     gen_tokens: int,
     repeats: int = REPEAT_GENERATION,
 ) -> tuple[float, float]:
-    """Return (tok/s, elapsed_ms) averaged over *repeats* runs.
+    """Return (generation tok/s, elapsed_ms) for the best of *repeats* runs.
 
-    We use a very short prompt so generation dominates.
+    ``ignore_eos`` forces the model to emit the full ``gen_tokens`` instead
+    of stopping early on a short reply. Prefers llama-server's
+    ``timings.predicted_per_second`` (pure decode rate, excludes prefill);
+    falls back to ``completion_tokens / wall`` for upstreams without timings.
     """
     prompt = "Hello"
-    times: list[float] = []
+    best_tok_s = 0.0
+    best_ms = 0.0
     for _ in range(repeats):
-        _, total = await _measure_once(client, model, prompt, max_tokens=gen_tokens)
-        times.append(total)
-    best = min(times)
-    tok_s = gen_tokens / best if best > 0 else 0.0
-    return tok_s, best * 1000
+        wall, obj = await _complete(
+            client, model, prompt, max_tokens=gen_tokens, ignore_eos=True
+        )
+        t = obj.get("timings") or {}
+        if t.get("predicted_per_second"):
+            tok_s = float(t["predicted_per_second"])
+            ms = float(t.get("predicted_ms", wall * 1000))
+        else:
+            n = (obj.get("usage") or {}).get("completion_tokens") or 0
+            tok_s = n / wall if wall > 0 and n else 0.0
+            ms = wall * 1000
+        if tok_s > best_tok_s:  # best-of-N discards scheduler jitter
+            best_tok_s = tok_s
+            best_ms = ms
+    return best_tok_s, best_ms
 
 
 async def _warmup(
@@ -201,7 +306,7 @@ async def _warmup(
     t0 = time.perf_counter()
     prompt = _build_prompt(prompt_tokens)
     try:
-        await _measure_once(client, model, prompt, max_tokens=gen_tokens)
+        await _complete(client, model, prompt, max_tokens=gen_tokens)
     except Exception as e:
         log.warning("warmup failed: %s", e)
     return time.perf_counter() - t0
@@ -255,9 +360,12 @@ async def benchmark_model(
     card_path = _find_drm_card(model.gpu_pci_slot) if gpu else None
     vram_before = _read_vram_used(card_path) if card_path else None
     vram_total = _read_vram_total(card_path) if card_path else None
+    if vram_total is None and gpu is not None:
+        vram_total = gpu.vram_mb  # detected at init time; good enough for %
     result.vram_total_mb = vram_total
 
-    async with httpx.AsyncClient(base_url=server_url, timeout=300.0) as client:
+    headers = {"Authorization": f"Bearer {cfg.server.admin_token}"} if cfg.server.admin_token else {}
+    async with httpx.AsyncClient(base_url=server_url, timeout=300.0, headers=headers) as client:
         # Ensure model is loaded
         if load:
             log.info("loading %s ...", model_name)
@@ -282,14 +390,38 @@ async def benchmark_model(
             client, model_name, gen_tokens
         )
 
-        # VRAM after
+        # VRAM after. amdgpu has a card-global counter; on Intel (xe/i915)
+        # there is none, so fall back to the backend process's DRM fdinfo.
         vram_after = _read_vram_used(card_path) if card_path else None
         if vram_before is not None and vram_after is not None:
             result.vram_used_mb = vram_after - vram_before
         elif vram_after is not None:
             result.vram_used_mb = vram_after
+        else:
+            pid = await _backend_pid(client, model.name)
+            if pid is not None:
+                result.vram_used_mb = _read_pid_vram_mb(pid)
 
     return result
+
+
+async def _backend_pid(client: httpx.AsyncClient, model_name: str) -> int | None:
+    """Ask the running arc-llama serve for the llama-server pid of a model.
+
+    Purely best-effort (feeds the VRAM readout, never the measurements), so
+    any failure — including a client without /admin/status — returns None.
+    """
+    try:
+        r = await client.get("/admin/status")
+        if r.status_code != 200:
+            return None
+        for m in r.json().get("models", []):
+            if m.get("name") == model_name:
+                pid = m.get("pid")
+                return int(pid) if pid else None
+    except Exception:
+        return None
+    return None
 
 
 # ------------------------------------------------------------------
@@ -325,7 +457,8 @@ async def benchmark_sweep(
     original_recipe = dict(model.recipe or {})
     results: list[BenchmarkResult] = []
 
-    async with httpx.AsyncClient(base_url=server_url, timeout=300.0) as client:
+    headers = {"Authorization": f"Bearer {cfg.server.admin_token}"} if cfg.server.admin_token else {}
+    async with httpx.AsyncClient(base_url=server_url, timeout=300.0, headers=headers) as client:
         for ctx in ctx_values:
             for kv in kv_types:
                 # Apply config
@@ -393,19 +526,22 @@ def _fmt_vram(used_mb: int | None, total_mb: int | None) -> str:
 
 def print_result(result: BenchmarkResult) -> None:
     """Pretty-print a single BenchmarkResult to the console."""
+    from rich.console import Console
+
+    console = Console()
     if result.error:
-        print(f"\n[red]Benchmark failed for {result.model}: {result.error}[/red]")
+        console.print(f"\n[red]Benchmark failed for {result.model}: {result.error}[/red]")
         return
 
-    print(f"\n[bold]Benchmark: {result.model}[/bold]")
-    print(f"  Recipe:   ctx={result.ctx}, KV={result.cache_type_k}/{result.cache_type_v}")
-    print(f"  Prompt:   {result.prompt_tokens} tokens")
-    print(f"  Generate: {result.gen_tokens} tokens")
+    console.print(f"\n[bold]Benchmark: {result.model}[/bold]")
+    console.print(f"  Recipe:   ctx={result.ctx}, KV={result.cache_type_k}/{result.cache_type_v}")
+    console.print(f"  Prompt:   {result.prompt_tokens} tokens")
+    console.print(f"  Generate: {result.gen_tokens} tokens")
     if result.jit_warmup_s is not None:
-        print(f"  Warm-up:  {result.jit_warmup_s:.1f}s (SYCL JIT)")
-    print(f"  Prompt-eval:  {_fmt_speed(result.prompt_eval_tok_s)}  |  {_fmt_time(result.prompt_eval_ms)}")
-    print(f"  Generation:   {_fmt_speed(result.generation_tok_s)}  |  {_fmt_time(result.generation_ms)}")
-    print(f"  VRAM:         {_fmt_vram(result.vram_used_mb, result.vram_total_mb)}")
+        console.print(f"  Warm-up:  {result.jit_warmup_s:.1f}s (SYCL JIT)")
+    console.print(f"  Prompt-eval:  {_fmt_speed(result.prompt_eval_tok_s)}  |  {_fmt_time(result.prompt_eval_ms)}")
+    console.print(f"  Generation:   {_fmt_speed(result.generation_tok_s)}  |  {_fmt_time(result.generation_ms)}")
+    console.print(f"  VRAM:         {_fmt_vram(result.vram_used_mb, result.vram_total_mb)}")
 
 
 def print_sweep_table(results: list[BenchmarkResult]) -> None:

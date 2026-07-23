@@ -9,26 +9,45 @@ Top-level commands:
   arc-llama add        Register a model — local file or HF download.
   arc-llama remove     Remove a model from the config.
   arc-llama serve      Run the OpenAI-compatible router.
-  arc-llama tui        Launch the terminal UI.
+  arc-llama benchmark  Measure prompt-eval / generation tok/s for a model.
+  arc-llama tune       Staged greedy autotune; persist the winning recipe.
+  arc-llama tui        Launch the server management TUI.
   arc-llama systemd    Print a systemd --user service unit for `arc-llama serve`.
+
+The agent/coding-assistant commands (`agent`, `code`, `agent-tui`) are
+experimental and only appear when ARC_LLAMA_EXPERIMENTAL_AGENT=1 is set.
 
 A small static web UI is bundled and served at `/` on the same port as
 `arc-llama serve` — open it in a browser for a model-picker + load/stop view.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import platform
 import shutil
-import subprocess
 import sys
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import click
+import httpx
 from rich.console import Console
 from rich.table import Table
 
 from arc_llama import __version__
+from arc_llama import benchmark as benchmark_mod
+from arc_llama.agent import run_agent
+from arc_llama.agent.checkpoints import CheckpointStore
+from arc_llama.agent.interactive import InteractiveAgent
+from arc_llama.agent.mcp_client import MCPClientManager
+from arc_llama.agent_tui import run_agent_tui
+from arc_llama.arch import Arch, Backend, aot_arch_for
+from arc_llama.binary import detect_backends, detect_llama_server_backend
+from arc_llama.chat_store import ChatMessage, ChatStore
 from arc_llama.config import (
     Config,
     default_config_path,
@@ -43,16 +62,53 @@ from arc_llama.models import (
     parse_hf_spec,
     register_discovered,
 )
+from arc_llama.platform_checks import (
+    DoctorReport,
+    format_bytes,
+    kernel_module_loaded,
+    level_zero_loader_present,
+    max_memory_bar_bytes,
+    oneapi_setvars_path,
+    parse_kernel_version,
+    rebar_likely_enabled,
+    user_in_groups,
+)
+from arc_llama.skills import load_skills
 
 console = Console()
+
+_IS_WINDOWS = sys.platform == "win32"
+
+
+class _JsonFormatter(logging.Formatter):
+    """Emit log records as single-line JSON objects."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        obj = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            obj["exception"] = self.formatException(record.exc_info)
+        return json.dumps(obj, default=str)
 
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    if os.environ.get("ARC_LLAMA_LOG_JSON"):
+        handler = logging.StreamHandler()
+        handler.setFormatter(_JsonFormatter())
+        root = logging.getLogger()
+        root.setLevel(level)
+        root.handlers.clear()
+        root.addHandler(handler)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
 
 def _save_or_die(cfg: Config, path: Path) -> None:
@@ -64,11 +120,14 @@ def _save_or_die(cfg: Config, path: Path) -> None:
 
 
 def _resolve_llama_server(explicit: str | None) -> str:
-    """Find a usable llama-server binary, in order of preference."""
-    candidates: list[str] = []
+    """Find a usable llama-server binary, in order of preference.
+
+    If the user explicitly passed a path, preserve it even when it does not
+    exist so the caller can report the exact location in an error.
+    """
     if explicit:
-        candidates.append(explicit)
-    candidates += [
+        return explicit
+    candidates = [
         os.environ.get("ARC_LLAMA_SERVER", ""),
         shutil.which("llama-server") or "",
         "/usr/local/bin/llama-server",
@@ -110,7 +169,7 @@ def cli(ctx: click.Context, verbose: bool, config_path: Path | None) -> None:
     "--llama-server",
     type=click.Path(),
     default=None,
-    help="Path to your built llama-server binary (SYCL backend).",
+    help="Path to your built llama-server binary (SYCL or Vulkan backend).",
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing config.")
 @click.option(
@@ -137,21 +196,42 @@ def init(
         sys.exit(1)
     gpus = detect_gpus()
     if not gpus:
-        console.print("[red]No Intel GPUs detected.[/red]")
-        console.print("Run [bold]arc-llama doctor[/bold] for a diagnosis.")
+        if _IS_WINDOWS:
+            console.print(
+                "[yellow]No Intel GPUs detected — Windows auto-detection is not "
+                "supported yet. Create a config manually or run this on WSL.[/yellow]"
+            )
+        else:
+            console.print("[red]No Intel GPUs detected.[/red]")
+            console.print("Run [bold]arc-llama doctor[/bold] for a diagnosis.")
         sys.exit(2)
     server_path = _resolve_llama_server(llama_server)
+    server_bin = Path(server_path).expanduser()
+    if not server_bin.exists():
+        console.print(
+            f"[red]llama-server binary not found: {server_path}[/red]"
+        )
+        if llama_server is None:
+            console.print(
+                "Pass --llama-server /path/to/llama-server or ensure it is on PATH."
+            )
+        sys.exit(3)
+    bin_backend = detect_llama_server_backend(server_bin)
+    if bin_backend is None:
+        console.print(
+            f"[yellow]Could not determine backend of {server_bin}; "
+            f"ensure it supports the GPUs you configured.[/yellow]"
+        )
+    else:
+        console.print(
+            f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
+        )
     cfg = init_config_from_detection(gpus, llama_server_path=server_path)
     if scan_paths:
         cfg.paths.scan_paths = list(scan_paths)
     _save_or_die(cfg, config_path)
     console.print(f"[green]Wrote config to {config_path}[/green]")
     _print_gpu_table(gpus)
-    if cfg.paths.llama_server == "llama-server":
-        console.print(
-            "[yellow]llama-server binary not found; set 'paths.llama_server' "
-            "in the config or pass --llama-server.[/yellow]"
-        )
     if scan:
         added = _do_scan(cfg, [Path(p) for p in scan_paths])
         if added:
@@ -171,19 +251,59 @@ def init(
 # doctor
 # ===========================================================================
 
+def _doctor_marker(ok: bool | None, severity: str = "info") -> str:
+    if ok is True:
+        return "[green]ok[/green]"
+    if ok is None:
+        return "[dim]?[/dim]"
+    if severity == "fail":
+        return "[red]FAIL[/red]"
+    return "[yellow]warn[/yellow]"
+
+
 @cli.command()
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
-    """Diagnose the local environment."""
+    """Diagnose the local environment for competitive Arc inference."""
     config_path: Path = ctx.obj["config_path"]
     console.print("[bold]arc-llama doctor[/bold]\n")
+    report = DoctorReport()
 
-    # Kernel + driver
-    console.print(f"  kernel:        {os.uname().release}")
-    has_xe = Path("/sys/module/xe").exists()
-    has_i915 = Path("/sys/module/i915").exists()
-    console.print(f"  xe driver:     {'loaded' if has_xe else 'not loaded'}")
-    console.print(f"  i915 driver:   {'loaded' if has_i915 else 'not loaded'}")
+    cfg: Config | None = None
+    if config_path.exists():
+        try:
+            cfg = load_config(config_path)
+        except Exception:
+            console.print("[yellow]  warning: could not read config[/yellow]")
+
+    # Kernel + driver (Linux-only diagnostics)
+    if _IS_WINDOWS:
+        console.print(f"  platform:      Windows {platform.release()}")
+        console.print(
+            "  [dim]Kernel/driver checks are not available on Windows.[/dim]"
+        )
+    else:
+        uname = platform.uname()
+        console.print(f"  kernel:        {uname.release}")
+        kv = parse_kernel_version(uname.release)
+        has_xe = kernel_module_loaded("xe")
+        has_i915 = kernel_module_loaded("i915")
+        console.print(f"  xe driver:     {'loaded' if has_xe else 'not loaded'}")
+        console.print(f"  i915 driver:   {'loaded' if has_i915 else 'not loaded'}")
+        if not has_xe and not has_i915:
+            report.add(
+                "gpu_driver",
+                False,
+                "neither xe nor i915 module loaded",
+                severity="fail",
+                hint="Install/load the Intel GPU kernel driver for your generation.",
+            )
+        else:
+            report.add(
+                "gpu_driver",
+                True,
+                f"xe={'yes' if has_xe else 'no'} i915={'yes' if has_i915 else 'no'}",
+            )
 
     # GPU detection (enrich=True so clinfo populates VRAM where xe doesn't via sysfs)
     gpus = detect_gpus(enrich=True)
@@ -198,8 +318,62 @@ def doctor(ctx: click.Context) -> None:
             if g.notes:
                 for n in g.notes:
                     console.print(f"        note: {n}")
+            # ReBAR aperture — critical for Arc llama.cpp performance
+            if not _IS_WINDOWS and g.sysfs_path:
+                bar = max_memory_bar_bytes(g.sysfs_path)
+                rebar = rebar_likely_enabled(g.sysfs_path, g.vram_mb)
+                bar_txt = format_bytes(bar) if bar is not None else "unknown"
+                if rebar is True:
+                    marker = _doctor_marker(True)
+                    console.print(f"        ReBAR:   {marker}  largest BAR {bar_txt}")
+                    report.add("rebar", True, f"{g.pci_slot} BAR {bar_txt}")
+                elif rebar is False:
+                    marker = _doctor_marker(False, "fail")
+                    console.print(
+                        f"        ReBAR:   {marker}  largest BAR {bar_txt} "
+                        f"(need BIOS Resizable BAR / Above 4G Decoding)"
+                    )
+                    report.add(
+                        "rebar",
+                        False,
+                        f"{g.pci_slot} BAR {bar_txt} — ReBAR looks off",
+                        severity="fail",
+                        hint="Enable Resizable BAR / Above 4G Decoding in BIOS. "
+                        "Without it llama.cpp falls back to slow paths on Arc.",
+                    )
+                else:
+                    console.print(
+                        f"        ReBAR:   {_doctor_marker(None)}  largest BAR {bar_txt}"
+                    )
+                    report.add("rebar", None, f"{g.pci_slot} BAR {bar_txt}")
+            # Battlemage wants a recent kernel
+            if g.arch == Arch.BATTLEMAGE and not _IS_WINDOWS:
+                kv = parse_kernel_version()
+                if kv is not None and (kv[0], kv[1]) < (6, 14):
+                    report.add(
+                        "kernel_bmg",
+                        False,
+                        f"kernel {kv[0]}.{kv[1]} < 6.14 for Battlemage",
+                        severity="warn",
+                        hint="Kernel 6.14+ recommended for stable xe on Battlemage.",
+                    )
+            # AOT build guidance — eliminates the ~20s SYCL JIT cold start
+            # that every model swap pays on Battlemage (where the JIT cache is
+            # disabled to dodge a SIGSEGV). Compute the ocloc -device string
+            # from the user's actual detected device ID rather than a static
+            # hint, so an A770 owner sees `acm-g10` and a B580 owner sees
+            # `bmg-g21`.
+            aot = aot_arch_for(g.device_id)
+            if aot is not None:
+                console.print(
+                    f"        AOT:      [dim]build with "
+                    f"-DGGML_SYCL_DEVICE_ARCH={aot} "
+                    f"(ocloc -device {aot}) to skip the ~20s JIT cold start[/dim]"
+                )
+        report.add("gpus", True, f"{len(gpus)} Intel GPU(s)")
     else:
         console.print("\n  [red]no Intel GPUs detected via sysfs[/red]")
+        report.add("gpus", False, "no Intel GPUs via sysfs", severity="fail")
         raw = lspci_intel_gpus()
         if raw:
             console.print("\n  raw lspci output for Intel display devices:")
@@ -210,47 +384,166 @@ def doctor(ctx: click.Context) -> None:
 
     # External tools
     console.print("\n  external tools:")
-    for tool in ("clinfo", "sycl-ls", "intel_gpu_top", "nvtop", "lspci"):
+    for tool in ("clinfo", "sycl-ls", "vulkaninfo", "intel_gpu_top", "nvtop", "lspci"):
         path = shutil.which(tool)
         console.print(f"    {tool:<14} {path or '— missing —'}")
 
-    # Permissions
-    console.print("\n  user groups:")
-    try:
-        out = subprocess.run(["id", "-nG"], capture_output=True, text=True, timeout=2)
-        groups = out.stdout.split()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        groups = []
-    for needed in ("render", "video"):
-        ok = needed in groups
-        marker = "[green]ok[/green]" if ok else "[yellow]missing[/yellow]"
-        console.print(f"    {needed:<14} {marker}")
-    if "render" not in groups or "video" not in groups:
-        console.print(
-            "    [yellow]→ add yourself with `sudo usermod -aG render,video $USER` "
-            "and re-login.[/yellow]"
-        )
-
-    # oneAPI
-    oneapi_setvars = Path("/opt/intel/oneapi/setvars.sh")
-    console.print("\n  oneAPI:")
-    if oneapi_setvars.exists():
-        console.print(f"    setvars.sh:   {oneapi_setvars}")
+    # Level Zero loader (required for SYCL)
+    console.print("\n  Level Zero:")
+    lz_ok, lz_path = level_zero_loader_present()
+    if lz_ok:
+        console.print(f"    loader:      {_doctor_marker(True)}  {lz_path}")
+        report.add("level_zero", True, lz_path)
     else:
         console.print(
-            "    [yellow]/opt/intel/oneapi/setvars.sh missing — install Intel "
-            "oneAPI Base Toolkit if you're building llama.cpp from source.[/yellow]"
+            f"    loader:      {_doctor_marker(False, 'warn')}  not found "
+            f"(install intel-level-zero-gpu / compute-runtime for SYCL)"
         )
+        report.add(
+            "level_zero",
+            False,
+            "Level Zero loader not found",
+            severity="warn",
+            hint="Install intel-level-zero-gpu / intel-compute-runtime packages.",
+        )
+
+    # Permissions (Linux-only)
+    if _IS_WINDOWS:
+        console.print("\n  user groups:")
+        console.print("    [dim]Group checks are not available on Windows.[/dim]")
+    else:
+        console.print("\n  user groups:")
+        membership = user_in_groups("render", "video")
+        for needed, ok in membership.items():
+            console.print(f"    {needed:<14} {_doctor_marker(ok, 'warn' if not ok else 'info')}")
+            report.add(
+                f"group_{needed}",
+                ok,
+                needed,
+                severity="warn" if not ok else "info",
+                hint=(
+                    "sudo usermod -aG render,video $USER && re-login"
+                    if not ok
+                    else ""
+                ),
+            )
+        if not all(membership.values()):
+            console.print(
+                "    [yellow]→ add yourself with `sudo usermod -aG render,video $USER` "
+                "and re-login.[/yellow]"
+            )
+
+    # oneAPI
+    console.print("\n  oneAPI:")
+    setvars = oneapi_setvars_path()
+    if setvars is not None:
+        console.print(f"    setvars:     {_doctor_marker(True)}  {setvars}")
+        report.add("oneapi_setvars", True, str(setvars))
+    else:
+        console.print(
+            f"    setvars:     {_doctor_marker(False, 'warn')}  not found — "
+            f"install Intel oneAPI Base Toolkit if building llama.cpp from source"
+        )
+        report.add(
+            "oneapi_setvars",
+            False,
+            "setvars not found",
+            severity="warn",
+            hint="Install Intel oneAPI Base Toolkit to build a SYCL llama-server.",
+        )
+
+    # llama-server binary
+    console.print("\n  llama-server binary:")
+    if cfg is not None:
+        llama_server = Path(cfg.paths.llama_server).expanduser()
+        if llama_server.exists():
+            backends = detect_backends(llama_server)
+            primary = detect_llama_server_backend(llama_server)
+            backend_list = (
+                ", ".join(sorted(b.value for b in backends)) if backends else "unknown"
+            )
+            console.print(f"    path:        {llama_server}")
+            console.print(f"    backends:    {backend_list}")
+            if primary is None:
+                report.add(
+                    "llama_server",
+                    False,
+                    "binary present but no SYCL/Vulkan markers",
+                    severity="fail",
+                    hint="Rebuild llama-server with GGML_SYCL=ON (or Vulkan).",
+                )
+            else:
+                report.add("llama_server", True, backend_list)
+            if cfg.gpus:
+                for gpu_cfg in cfg.gpus:
+                    if not gpu_cfg.enabled:
+                        continue
+                    want = gpu_cfg.backend
+                    have = {b.value for b in backends}
+                    if have and want not in have:
+                        console.print(
+                            f"    [yellow]→ GPU {gpu_cfg.pci_slot} wants "
+                            f"'{want}' but binary has [{backend_list}].[/yellow]"
+                        )
+                        report.add(
+                            f"backend_match_{gpu_cfg.pci_slot}",
+                            False,
+                            f"config={want} binary=[{backend_list}]",
+                            severity="warn",
+                        )
+        else:
+            console.print(f"    [yellow]not found[/yellow] at {llama_server}")
+            report.add(
+                "llama_server",
+                False,
+                f"missing at {llama_server}",
+                severity="fail",
+                hint="Point paths.llama_server at a SYCL (or Vulkan) llama-server build.",
+            )
+    else:
+        console.print("    [dim]no config loaded[/dim]")
 
     # Config
     console.print("\n  config:")
-    if config_path.exists():
+    if cfg is not None:
         console.print(f"    [green]found[/green] at {config_path}")
+        if cfg.gpus:
+            console.print("    GPUs in config:")
+            for gpu_cfg in cfg.gpus:
+                status = "enabled" if gpu_cfg.enabled else "disabled"
+                console.print(
+                    f"      - {gpu_cfg.pci_slot}  {gpu_cfg.name or gpu_cfg.arch}  "
+                    f"backend={gpu_cfg.backend}  [{status}]"
+                )
     else:
         console.print(
             f"    [yellow]missing[/yellow] at {config_path} — run "
             f"[bold]arc-llama init[/bold]."
         )
+        report.add(
+            "config",
+            False,
+            f"missing at {config_path}",
+            severity="warn",
+            hint="Run arc-llama init.",
+        )
+
+    # Summary of competitive-inference gates
+    fails = report.failures
+    warns = report.warnings
+    console.print("\n  [bold]competitive-inference gates[/bold]")
+    if not fails and not warns:
+        console.print("    [green]all checked gates look good[/green]")
+    else:
+        for c in fails + warns:
+            console.print(
+                f"    {_doctor_marker(c.ok, c.severity)}  {c.name}: {c.detail}"
+            )
+            if c.hint:
+                console.print(f"        → {c.hint}")
+    if fails:
+        # Non-zero so scripts/CI can gate on a healthy Arc host.
+        sys.exit(2)
 
 
 # ===========================================================================
@@ -295,7 +588,7 @@ def _print_gpu_table(gpus) -> None:
 @cli.command("list")
 @click.pass_context
 def list_models(ctx: click.Context) -> None:
-    """List registered models."""
+    """List registered models and which one is currently loaded."""
     cfg = load_config(ctx.obj["config_path"])
     if not cfg.models:
         console.print(
@@ -303,30 +596,54 @@ def list_models(ctx: click.Context) -> None:
             "Run [bold]arc-llama add ...[/bold].[/yellow]"
         )
         return
+
+    loaded: set[str] = set()
+    status_connected = False
+    status_url = f"http://{cfg.server.host}:{cfg.server.port}/admin/status"
+    try:
+        r = httpx.get(status_url, timeout=2.0)
+        r.raise_for_status()
+        loaded = {m["name"] for m in r.json().get("models", []) if m.get("loaded")}
+        status_connected = True
+    except Exception:
+        # Server not running; fall back to config-only listing.
+        pass
+
     table = Table(title="Models")
     table.add_column("Name")
+    table.add_column("Status")
     table.add_column("GPU")
+    table.add_column("Backend")
     table.add_column("Port")
     table.add_column("ctx")
     table.add_column("KV")
     table.add_column("Spec")
     table.add_column("Path")
     for m in cfg.models:
-        r = m.recipe or {}
-        kv = f"{r.get('cache_type_k','f16')}/{r.get('cache_type_v','f16')}"
-        spec = r.get("spec_type", "—")
-        if r.get("ubatch_size"):
-            spec += f" (ub={r['ubatch_size']})"
+        recipe = m.recipe or {}
+        kv = f"{recipe.get('cache_type_k','f16')}/{recipe.get('cache_type_v','f16')}"
+        spec = recipe.get("spec_type", "—")
+        if recipe.get("ubatch_size"):
+            spec += f" (ub={recipe['ubatch_size']})"
+        gpu_cfg = cfg.find_gpu(m.gpu_pci_slot)
+        backend = gpu_cfg.backend if gpu_cfg else "?"
+        status = "[green]loaded[/green]" if m.name in loaded else "[dim]idle[/dim]"
         table.add_row(
             m.name,
+            status,
             m.gpu_pci_slot,
+            backend,
             str(m.port),
-            str(r.get("ctx", "?")),
+            str(recipe.get("ctx", "?")),
             kv,
             spec,
             m.path,
         )
     console.print(table)
+    if not status_connected and cfg.server.host and cfg.server.port:
+        console.print(
+            f"[dim]Status not available from {status_url}; server may not be running.[/dim]"
+        )
 
 
 # ===========================================================================
@@ -341,6 +658,11 @@ def list_models(ctx: click.Context) -> None:
     help="PCI slot of the GPU to bind to (default: first enabled GPU).",
 )
 @click.option(
+    "--backend", "backend", default=None,
+    type=click.Choice([Backend.SYCL.value, Backend.VULKAN.value]),
+    help="Compute backend for this GPU (default: the GPU's configured backend, usually sycl).",
+)
+@click.option(
     "--port", type=int, default=None,
     help="Backend port for this model's llama-server (default: auto).",
 )
@@ -353,18 +675,31 @@ def list_models(ctx: click.Context) -> None:
 @click.option("--display-name", default="", help="Human-friendly name.")
 @click.option(
     "--kv-class",
-    type=click.Choice(["default", "moe_a3b", "qwen3_27b_dense", "gemma_swa"]),
+    type=click.Choice([
+        "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
+        "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
+    ]),
     default="default",
     help="KV-class hint, used for VRAM estimation.",
 )
 @click.option("--alias", "aliases", multiple=True, help="Extra match strings (repeatable).")
 @click.option(
     "--spec-type", "spec_type", default=None,
-    help="Speculative decoding type (e.g. draft-mtp). Auto-detected for MTP models.",
+    help="Speculative decoding type (e.g. draft-mtp). Auto-detected for models "
+         "with embedded MTP heads or a sidecar draft GGUF.",
+)
+@click.option(
+    "--spec-draft-model", "spec_draft_model", default=None,
+    help="Path to a sidecar speculative-draft GGUF (--spec-draft-model). "
+         "Auto-detected from a sibling mtp-/draft- file when present.",
+)
+@click.option(
+    "--spec-draft-ngl", "spec_draft_ngl", type=int, default=None,
+    help="GPU layers for the draft model (--spec-draft-ngl); default 999.",
 )
 @click.option(
     "--ubatch-size", "ubatch_size", type=int, default=None,
-    help="Ubatch size (-ub). Auto-set to 8 for MTP models.",
+    help="Ubatch size (-ub). Left unset by default; llama.cpp picks its own.",
 )
 @click.option(
     "--from-hf", is_flag=True,
@@ -377,6 +712,7 @@ def add(
     source: str,
     name: str | None,
     gpu_pci_slot: str | None,
+    backend: str | None,
     port: int | None,
     ctx_override: int | None,
     kv_type: str | None,
@@ -384,6 +720,8 @@ def add(
     kv_class: str,
     aliases: tuple[str, ...],
     spec_type: str | None,
+    spec_draft_model: str | None,
+    spec_draft_ngl: int | None,
     ubatch_size: int | None,
     from_hf: bool,
     hf_token: str | None,
@@ -402,6 +740,25 @@ def add(
             console.print("[red]No enabled GPUs in config.[/red]")
             sys.exit(1)
         gpu_pci_slot = enabled[0].pci_slot
+
+    # Apply backend override to the selected GPU.
+    if backend is not None:
+        gpu_cfg = cfg.find_gpu(gpu_pci_slot)
+        if gpu_cfg is not None:
+            gpu_cfg.backend = backend
+
+    # Warn if the configured llama-server binary does not support the GPU backend.
+    selected_gpu = cfg.find_gpu(gpu_pci_slot)
+    if selected_gpu is not None:
+        bin_path = Path(cfg.paths.llama_server).expanduser()
+        if bin_path.exists():
+            bin_backend = detect_llama_server_backend(bin_path)
+            if bin_backend is not None and bin_backend.value != selected_gpu.backend:
+                console.print(
+                    f"[yellow]Warning: GPU {selected_gpu.pci_slot} is set to "
+                    f"'{selected_gpu.backend}', but {bin_path} appears to be a "
+                    f"'{bin_backend.value}' binary.[/yellow]"
+                )
 
     # Resolve source → file path. Local file wins if it exists; otherwise try HF.
     local_candidate = Path(source).expanduser()
@@ -436,6 +793,12 @@ def add(
         overrides["cache_type_v"] = kv_type
     if spec_type is not None:
         overrides["spec_type"] = spec_type
+    if spec_draft_model is not None:
+        overrides["spec_draft_model"] = str(Path(spec_draft_model).expanduser().resolve())
+        overrides.setdefault("spec_type", "draft-mtp")
+        overrides.setdefault("spec_draft_ngl", 999)
+    if spec_draft_ngl is not None:
+        overrides["spec_draft_ngl"] = spec_draft_ngl
     if ubatch_size is not None:
         overrides["ubatch_size"] = ubatch_size
 
@@ -557,21 +920,137 @@ def remove(ctx: click.Context, name: str) -> None:
 # serve
 # ===========================================================================
 
+def _print_serve_banner(cfg: Config) -> None:
+    """Print the applied Arc profile per GPU + model at serve startup.
+
+    Surfaces the gotchas arc-llama exists to encode — arch, backend, VRAM,
+    ReBAR status, and the JIT-vs-AOT cold-start situation — so the user can
+    see *why* their config is what it is without reading source comments.
+    """
+    console.print("[bold]arc-llama serve[/bold] — applied Arc profiles:")
+    # Re-detect so we can show live ReBAR + the exact device ID for AOT hints.
+    live: dict[str, object] = {}
+    if not _IS_WINDOWS:
+        try:
+            live = {g.pci_slot: g for g in detect_gpus(enrich=False)}
+        except Exception:
+            live = {}
+    for gpu in cfg.gpus:
+        if not gpu.enabled:
+            continue
+        backend = gpu.backend or Backend.SYCL.value
+        vram = f"{gpu.vram_mb} MB" if gpu.vram_mb else "VRAM unknown"
+        parts = [f"GPU {gpu.pci_slot}: {gpu.arch} ({backend}) · {vram}"]
+        det = live.get(gpu.pci_slot)
+        if det is not None and getattr(det, "sysfs_path", ""):
+            r = rebar_likely_enabled(det.sysfs_path, det.vram_mb)
+            parts.append("ReBAR on" if r else ("ReBAR OFF" if r is False else "ReBAR ?"))
+        if backend == Backend.SYCL.value:
+            aot = aot_arch_for(det.device_id) if det is not None else None
+            if aot is None:
+                # Fall back to a generation-level default from the configured
+                # arch when the live PCI slot doesn't match (e.g. stale config
+                # or running somewhere sysfs isn't available).
+                try:
+                    a = Arch(gpu.arch) if gpu.arch else None
+                except ValueError:
+                    a = None
+                if a == Arch.BATTLEMAGE:
+                    aot = "bmg-g21"
+                elif a == Arch.ALCHEMIST:
+                    aot = "acm-g10"
+            if aot is not None:
+                parts.append(
+                    f"JIT cold-start ~20s (AOT: -DGGML_SYCL_DEVICE_ARCH={aot})"
+                )
+            else:
+                parts.append("JIT cold-start")
+        console.print("  " + " · ".join(parts))
+    for m in cfg.models:
+        r = m.recipe or {}
+        ctx = r.get("ctx", "?")
+        kv_k = r.get("cache_type_k", "f16")
+        kv_v = r.get("cache_type_v", "f16")
+        kv_txt = kv_k if kv_k == kv_v else f"{kv_k}/{kv_v}"
+        console.print(f"  model {m.name}: ctx={ctx} · KV {kv_txt} · port {m.port}")
+    if not cfg.models:
+        console.print("  [dim]no models registered — `arc-llama add` something first[/dim]")
+
+
 @cli.command("serve")
 @click.option("--host", default=None, help="Override server host.")
 @click.option("--port", type=int, default=None, help="Override server port.")
+@click.option(
+    "--profile",
+    default=None,
+    help="Active MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--admin-token",
+    default=None,
+    help=(
+        "Bearer token required for admin endpoints and auto_confirm agent runs "
+        "(overrides config; also settable via ARC_LLAMA_ADMIN_TOKEN)."
+    ),
+)
+@click.option(
+    "--scan/--no-scan", "scan", default=True,
+    help="Auto-register any new GGUFs found in models_dir/scan_paths on startup "
+         "(default: on). Drop a model in and it just appears.",
+)
 @click.pass_context
-def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
+def serve(
+    ctx: click.Context,
+    host: str | None,
+    port: int | None,
+    profile: str | None,
+    admin_token: str | None,
+    scan: bool,
+) -> None:
     """Run the OpenAI-compatible router."""
     cfg = load_config(ctx.obj["config_path"])
     if host:
         cfg.server.host = host
     if port:
         cfg.server.port = port
+    if profile:
+        cfg.agent.profile = profile
+    if admin_token:
+        cfg.server.admin_token = admin_token
+
+    # Zero-config discovery: pick up any GGUF dropped into models_dir/scan_paths
+    # since the last run, so `serve` reflects the filesystem without a manual
+    # `scan`. Idempotent (already-registered paths are skipped) and best-effort
+    # — a discovery failure must never stop the router from coming up.
+    if scan and cfg.gpus:
+        try:
+            added = _do_scan(cfg, [])
+        except Exception as e:  # noqa: BLE001 - discovery must not block serve
+            added = []
+            console.print(f"[yellow]Startup scan failed: {e}[/yellow]")
+        if added:
+            _save_or_die(cfg, ctx.obj["config_path"])
+            console.print(
+                f"[green]Auto-registered {len(added)} new model(s):[/green] "
+                + ", ".join(m.name for m in added)
+            )
+
     if not cfg.models:
         console.print(
-            "[yellow]No models registered yet — `arc-llama add` something first.[/yellow]"
+            "[yellow]No models registered yet — drop a GGUF in "
+            f"{cfg.paths.models_dir} or run `arc-llama add`.[/yellow]"
         )
+    if cfg.server.host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            f"[yellow]Binding to {cfg.server.host!r}, not loopback -- make sure "
+            "admin_token is set to something you control (it was auto-generated "
+            "if you never set one).[/yellow]"
+        )
+    console.print(
+        f"[dim]Admin token: {cfg.server.admin_token} "
+        "(required for admin endpoints and auto_confirm agent runs)[/dim]"
+    )
+    _print_serve_banner(cfg)
     try:
         import uvicorn
     except ImportError:
@@ -604,15 +1083,226 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         _shutdown_subprocesses()
         # Re-raise as default so uvicorn's own handler (or python) finishes the job.
         _signal.signal(signum, _signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        if _IS_WINDOWS:
+            sys.exit(0)
+        else:
+            os.kill(os.getpid(), signum)
 
-    for s in (_signal.SIGTERM, _signal.SIGINT):
+    for s in (getattr(_signal, "SIGTERM", None), _signal.SIGINT):
+        if s is None:
+            continue
         try:
             _signal.signal(s, _on_signal)
         except (OSError, ValueError):
             pass
 
     uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="info")
+
+
+# ===========================================================================
+# benchmark / tune
+# ===========================================================================
+
+def _server_url_from(ctx: click.Context, server_url: str | None) -> str:
+    if server_url:
+        return server_url.rstrip("/")
+    cfg = load_config(ctx.obj["config_path"])
+    return f"http://{cfg.server.host}:{cfg.server.port}"
+
+
+@cli.command("benchmark")
+@click.argument("model")
+@click.option(
+    "--server", "server_url",
+    default=None,
+    help="Base URL of a running `arc-llama serve` (default: http://HOST:PORT from config).",
+)
+@click.option(
+    "--prompt-tokens", "prompt_tokens",
+    type=int, default=benchmark_mod.DEFAULT_PROMPT_TOKENS, show_default=True,
+    help="Approximate prompt length to benchmark.",
+)
+@click.option(
+    "--gen-tokens", "gen_tokens",
+    type=int, default=benchmark_mod.DEFAULT_GEN_TOKENS, show_default=True,
+    help="Number of tokens to generate.",
+)
+@click.option(
+    "--sweep-ctx", "sweep_ctx",
+    default="",
+    help="Comma-separated ctx values for a sweep (e.g. 4096,8192,16384).",
+)
+@click.option(
+    "--sweep-kv", "sweep_kv",
+    default="",
+    help="Comma-separated KV types for a sweep (e.g. f16,q8_0,q4_0).",
+)
+@click.option(
+    "--kv", "kv_types", multiple=True,
+    type=click.Choice(["f16", "q8_0", "q5_1", "q4_0"]),
+    help="KV cache type(s) for --sweep-ctx (repeatable; default: f16 q8_0).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables.")
+@click.pass_context
+def benchmark_cmd(
+    ctx: click.Context,
+    model: str,
+    server_url: str | None,
+    prompt_tokens: int,
+    gen_tokens: int,
+    sweep_ctx: str,
+    sweep_kv: str,
+    kv_types: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    """Measure prompt-eval and generation tok/s for MODEL.
+
+    Requires a running `arc-llama serve` — measurements go through the
+    router so they use the exact SYCL env and recipe your requests get.
+    """
+    cfg = load_config(ctx.obj["config_path"])
+    if cfg.find_model(model) is None:
+        console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
+        sys.exit(1)
+    url = _server_url_from(ctx, server_url)
+
+    ctx_values = [int(x.strip()) for x in sweep_ctx.split(",") if x.strip()] if sweep_ctx else []
+    kv_values = [x.strip() for x in sweep_kv.split(",") if x.strip()] if sweep_kv else []
+    if kv_types:
+        kv_values = list(kv_types)
+
+    model_cfg = cfg.find_model(model)
+    assert model_cfg is not None
+
+    async def _run() -> int:
+        if ctx_values or kv_values:
+            recipe = model_cfg.recipe or {}
+            results = await benchmark_mod.benchmark_sweep(
+                url, model,
+                ctx_values=ctx_values or [recipe.get("ctx", 4096)],
+                kv_types=kv_values or [recipe.get("cache_type_k", "f16")],
+                prompt_tokens=prompt_tokens,
+                gen_tokens=gen_tokens,
+                cfg=cfg,
+            )
+            if as_json:
+                click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+            else:
+                benchmark_mod.print_sweep_table(results)
+            return 1 if all(r.error for r in results) else 0
+        result = await benchmark_mod.benchmark_model(
+            url, model,
+            prompt_tokens=prompt_tokens,
+            gen_tokens=gen_tokens,
+            cfg=cfg,
+        )
+        if as_json:
+            click.echo(json.dumps(result.to_dict(), indent=2))
+        else:
+            benchmark_mod.print_result(result)
+        return 1 if result.error else 0
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        console.print("[yellow]Benchmark interrupted.[/yellow]")
+        sys.exit(130)
+
+
+@cli.command("tune")
+@click.argument("model", required=False)
+@click.option(
+    "--all", "all_models", is_flag=True,
+    help="Tune every registered model sequentially.",
+)
+@click.option(
+    "--server", "server_url", default=None,
+    help="Base URL of a running `arc-llama serve` (default: http://HOST:PORT from config).",
+)
+@click.option(
+    "--target", type=click.Choice(["balanced", "generation", "prompt"]),
+    default="balanced", show_default=True,
+    help="What to optimise: generation tok/s, prompt-eval tok/s, or both.",
+)
+@click.option("--prompt-tokens", type=int, default=1024, show_default=True)
+@click.option("--gen-tokens", type=int, default=128, show_default=True)
+@click.option(
+    "--apply/--dry-run", "apply_", default=True,
+    help="Write the winning config into the model's recipe (default) or restore the original.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables.")
+@click.pass_context
+def tune_cmd(
+    ctx: click.Context,
+    model: str | None,
+    all_models: bool,
+    server_url: str | None,
+    target: str,
+    prompt_tokens: int,
+    gen_tokens: int,
+    apply_: bool,
+    as_json: bool,
+) -> None:
+    """Find the fastest recipe for MODEL by measuring, then persist it.
+
+    Staged sweep over KV cache type, ubatch size, and flash attention —
+    roughly 6–9 measured configs, each paying one model reload. Expect
+    ~10 minutes on a Battlemage-class card. Pass `--all` to sweep every
+    registered model in one run. Requires a running `arc-llama serve`.
+    """
+    from dataclasses import asdict
+
+    from arc_llama.tune import print_multi_summary, print_report, tune_all, tune_model
+
+    cfg = load_config(ctx.obj["config_path"])
+
+    if all_models and model:
+        console.print("[red]Pass either MODEL or --all, not both.[/red]")
+        sys.exit(1)
+    if not all_models and not model:
+        console.print("[red]Specify a MODEL to tune, or --all for every registered model.[/red]")
+        sys.exit(1)
+
+    url = _server_url_from(ctx, server_url)
+
+    try:
+        if all_models:
+            model_names = [m.name for m in cfg.models]
+            if not model_names:
+                console.print("[yellow]No models registered.[/yellow]")
+                sys.exit(0)
+
+            def on_start(name: str, i: int, total: int) -> None:
+                console.print(f"[bold]\\[{i}/{total}] tuning {name}[/bold]")
+
+            reports = asyncio.run(tune_all(
+                url, model_names,
+                target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+                apply=apply_, cfg=cfg, on_start=on_start,
+            ))
+            if as_json:
+                click.echo(json.dumps([asdict(r) for r in reports], indent=2, default=str))
+            else:
+                print_multi_summary(reports)
+            sys.exit(1 if any(r.error for r in reports) else 0)
+
+        if cfg.find_model(model) is None:
+            console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
+            sys.exit(1)
+        report = asyncio.run(tune_model(
+            url, model,
+            target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+            apply=apply_, cfg=cfg,
+        ))
+    except KeyboardInterrupt:
+        console.print("[yellow]Tune interrupted.[/yellow]")
+        sys.exit(130)
+
+    if as_json:
+        click.echo(json.dumps(asdict(report), indent=2, default=str))
+    else:
+        print_report(report)
+    sys.exit(1 if report.error else 0)
 
 
 # ===========================================================================
@@ -643,6 +1333,9 @@ def mtp_info_cmd(path: Path) -> None:
 @click.option("--write", is_flag=True, help="Write the unit to ~/.config/systemd/user/")
 def systemd_unit(service_name: str, description: str, write: bool) -> None:
     """Print (or write) a systemd --user unit for `arc-llama serve`."""
+    if _IS_WINDOWS:
+        console.print("[red]systemd is not available on Windows.[/red]")
+        sys.exit(1)
     arc = shutil.which("arc-llama")
     if not arc:
         arc = str(Path(sys.argv[0]).resolve())
@@ -738,6 +1431,477 @@ def upstream_remove(ctx: click.Context, name: str) -> None:
 
 
 # ===========================================================================
+# agent
+# ===========================================================================
+
+def _state_dir_from_config(cfg: Config) -> Path | None:
+    if cfg.paths.state_dir:
+        return Path(cfg.paths.state_dir).expanduser()
+    return None
+
+
+@asynccontextmanager
+async def _agent_tool_context(cfg: Config, profile: str | None):
+    """Load skills and start the active profile's MCP servers for a CLI agent run."""
+    load_skills(cfg.paths.skills_dir)
+    manager = MCPClientManager(cfg.active_mcp_servers(profile))
+    try:
+        await manager.start()
+        yield
+    finally:
+        await manager.stop()
+
+
+async def _prompt_yes_no(prompt: str) -> bool:
+    """Prompt the user for a yes/no answer from an async context."""
+    loop = asyncio.get_running_loop()
+    while True:
+        answer = await loop.run_in_executor(None, input, prompt)
+        cleaned = answer.strip().lower()
+        if cleaned in ("y", "yes"):
+            return True
+        if cleaned in ("n", "no"):
+            return False
+        console.print("[dim]Please answer y or n.[/dim]")
+
+
+def _render_agent_event(event: dict) -> None:
+    t = event.get("type")
+    if t == "status":
+        console.print(f"[dim]# {event.get('message', '')}[/dim]")
+    elif t == "plan":
+        console.print("[bold cyan]Proposed plan:[/bold cyan]")
+        console.print(event.get("content", ""))
+    elif t == "assistant":
+        content = event.get("content", "")
+        if content:
+            console.print(content)
+    elif t == "tool_call":
+        name = event.get("name", "tool")
+        args = event.get("arguments", {})
+        console.print(f"[bold yellow]▶ {name}[/bold yellow]")
+        console.print(f"[dim]{json.dumps(args, indent=2, ensure_ascii=False)}[/dim]")
+    elif t == "tool_result":
+        name = event.get("name", "tool")
+        content = event.get("content", "")
+        if event.get("error"):
+            console.print(f"[red]✗ {name} failed[/red]")
+        else:
+            console.print(f"[green]✓ {name} done[/green]")
+        console.print(f"[dim]{content}[/dim]")
+    elif t == "confirm_required":
+        console.print(f"[yellow]⚠ Confirmation required for {event.get('tool', 'tool')}[/yellow]")
+    elif t == "checkpoint":
+        console.print(f"[dim]Checkpoint saved: {event.get('id', '')}[/dim]")
+    elif t == "error":
+        console.print(f"[red]Error: {event.get('message', '')}[/red]")
+    elif t == "done":
+        console.print("[green]Agent finished.[/green]")
+
+
+@cli.command("agent")
+@click.argument("task")
+@click.option("--model", "-m", required=True, help="Model id to use.")
+@click.option("--root", "-r", default=None, help="Project root (default: agent.root from config).")
+@click.option("--auto-confirm", is_flag=True, help="Do not prompt for tool confirmation.")
+@click.option("--plan-mode", is_flag=True, help="Generate a plan first and ask for approval.")
+@click.option("--max-turns", type=int, default=30, help="Maximum agent turns (default: 30).")
+@click.option("--folder", "-f", default="", help="Folder to save the agent transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def agent_cmd(
+    ctx: click.Context,
+    task: str,
+    model: str,
+    root: str | None,
+    auto_confirm: bool,
+    plan_mode: bool,
+    max_turns: int,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Run the local coding agent from the terminal.
+
+    Requires a running `arc-llama serve` instance. The agent streams events to
+    the terminal and prompts for confirmation before destructive tools.
+    """
+    cfg = load_config(ctx.obj["config_path"])
+    if base_url is None:
+        base_url = f"http://{cfg.server.host}:{cfg.server.port}"
+
+    try:
+        health = httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+        health.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Cannot reach arc-llama server at {base_url}: {e}[/red]")
+        console.print("[dim]Start one with:[/dim] arc-llama serve")
+        sys.exit(1)
+
+    root_path = Path(root or cfg.agent.root).expanduser().resolve()
+    state_dir = _state_dir_from_config(cfg)
+    chat_store = ChatStore(
+        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
+    )
+    checkpoint_store = CheckpointStore(
+        state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
+    )
+
+    title = task.strip().split("\n")[0][:80] or "Agent task"
+    agent_chat = chat_store.create(str(uuid.uuid4()), title, folder=folder)
+    run_id = str(uuid.uuid4())
+    transcript: list[ChatMessage] = [ChatMessage(role="user", content=task)]
+
+    async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
+        summary = json.dumps(arguments, ensure_ascii=False)[:200]
+        return await _prompt_yes_no(f"Allow [bold]{tool}[/bold] {summary}? [y/n] ")
+
+    async def plan_callback(plan_text: str) -> bool:
+        return await _prompt_yes_no("Approve plan? [y/n] ")
+
+    async def run() -> None:
+        async with _agent_tool_context(cfg, profile):
+            async for event in run_agent(
+                task=task,
+                model=model,
+                base_url=base_url,
+                root=root_path,
+                auto_confirm=auto_confirm,
+                confirm_callback=confirm_callback,
+                plan_mode=plan_mode,
+                plan_callback=plan_callback,
+                run_id=run_id,
+                checkpoint_store=checkpoint_store,
+                max_turns=max_turns,
+                chat_store=chat_store,
+            ):
+                _render_agent_event(event)
+                if event.get("type") == "assistant" and event.get("content"):
+                    transcript.append(ChatMessage(role="assistant", content=event["content"]))
+                elif event.get("type") == "tool_result":
+                    name = event.get("name", "tool")
+                    content = event.get("content", "")
+                    transcript.append(ChatMessage(role="tool", content=f"{name}:\n{content}"))
+
+            chat = chat_store.get(agent_chat.id)
+            if chat is not None:
+                chat.messages.extend(transcript)
+                chat_store.save(chat)
+                console.print(f"[dim]Transcript saved: chat {agent_chat.id} in folder '{folder or 'default'}'[/dim]")
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("[yellow]Agent run interrupted.[/yellow]")
+
+
+# ===========================================================================
+# code (interactive agent REPL)
+# ===========================================================================
+
+@cli.command("code")
+@click.option("--model", "-m", required=True, help="Model id to use.")
+@click.option("--root", "-r", default=None, help="Project root (default: agent.root from config).")
+@click.option("--auto-confirm", is_flag=True, help="Do not prompt for tool confirmation.")
+@click.option("--plan-mode", is_flag=True, help="Generate a plan first and ask for approval each turn.")
+@click.option("--max-turns", type=int, default=30, help="Maximum agent turns per user message (default: 30).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def code_cmd(
+    ctx: click.Context,
+    model: str,
+    root: str | None,
+    auto_confirm: bool,
+    plan_mode: bool,
+    max_turns: int,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Start an interactive coding agent REPL.
+
+    Requires a running `arc-llama serve` instance. Type messages and the agent
+    will use tools across multiple turns. Special commands start with `/`.
+    """
+    cfg = load_config(ctx.obj["config_path"])
+    if base_url is None:
+        base_url = f"http://{cfg.server.host}:{cfg.server.port}"
+
+    try:
+        health = httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+        health.raise_for_status()
+    except Exception as e:
+        console.print(f"[red]Cannot reach arc-llama server at {base_url}: {e}[/red]")
+        console.print("[dim]Start one with:[/dim] arc-llama serve")
+        sys.exit(1)
+
+    root_path = Path(root or cfg.agent.root).expanduser().resolve()
+    state_dir = _state_dir_from_config(cfg)
+    chat_store = ChatStore(
+        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
+    )
+    checkpoint_store = CheckpointStore(
+        state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
+    )
+
+    session_chat = chat_store.create(str(uuid.uuid4()), "CLI session", folder=folder)
+    run_id = str(uuid.uuid4())
+
+    agent = InteractiveAgent(
+        model=model,
+        base_url=base_url,
+        root=root_path,
+        auto_confirm=auto_confirm,
+        plan_mode=plan_mode,
+        max_turns=max_turns,
+        chat_store=chat_store,
+        checkpoint_store=checkpoint_store,
+        run_id=run_id,
+    )
+
+    settings = {
+        "model": model,
+        "root": str(root_path),
+        "folder": folder or "default",
+        "auto_confirm": auto_confirm,
+        "plan_mode": plan_mode,
+        "max_turns": max_turns,
+    }
+
+    console.print("[bold green]arc-llama code[/bold green] — interactive agent")
+    for key, value in settings.items():
+        console.print(f"  [dim]{key}:[/dim] {value}")
+    console.print("[dim]Type /help for commands, /quit to exit.[/dim]\n")
+
+    async def confirm_callback(call_id: str, tool: str, arguments: dict) -> bool:
+        summary = json.dumps(arguments, ensure_ascii=False)[:200]
+        return await _prompt_yes_no(f"Allow [bold]{tool}[/bold] {summary}? [y/n] ")
+
+    async def plan_callback(plan_text: str) -> bool:
+        return await _prompt_yes_no("Approve plan? [y/n] ")
+
+    async def save_transcript(messages: list[ChatMessage]) -> None:
+        if not messages:
+            return
+        chat = chat_store.get(session_chat.id)
+        if chat is None:
+            return
+        chat.messages.extend(messages)
+        chat_store.save(chat)
+
+    async def repl() -> None:
+        nonlocal session_chat, agent
+        async with _agent_tool_context(cfg, profile):
+            loop = asyncio.get_running_loop()
+            while True:
+                try:
+                    user_input = await loop.run_in_executor(None, input, ">>> ")
+                except EOFError:
+                    console.print("\n[yellow]Exiting.[/yellow]")
+                    break
+
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    command = user_input[1:].strip()
+                    if command in ("quit", "exit"):
+                        console.print("[yellow]Goodbye.[/yellow]")
+                        break
+                    if command == "help":
+                        console.print(
+                            "[bold]Commands:[/bold]\n"
+                            "  /help              show this message\n"
+                            "  /quit, /exit       leave the REPL\n"
+                            "  /auto              toggle auto-confirm\n"
+                            "  /plan              toggle plan mode\n"
+                            "  /model <id>        change model\n"
+                            "  /root <path>       change project root\n"
+                            "  /folder <name>     move transcript to folder\n"
+                            "  /max-turns <n>     change max turns per message\n"
+                            "  /clear             start a new session chat"
+                        )
+                        continue
+                    if command == "auto":
+                        agent.auto_confirm = not agent.auto_confirm
+                        console.print(f"[dim]auto_confirm = {agent.auto_confirm}[/dim]")
+                        continue
+                    if command == "plan":
+                        agent.plan_mode = not agent.plan_mode
+                        console.print(f"[dim]plan_mode = {agent.plan_mode}[/dim]")
+                        continue
+                    if command == "clear":
+                        await agent.close()
+                        session_chat = chat_store.create(str(uuid.uuid4()), "CLI session", folder=folder)
+                        agent = InteractiveAgent(
+                            model=agent.model,
+                            base_url=base_url,
+                            root=agent.root,
+                            auto_confirm=agent.auto_confirm,
+                            plan_mode=agent.plan_mode,
+                            max_turns=agent.max_turns,
+                            chat_store=chat_store,
+                            checkpoint_store=checkpoint_store,
+                            run_id=str(uuid.uuid4()),
+                        )
+                        console.print("[dim]Started a new session chat.[/dim]")
+                        continue
+                    if command.startswith("model "):
+                        agent.model = command[6:].strip() or agent.model
+                        console.print(f"[dim]model = {agent.model}[/dim]")
+                        continue
+                    if command.startswith("root "):
+                        new_root = Path(command[5:].strip()).expanduser().resolve()
+                        agent.root = new_root
+                        console.print(f"[dim]root = {agent.root}[/dim]")
+                        continue
+                    if command.startswith("folder "):
+                        new_folder = command[7:].strip()
+                        chat = chat_store.get(session_chat.id)
+                        if chat is not None:
+                            chat.folder = new_folder
+                            chat_store.save(chat)
+                        console.print(f"[dim]folder = {new_folder}[/dim]")
+                        continue
+                    if command.startswith("max-turns "):
+                        try:
+                            agent.max_turns = int(command[10:].strip())
+                            console.print(f"[dim]max_turns = {agent.max_turns}[/dim]")
+                        except ValueError:
+                            console.print("[red]max-turns requires an integer[/red]")
+                        continue
+                    console.print(f"[red]Unknown command: /{command}[/red]")
+                    continue
+
+                turn_messages: list[ChatMessage] = [ChatMessage(role="user", content=user_input)]
+                async for event in agent.chat(
+                    user_input,
+                    confirm_callback=confirm_callback,
+                    plan_callback=plan_callback,
+                ):
+                    _render_agent_event(event)
+                    if event.get("type") == "assistant" and event.get("content"):
+                        turn_messages.append(ChatMessage(role="assistant", content=event["content"]))
+                    elif event.get("type") == "tool_result":
+                        name = event.get("name", "tool")
+                        content = event.get("content", "")
+                        turn_messages.append(ChatMessage(role="tool", content=f"{name}:\n{content}"))
+
+                await save_transcript(turn_messages)
+
+            await agent.close()
+
+    try:
+        asyncio.run(repl())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Session interrupted.[/yellow]")
+
+
+# ===========================================================================
+# agent-tui (arcllama)
+# ===========================================================================
+
+@cli.command("agent-tui")
+@click.option("--model", "-m", default=None, help="Model id to use (default: first available).")
+@click.option("--root", "-r", default=None, help="Project root (default: current directory).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+@click.pass_context
+def agent_tui_cmd(
+    ctx: click.Context,
+    model: str | None,
+    root: str | None,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Launch the interactive arcllama agent TUI."""
+    cfg = load_config(ctx.obj["config_path"])
+    try:
+        run_agent_tui(
+            base_url=base_url,
+            model=model,
+            root=root,
+            folder=folder,
+            profile=profile,
+            config=cfg,
+        )
+    except SystemExit as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+
+@click.command(name="arcllama", add_help_option=True)
+@click.option("--model", "-m", default=None, help="Model id to use (default: first available).")
+@click.option("--root", "-r", default=None, help="Project root (default: current directory).")
+@click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
+@click.option(
+    "--profile",
+    default=None,
+    help="MCP profile name (overrides agent.profile in config).",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="arc-llama server base URL (default: http://HOST:PORT from config).",
+)
+def arcllama_main(
+    model: str | None,
+    root: str | None,
+    folder: str,
+    profile: str | None,
+    base_url: str | None,
+) -> None:
+    """Entry point for the `arcllama` command."""
+    if not _experimental_agent_enabled():
+        console.print(
+            "[red]The arcllama agent TUI is experimental. "
+            "Set ARC_LLAMA_EXPERIMENTAL_AGENT=1 to enable it.[/red]"
+        )
+        sys.exit(1)
+    try:
+        run_agent_tui(
+            base_url=base_url,
+            model=model,
+            root=root,
+            folder=folder,
+            profile=profile,
+        )
+    except SystemExit as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+
+# ===========================================================================
 # tui
 # ===========================================================================
 
@@ -760,6 +1924,17 @@ def tui_cmd(ctx: click.Context, server_url: str | None) -> None:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
     run_tui(server_url)
+
+
+def _experimental_agent_enabled() -> bool:
+    """Return True if the experimental coding-agent commands should be exposed."""
+    return os.environ.get("ARC_LLAMA_EXPERIMENTAL_AGENT", "").lower() in ("1", "true", "yes")
+
+
+# Hide the experimental agent commands unless the user explicitly opts in.
+if not _experimental_agent_enabled():
+    for _experimental_agent_cmd in ("agent", "code", "agent-tui"):
+        cli.commands.pop(_experimental_agent_cmd, None)
 
 
 def main() -> None:

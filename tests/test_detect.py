@@ -12,7 +12,6 @@ from arc_llama.detect import (
     _enrich_with_clinfo,
     _parse_clinfo_devices,
     _scan_pci,
-    detect_gpus,
     lspci_intel_gpus,
 )
 

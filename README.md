@@ -13,7 +13,7 @@ It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
 > [!NOTE]
-> **Status: 0.2 beta.** Tested end-to-end on Battlemage B60. HF download,
+> **Status: 0.3.0.** Tested end-to-end on Battlemage B60. HF download,
 > streaming, and the OpenAI-compatible API all pass. Other SKUs (A770, A380,
 > B580) need community confirmation -- open an issue if something breaks on
 > your card.
@@ -33,7 +33,7 @@ something useful before lunch.
   `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS`) are stripped from the
   inherited shell environment.
 - **Smart defaults** for `-ctx`, `--cache-type-k/v`, and `-ngl` based on the
-  detected VRAM and the model file size , never starts a model you can't fit.
+  detected VRAM and the model's quantized tensor size, never starts a model you can't fit.
 - **Model registry** in TOML at `$XDG_CONFIG_HOME/arc-llama/config.toml`,
   trivially editable.
 - **One process per model**, swapped in/out by an internal router. Default
@@ -76,10 +76,16 @@ arc-llama scan
 # 5. Run the OpenAI-compatible server (also serves the web UI at /)
 arc-llama serve
 
-# 6. (Optional) Open the terminal UI in another window
+# 6. (Optional) Measure, then let arc-llama find the fastest recipe for a
+#    model on YOUR card (staged sweep over KV type, ubatch, flash attention;
+#    ~10 min, writes the winner into the config)
+arc-llama benchmark qwen3-7b
+arc-llama tune qwen3-7b
+
+# 7. (Optional) Open the terminal UI in another window
 arc-llama tui
 
-# 7. (Optional) Install a systemd --user unit
+# 8. (Optional) Install a systemd --user unit
 arc-llama systemd --write
 systemctl --user daemon-reload
 systemctl --user enable --now arc-llama.service
@@ -98,8 +104,9 @@ curl http://127.0.0.1:11437/v1/chat/completions \
 
 ## Requirements
 
-- Linux, kernel **6.8+** for Battlemage (`xe` driver) or 5.17+ for Alchemist
-  (`i915`).
+- Linux, kernel **6.14+ recommended** for Battlemage (`xe` driver; 6.8 is the
+  minimum where `xe` exists, but 6.14+ is stable for BMG) or 5.17+ for
+  Alchemist (`i915`). This matches the threshold `arc-llama doctor` warns on.
 - ReBAR enabled in BIOS , without it llama.cpp falls back to slow paths on Arc.
 - A `llama-server` built with the SYCL backend. The Intel oneAPI Base Toolkit
   is the supported build path:
@@ -109,6 +116,35 @@ curl http://127.0.0.1:11437/v1/chat/completions \
   cmake --build build --config Release -j
   ```
 - User in the `render` and `video` groups (`arc-llama doctor` will tell you).
+
+## Benchmark & autotune
+
+Static defaults can't know whether *your* card/model/llama.cpp build prefers
+f16 or q8_0 KV cache, a 512 or 2048 ubatch, or flash attention on/off — the
+SYCL backend's answer genuinely differs per SKU and per revision. So measure:
+
+```bash
+# One-shot measurement (prompt-eval + generation tok/s, VRAM)
+arc-llama benchmark qwen3-7b
+
+# Sweep context lengths × KV types
+arc-llama benchmark qwen3-7b --sweep-ctx 8192,32768 --kv f16 --kv q8_0
+
+# Staged greedy sweep: KV type → ubatch → flash attention. Winner is written
+# into the model's recipe and persisted. ~6–9 configs, ~10 min on Battlemage.
+arc-llama tune qwen3-7b
+arc-llama tune qwen3-7b --target generation   # optimise chat latency only
+arc-llama tune qwen3-7b --dry-run             # look, don't touch
+```
+
+Both need a running `arc-llama serve` so measurements inherit the exact SYCL
+env and router policy your real requests get. Candidates that fail to start
+(e.g. compute-buffer OOM from a bigger ubatch) simply lose the round — the
+tuner always leaves the model in a working config.
+
+arc-llama also probes your `llama-server --help` once per binary to emit the
+right flag dialect (`-fa on|off|auto` on current builds vs boolean `-fa` on
+pre-b6300 ones), so hand-built and prebuilt binaries both work.
 
 ## Multi-GPU
 
@@ -164,6 +200,7 @@ state_dir    = "~/.local/state/arc-llama"
 pci_slot   = "0000:03:00.0"
 sycl_index = 0
 arch       = "battlemage"
+backend    = "sycl"          # or "vulkan" for a Vulkan llama-server build
 vram_mb    = 24480
 enabled    = true
 name       = "Arc Pro B60"
@@ -189,6 +226,11 @@ extra_flags      = []
 name = "ollama"
 url  = "http://127.0.0.1:11434"
 ```
+
+> [!NOTE]
+> The optional agent/coding-assistant mode is experimental. Enable it by setting
+> `ARC_LLAMA_EXPERIMENTAL_AGENT=1` before running `arc-llama agent`, `code`,
+> or `agent-tui`.
 
 `kv_class` controls the KV-cache size estimate that `arc-llama add` uses to
 pick a context length. Currently:
@@ -259,12 +301,17 @@ Both use brightness/dim for status (loaded vs idle) , no red/green palettes.
 
 ## Container
 
-A Dockerfile is included that builds llama-server with the SYCL backend and
-installs arc-llama in a single image:
+A Dockerfile is included that builds llama-server with the SYCL backend
+(FP16 math path on by default) and installs arc-llama in a single image:
 
 ```bash
-# Build
+# Build (generic: JIT-compiled device code, works on any Intel GPU)
 docker build -t arc-llama:latest .
+
+# Build with AOT device code for your GPU generation — kills the ~20s SYCL
+# JIT recompile every cold start pays (Battlemage can't use the JIT cache):
+docker build --build-arg GGML_SYCL_DEVICE_ARCH=bmg-g21 -t arc-llama:bmg .  # B-series
+docker build --build-arg GGML_SYCL_DEVICE_ARCH=acm-g10 -t arc-llama:acm .  # A770/750/580
 
 # Run (GPU access required)
 docker run --rm -it \
@@ -286,12 +333,12 @@ docker run ... \
 
 ## Roadmap
 
-- Smoke test on Alchemist (A770, A380) and Battlemage (B580) hardware.
-- IPEX-LLM Ollama as an optional backend for users who prefer it.
 - ~~HF model download (`arc-llama add org/repo:quant --from-hf`).~~ ✅
 - ~~Streaming response forwarding (`stream: true`).~~ ✅
 - ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅
 - ~~`arc-llama benchmark` , quick prompt-eval/gen tok/s harness.~~ ✅
+- ~~`arc-llama tune` , measure-and-persist recipe autotuner.~~ ✅
+- ~~`arc-llama tune --all` , sweep every registered model in one run.~~ ✅
 
 ## Contributing
 

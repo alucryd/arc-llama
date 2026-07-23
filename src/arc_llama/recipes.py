@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from arc_llama.arch import Arch, ArchProfile, profile_for
+from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
 
 
 class KVCacheType(str, Enum):
@@ -28,11 +28,19 @@ class KVCacheType(str, Enum):
 # Battlemage B60 stack. They're upper bounds for sizing; actual usage with
 # sliding-window attention (Gemma) is several × smaller again.
 KV_PER_TOKEN_F16_BYTES: dict[str, int] = {
-    "default": 70 * 1024,   # 70 KiB/token f16 — covers ~30B dense models
-    "moe_a3b": 20 * 1024,   # ~20 KiB — Qwen3 30B/35B-A3B-class MoE
-    "qwen3_27b_dense": 67 * 1024,
-    "gemma_swa": 16 * 1024, # interleaved sliding-window attention compresses heavily
+    "default": 70 * 1024,        # 70 KiB/token f16 — covers most ≤30B dense models
+    "moe_a3b": 20 * 1024,        # ~20 KiB — Qwen3 30B/35B-A3B-class MoE
+    "qwen3_dense": 67 * 1024,    # Qwen3 0.6B–32B dense (incl. Coder, Instruct)
+    "qwen3_27b_dense": 67 * 1024,# kept for backwards compatibility
+    "qwen2_5": 70 * 1024,        # Qwen2.5 / Qwen2.5-Coder dense
+    "gemma_swa": 16 * 1024,      # Gemma 2/3/4 interleaved sliding-window attn
+    "phi4": 72 * 1024,           # Phi-4 / Phi-4-reasoning 14.7B dense
+    "llama3": 75 * 1024,         # Llama 3.x / 4 dense & small MoE distills
+    "deepseek_r1_distill": 70 * 1024, # R1 distill on Llama/Qwen
 }
+
+
+FLASH_ATTN_VALUES = ("on", "off", "auto")
 
 
 @dataclass
@@ -49,12 +57,43 @@ class LaunchRecipe:
     top_k: int | None = None
     spec_type: str | None = None
     """Speculative decoding type, e.g. 'draft-mtp'."""
+    spec_draft_n_max: int | None = None
+    """Tokens to draft for speculative decoding (--spec-draft-n-max).
+
+    Measured on Arc Pro B60 / Qwen3.6-27B-MTP (2026-07): n_max 1–4 give
+    similar gen (~19–20 tok/s); n_max 5–6 regress gen to ~13–15. Prefer ≤4.
+    """
+    spec_draft_model: str | None = None
+    """Path to a sidecar speculative-draft GGUF (--spec-draft-model).
+
+    Some models ship their MTP/EAGLE heads as a separate small GGUF next to
+    the main weights (e.g. `mtp-gemma-*.gguf`) rather than embedded. When set,
+    llama-server loads it as the draft — this is what makes draft-mtp work for
+    models whose main GGUF has no embedded MTP heads."""
+    spec_draft_ngl: int | None = None
+    """GPU layers for the draft model (--spec-draft-ngl); 999 = fully offloaded."""
     ubatch_size: int | None = None
-    """Ubatch size (-ub). Auto-set to 8 for MTP models to avoid SSM compute-buffer OOM."""
+    """Ubatch size (-ub). Leave unset to let llama.cpp pick the default."""
+    batch_size: int | None = None
+    """Logical batch size (-b). Must be >= ubatch_size when both are set."""
+    flash_attn: str | None = None
+    """Flash Attention: 'on' | 'off' | 'auto' | None (binary default).
+
+    Old llama-server builds (pre ~b6300) expose -fa as a boolean that defaults
+    to off; new builds take -fa {on,off,auto} and default to auto. `to_argv`
+    translates per the probed binary style — see server_caps.probe_server_caps.
+    """
+    no_mmap: bool = False
+    """Disable mmap (--no-mmap): slower reload, but the whole model is read
+    up-front — avoids page-cache thrash when VRAM spill keeps tensors host-side."""
+    mlock: bool = False
+    """--mlock: pin host-side weights in RAM so they can't be swapped out."""
+    n_cpu_moe: int | None = None
+    """Number of MoE experts per layer to keep on CPU (--n-cpu-moe)."""
     extra_flags: list[str] = field(default_factory=list)
     """Anything else the user wants appended to the command line verbatim."""
 
-    def to_argv(self) -> list[str]:
+    def to_argv(self, fa_takes_value: bool = True) -> list[str]:
         argv = [
             "-ngl", str(self.n_gpu_layers),
             "-c", str(self.ctx),
@@ -72,8 +111,29 @@ class LaunchRecipe:
             argv += ["--top-k", str(self.top_k)]
         if self.spec_type:
             argv += ["--spec-type", self.spec_type]
+        if self.spec_draft_model:
+            argv += ["--spec-draft-model", self.spec_draft_model]
+        if self.spec_draft_ngl is not None:
+            argv += ["--spec-draft-ngl", str(self.spec_draft_ngl)]
+        if self.spec_draft_n_max is not None:
+            argv += ["--spec-draft-n-max", str(self.spec_draft_n_max)]
         if self.ubatch_size is not None:
             argv += ["-ub", str(self.ubatch_size)]
+        if self.batch_size is not None:
+            argv += ["-b", str(self.batch_size)]
+        if self.flash_attn in FLASH_ATTN_VALUES:
+            if fa_takes_value:
+                argv += ["-fa", self.flash_attn]
+            elif self.flash_attn == "on":
+                # Old boolean-style flag; 'off' is that style's default and
+                # 'auto' is inexpressible, so both fall through to no flag.
+                argv += ["-fa"]
+        if self.no_mmap:
+            argv += ["--no-mmap"]
+        if self.mlock:
+            argv += ["--mlock"]
+        if self.n_cpu_moe is not None:
+            argv += ["--n-cpu-moe", str(self.n_cpu_moe)]
         argv += list(self.extra_flags)
         return argv
 
@@ -134,21 +194,63 @@ def suggest_ctx(
     return max(4096, min(rounded, ctx_cap))
 
 
+PERF_UBATCH_MIN_VRAM_MB = 16384
+"""Only default to a large ubatch on cards with real VRAM headroom — the
+compute buffer grows roughly linearly with ubatch, and on 8–12 GB cards a
+previously-fitting model could stop fitting."""
+
+PERF_UBATCH = 1024
+"""Prompt processing on Arc is very sensitive to ubatch. Measured on Arc Pro
+B60 / Qwen3.6-27B-MTP (2026-07): raising -ub 512→1024 lifts prompt-eval from
+~340 to ~420 tok/s (~23%, all runs non-overlapping) with no gen regression.
+See bench_results/SUMMARY.md."""
+
+PERF_BATCH = 2048
+"""Logical batch size (-b) paired with PERF_UBATCH. llama.cpp requires
+batch_size >= ubatch_size; 2048 is the upstream stock default."""
+
+PERF_COMPUTE_BUFFER_MB = 1536
+"""Compute-buffer estimate used for ctx sizing when the perf ubatch applies
+(vs. the conservative 768 MiB default at llama.cpp's stock ubatch of 512)."""
+
+
 def default_recipe(
     arch: Arch,
     vram_mb: int,
     model_file_mb: int,
     kv_class: str = "default",
     prefer_q8_kv: bool = True,
+    backend: Backend = Backend.SYCL,
 ) -> LaunchRecipe:
-    """A safe starting recipe for a freshly added model on a given arch."""
+    """A safe starting recipe for a freshly added model on a given arch/backend."""
     profile: ArchProfile = profile_for(arch)
-    kv_type = KVCacheType.Q8_0 if (prefer_q8_kv and profile.safe_kv_q8) else KVCacheType.F16
+    extra_flags: list[str] = []
+    # SYCL: express flash-attn via the recipe field so server_caps can emit
+    # the right dialect. Vulkan quantized V-cache still injects via extra_flags
+    # (policy also enforces this for older configs without flash_attn set).
+    flash_attn: str | None = "auto"
+    if backend == Backend.VULKAN:
+        # Vulkan quantized V-cache needs --flash-attn (llama.cpp requirement).
+        # SYCL production configs run fine with q8 V and no FA flag — do not
+        # inject it there (verified on B60 production stack).
+        use_q8 = prefer_q8_kv and profile.safe_kv_q8_vulkan
+        if use_q8:
+            extra_flags.extend(["--flash-attn", "on"])
+            flash_attn = None  # avoid emitting both -fa auto and --flash-attn on
+        else:
+            flash_attn = "auto"
+    else:
+        use_q8 = prefer_q8_kv and profile.safe_kv_q8
+    kv_type = KVCacheType.Q8_0 if use_q8 else KVCacheType.F16
+    # Bump ubatch above llama.cpp's stock 512 when the card can absorb the
+    # bigger compute buffer; budget the larger buffer into the ctx suggestion.
+    perf_batching = vram_mb >= PERF_UBATCH_MIN_VRAM_MB
     ctx = suggest_ctx(
         vram_mb=vram_mb,
         model_file_mb=model_file_mb,
         kv_type=kv_type,
         kv_class=kv_class,
+        compute_buffer_mb=PERF_COMPUTE_BUFFER_MB if perf_batching else 768,
     )
     return LaunchRecipe(
         n_gpu_layers=999,
@@ -156,4 +258,47 @@ def default_recipe(
         parallel=1,
         cache_type_k=kv_type,
         cache_type_v=kv_type,
+        flash_attn=flash_attn,
+        ubatch_size=PERF_UBATCH if perf_batching else None,
+        batch_size=PERF_BATCH if perf_batching else None,
+        extra_flags=extra_flags,
     )
+
+
+def recipe_to_dict(recipe: LaunchRecipe) -> dict:
+    """Serialise a recipe to the TOML-friendly dict stored in ModelConfig.recipe.
+
+    Only always-meaningful fields are emitted unconditionally; optional fields
+    are included only when set, so configs stay small and None never reaches
+    the TOML writer.
+    """
+    d: dict = {
+        "n_gpu_layers": recipe.n_gpu_layers,
+        "ctx": recipe.ctx,
+        "parallel": recipe.parallel,
+        "cache_type_k": recipe.cache_type_k.value,
+        "cache_type_v": recipe.cache_type_v.value,
+    }
+    if recipe.flash_attn is not None:
+        d["flash_attn"] = recipe.flash_attn
+    if recipe.ubatch_size is not None:
+        d["ubatch_size"] = recipe.ubatch_size
+    if recipe.batch_size is not None:
+        d["batch_size"] = recipe.batch_size
+    if recipe.spec_type is not None:
+        d["spec_type"] = recipe.spec_type
+    if recipe.spec_draft_model is not None:
+        d["spec_draft_model"] = recipe.spec_draft_model
+    if recipe.spec_draft_ngl is not None:
+        d["spec_draft_ngl"] = recipe.spec_draft_ngl
+    if recipe.spec_draft_n_max is not None:
+        d["spec_draft_n_max"] = recipe.spec_draft_n_max
+    if recipe.n_cpu_moe is not None:
+        d["n_cpu_moe"] = recipe.n_cpu_moe
+    if recipe.no_mmap:
+        d["no_mmap"] = True
+    if recipe.mlock:
+        d["mlock"] = True
+    if recipe.extra_flags:
+        d["extra_flags"] = list(recipe.extra_flags)
+    return d

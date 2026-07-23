@@ -11,6 +11,7 @@ need to type `arc-llama add` for a GGUF they already have on disk.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,10 +21,29 @@ from arc_llama.config import (
     Config,
     ModelConfig,
 )
-from arc_llama.gguf_meta import has_mtp_heads
-from arc_llama.recipes import default_recipe
+from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe, read_gguf_meta
+from arc_llama.recipes import default_recipe, recipe_to_dict
 
 log = logging.getLogger("arc_llama.models")
+
+
+def _suggest_moe_offload(vram_mb: int, model_file_mb: int, num_experts: int) -> int | None:
+    """Conservatively suggest how many experts per layer to keep on CPU.
+
+    Returns ``None`` when there is enough headroom that offloading is unnecessary
+    or when the expert count is not known. The heuristic is intentionally simple:
+    only offload if the model file is within ~15% of the GPU's VRAM budget, and
+    never offload more than half the experts.
+    """
+    if num_experts <= 0:
+        return None
+    # No pressure: model fits with >15% VRAM headroom.
+    if model_file_mb < vram_mb * 0.85:
+        return None
+    # Pressure ratio: how much of the model exceeds the 85% threshold.
+    pressure = max(0.0, min(1.0, (model_file_mb - vram_mb * 0.85) / (vram_mb * 0.15)))
+    offload = max(1, int(num_experts * pressure * 0.5))
+    return min(offload, num_experts // 2)
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 HF_SPEC_RE = re.compile(
@@ -106,6 +126,14 @@ def add_local_model(
     gpu = cfg.find_gpu(gpu_pci_slot)
     if gpu is None:
         raise ValueError(f"GPU {gpu_pci_slot} not in config — run `arc-llama init` first.")
+    # Prefer GGUF metadata over the filename heuristic for kv_class unless the
+    # caller passed an explicit (non-default) hint. MoE models in particular
+    # (Gemma-4 A4B, Qwen3 A3B) share a filename family with dense variants.
+    if kv_class == "default":
+        inferred = infer_kv_class_from_path(p)
+        if inferred is not None:
+            kv_class = inferred
+            log.info("model %s: kv_class=%s from GGUF metadata", name, kv_class)
     used_ports = {m.port for m in cfg.models}
     port = port or _next_free_port(used_ports)
     if port in used_ports:
@@ -113,29 +141,61 @@ def add_local_model(
     if any(m.name == name for m in cfg.models):
         raise ValueError(f"Model name '{name}' already registered.")
     # Build a recipe that fits this GPU.
-    from arc_llama.arch import Arch
+    from arc_llama.arch import Arch, Backend
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     recipe = default_recipe(
         arch=arch,
         vram_mb=gpu.vram_mb or 8192,
         model_file_mb=p.stat().st_size // (1024 * 1024),
         kv_class=kv_class,
+        backend=backend,
     )
-    recipe_dict: dict[str, Any] = {
-        "n_gpu_layers": recipe.n_gpu_layers,
-        "ctx": recipe.ctx,
-        "parallel": recipe.parallel,
-        "cache_type_k": recipe.cache_type_k.value,
-        "cache_type_v": recipe.cache_type_v.value,
-    }
+    recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
     # Auto-enable draft-mtp for models that actually carry MTP heads.
+    # Measured B60/Qwen3.6-27B-MTP: draft-mtp n_max 1–4 ≈ +20% gen vs none;
+    # n_max 5–6 regresses. Pin n_max=3 (llama default / mid of the good band).
     if has_mtp_heads(p):
         recipe_dict["spec_type"] = "draft-mtp"
-        recipe_dict["ubatch_size"] = 8
+        recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
         log.info(
-            "model %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
-            name,
+            "model %s has embedded MTP heads; auto-enabling spec_type=draft-mtp "
+            "spec_draft_n_max=%d (B60 measured band 1–4)",
+            name, DEFAULT_SPEC_DRAFT_N_MAX,
         )
+    else:
+        draft = find_draft_model(p)
+        if draft is not None:
+            recipe_dict["spec_type"] = "draft-mtp"
+            recipe_dict["spec_draft_model"] = str(draft)
+            recipe_dict["spec_draft_ngl"] = DEFAULT_SPEC_DRAFT_NGL
+            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+            log.info(
+                "model %s: found sidecar draft %s; auto-enabling draft-mtp "
+                "with --spec-draft-model (spec_draft_n_max=%d)",
+                name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+            )
+    # Suggest MoE expert offload on VRAM-tight cards.
+    if is_moe(p):
+        num_experts = expert_count(p)
+        if num_experts is not None:
+            n_cpu = _suggest_moe_offload(
+                vram_mb=gpu.vram_mb or 8192,
+                model_file_mb=p.stat().st_size // (1024 * 1024),
+                num_experts=num_experts,
+            )
+            if n_cpu:
+                recipe_dict["n_cpu_moe"] = n_cpu
+                log.info(
+                    "model %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
+                    name, num_experts, n_cpu,
+                )
+        else:
+            log.debug(
+                "model %s looks like MoE but expert count could not be read; "
+                "manual --n-cpu-moe tuning may help",
+                name,
+            )
     if recipe_overrides:
         recipe_dict.update(recipe_overrides)
     mc = ModelConfig(
@@ -158,8 +218,13 @@ def add_local_model(
 
 # Filename → kv_class hints, evaluated in order. First match wins.
 _KV_CLASS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"gemma[\W_-]*[34]", re.IGNORECASE), "gemma_swa"),
-    (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_27b_dense"),
+    (re.compile(r"gemma[\W_-]*[234]", re.IGNORECASE), "gemma_swa"),
+    (re.compile(r"phi[\W_-]*4", re.IGNORECASE), "phi4"),
+    (re.compile(r"deepseek[\W_-]*r1[\W_-]*distill", re.IGNORECASE), "deepseek_r1_distill"),
+    (re.compile(r"llama[\W_-]*(3|4)", re.IGNORECASE), "llama3"),
+    (re.compile(r"qwen[\W_-]*2[.\W_-]*5", re.IGNORECASE), "qwen2_5"),
+    (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_dense"),
+    (re.compile(r"qwen[\W_-]*3(?!.*a3b)(?!.*moe)", re.IGNORECASE), "qwen3_dense"),
     (re.compile(r"(qwen[\W_-]*3.*a3b|qwen[\W_-]*3.*moe|carnice|huihui.*30b.*a3b)", re.IGNORECASE), "moe_a3b"),
 ]
 
@@ -170,12 +235,143 @@ _QUANT_TIER_RE = re.compile(
 )
 
 
+# --- Speculative sidecar-draft detection -----------------------------------
+# Some models ship their MTP/EAGLE draft heads as a separate small GGUF next to
+# the main weights (e.g. `mtp-gemma-4-26B-A4B-it.gguf`). We auto-pair them so
+# the fast speculative recipe works without the user knowing the file exists.
+
+# A draft carries the marker as a *prefix*. This deliberately does NOT match a
+# mid-name 'MTP' (e.g. `Qwen3.6-27B-MTP-...`), which is a full model with
+# *embedded* heads, not a sidecar draft.
+_DRAFT_PREFIX_RE = re.compile(r"^(mtp|draft|eagle|medusa)[-_.]", re.IGNORECASE)
+
+DEFAULT_SPEC_DRAFT_N_MAX = 3  # B60-measured good band is 1–4; 5–6 regress.
+DEFAULT_SPEC_DRAFT_NGL = 999  # fully offload the (small) draft to the GPU.
+
+
+def _sibling_ggufs(directory: Path) -> list[Path]:
+    """List *.gguf files in `directory` via os.listdir.
+
+    Deliberately avoids Path.glob, which stats the directory's mode and so
+    trips test stat-mocks; os.listdir needs no stat on the entries.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(directory / n for n in names if n.lower().endswith(".gguf"))
+
+
+def _model_key(name: str) -> str:
+    """Normalise a GGUF filename to a comparable base key.
+
+    Drops the extension, a leading draft marker, quant-tier tokens, and every
+    non-alphanumeric, so `mtp-gemma-4-26B-A4B-it.gguf` and
+    `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf` reduce to comparable stems
+    (`gemma426ba4bit` vs `gemma426ba4bitqat`).
+    """
+    stem = name[:-5] if name.lower().endswith(".gguf") else name
+    stem = _DRAFT_PREFIX_RE.sub("", stem)
+    stem = _QUANT_TIER_RE.sub("", stem)
+    return re.sub(r"[^a-z0-9]", "", stem.lower())
+
+
+def find_draft_model(main_path: Path | str, siblings: list[Path] | None = None) -> Path | None:
+    """Return a sidecar speculative-draft GGUF for `main_path`, or None.
+
+    A sibling in the same directory qualifies when it carries a draft-marker
+    prefix, is smaller than the main model, and shares its base name.
+    """
+    main = Path(main_path)
+    try:
+        main_size = main.stat().st_size
+    except OSError:
+        return None
+    if siblings is None:
+        siblings = _sibling_ggufs(main.parent)
+    main_key = _model_key(main.name)
+    if not main_key:
+        return None
+    for s in siblings:
+        if s.name == main.name or not _DRAFT_PREFIX_RE.match(s.name):
+            continue
+        try:
+            if s.stat().st_size >= main_size:  # a draft is smaller than its target
+                continue
+        except OSError:
+            continue
+        draft_key = _model_key(s.name)
+        if draft_key and main_key.startswith(draft_key):
+            return s
+    return None
+
+
+def looks_like_draft(path: Path | str, siblings: list[Path] | None = None) -> bool:
+    """True if `path` is a sidecar draft belonging to some larger sibling.
+
+    Used by scan to avoid registering a draft GGUF as a standalone model.
+    """
+    p = Path(path)
+    if not _DRAFT_PREFIX_RE.match(p.name):
+        return False
+    if siblings is None:
+        siblings = _sibling_ggufs(p.parent)
+    for s in siblings:
+        if s.name == p.name:
+            continue
+        d = find_draft_model(s, siblings)
+        if d is not None and d.name == p.name:
+            return True
+    return False
+
+
 def infer_kv_class(filename: str) -> str:
     """Guess the kv_class for VRAM estimation from the GGUF filename."""
     for pattern, kv_class in _KV_CLASS_PATTERNS:
         if pattern.search(filename):
             return kv_class
     return "default"
+
+
+def infer_kv_class_from_path(path: Path) -> str | None:
+    """Infer kv_class from GGUF metadata when available.
+
+    More reliable than the filename heuristic for families that share a name
+    across dense and MoE variants (e.g. Gemma-4, Qwen3): the architecture
+    string is identical, so ``expert_count`` metadata is what actually tells
+    dense and MoE apart. Returns None when metadata can't decide, so the
+    caller falls back to ``infer_kv_class`` (filename) or ``"default"``.
+    """
+    meta = read_gguf_meta(path)
+    if not meta:
+        return None
+    # MoE is the highest-value signal: dense and MoE variants of the same
+    # family share an architecture string, so expert_count distinguishes them.
+    if is_moe(path):
+        return "moe_a3b"
+    arch = str(meta.get("architecture", "")).lower()
+    if arch.startswith("gemma"):
+        return "gemma_swa"
+    if arch == "phi4" or arch.startswith("phi4"):
+        return "phi4"
+    return None
+
+
+def resolve_kv_class(path: Path, explicit: str = "default") -> str:
+    """Pick the kv_class for VRAM sizing.
+
+    Order of precedence:
+      1. an explicit, non-default override from the caller (CLI flag),
+      2. GGUF metadata (MoE / Gemma / Phi-4 — the cases the filename gets wrong),
+      3. the filename heuristic,
+      4. ``"default"``.
+    """
+    if explicit != "default":
+        return explicit
+    meta_kv = infer_kv_class_from_path(path)
+    if meta_kv is not None:
+        return meta_kv
+    return infer_kv_class(path.name)
 
 
 def short_name_from_path(path: Path, used: set[str]) -> str:
@@ -291,8 +487,9 @@ def register_discovered(
     gpu = cfg.find_gpu(gpu_pci_slot)
     if gpu is None:
         raise ValueError(f"Unknown GPU: {gpu_pci_slot}")
-    from arc_llama.arch import Arch
+    from arc_llama.arch import Arch, Backend
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
+    backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     existing_paths = {Path(m.path).resolve() for m in cfg.models}
     used_names = {m.name for m in cfg.models}
     used_ports = {m.port for m in cfg.models}
@@ -306,28 +503,59 @@ def register_discovered(
             continue
         if not rp.exists():
             continue
-        kv_class = infer_kv_class(rp.name)
+        if looks_like_draft(rp):
+            log.info("skipping %s (speculative draft for a sibling model)", rp.name)
+            continue
+        kv_class = resolve_kv_class(rp)
         recipe = default_recipe(
             arch=arch,
             vram_mb=gpu.vram_mb or 8192,
             model_file_mb=rp.stat().st_size // (1024 * 1024),
             kv_class=kv_class,
+            backend=backend,
         )
-        recipe_dict: dict[str, Any] = {
-            "n_gpu_layers": recipe.n_gpu_layers,
-            "ctx": recipe.ctx,
-            "parallel": recipe.parallel,
-            "cache_type_k": recipe.cache_type_k.value,
-            "cache_type_v": recipe.cache_type_v.value,
-        }
+        recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
+        # n_max=3 pinned from B60 measurements (see bench_results/SUMMARY.md).
         if has_mtp_heads(rp):
             recipe_dict["spec_type"] = "draft-mtp"
-            recipe_dict["ubatch_size"] = 8
+            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
             log.info(
-                "discovered %s has MTP heads; auto-enabling spec_type=draft-mtp, ubatch_size=8",
-                rp.name,
+                "discovered %s has embedded MTP heads; auto-enabling draft-mtp n_max=%d",
+                rp.name, DEFAULT_SPEC_DRAFT_N_MAX,
             )
+        else:
+            draft = find_draft_model(rp)
+            if draft is not None:
+                recipe_dict["spec_type"] = "draft-mtp"
+                recipe_dict["spec_draft_model"] = str(draft)
+                recipe_dict["spec_draft_ngl"] = DEFAULT_SPEC_DRAFT_NGL
+                recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+                log.info(
+                    "discovered %s: sidecar draft %s; auto-enabling draft-mtp n_max=%d",
+                    rp.name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+                )
+        # Suggest MoE expert offload on VRAM-tight cards.
+        if is_moe(rp):
+            num_experts = expert_count(rp)
+            if num_experts is not None:
+                n_cpu = _suggest_moe_offload(
+                    vram_mb=gpu.vram_mb or 8192,
+                    model_file_mb=rp.stat().st_size // (1024 * 1024),
+                    num_experts=num_experts,
+                )
+                if n_cpu:
+                    recipe_dict["n_cpu_moe"] = n_cpu
+                    log.info(
+                        "discovered %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
+                        rp.name, num_experts, n_cpu,
+                    )
+            else:
+                log.debug(
+                    "discovered %s looks like MoE but expert count could not be read; "
+                    "manual --n-cpu-moe tuning may help",
+                    rp.name,
+                )
         name = short_name_from_path(rp, used_names)
         used_names.add(name)
         port = port_start

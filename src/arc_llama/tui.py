@@ -11,6 +11,7 @@ Color choices avoid red/green — status is signalled by brightness/dim, not hue
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -245,7 +246,7 @@ class ArcLlamaTUI(App):
             status = "[b]LOADED[/]" if loaded else "[dim]idle[/]"
             kv = f"{m.get('cache_type_k') or '?'}/{m.get('cache_type_v') or '?'}"
             path = m.get("path") or "—"
-            short = "/".join(p for p in path.split("/") if p)[-50:]
+            short = "/".join(Path(path).parts)[-50:]
             row_text = (status, m["name"], m.get("gpu_pci_slot", "?"),
                         str(m.get("port") or "?"), str(m.get("ctx") or "?"), kv, short)
             if loaded:

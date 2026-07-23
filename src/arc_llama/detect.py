@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from arc_llama.arch import Arch, arch_for_device_id
+from arc_llama.arch import Arch, arch_for_device_id, known_vram_mib
 
 INTEL_VENDOR_ID = 0x8086
 PCI_CLASS_VGA = 0x030000      # 0x03_00_00 — VGA-compatible controller
@@ -94,12 +94,14 @@ def _drm_nodes(sysfs: Path) -> tuple[str | None, str | None]:
 
 
 def _vram_mib(sysfs: Path) -> int | None:
-    """Pull VRAM size from xe driver sysfs. i915 doesn't expose this consistently."""
-    # xe driver:  device/mem_info_vram_total (bytes, integer)
+    """Pull VRAM size from xe / i915 / amdgpu sysfs layouts."""
     candidates = [
-        sysfs / "mem_info_vram_total",
+        sysfs / "mem_info_vram_total",                       # amdgpu / some xe
         sysfs / "device" / "mem_info_vram_total",
-        sysfs / "tile0" / "physical_vram_size_bytes",
+        sysfs / "tile0" / "physical_vram_size_bytes",        # xe (Battlemage)
+        sysfs / "device" / "tile0" / "physical_vram_size_bytes",
+        sysfs / "lmem_total_bytes",                          # i915 dGPU
+        sysfs / "device" / "lmem_total_bytes",
     ]
     for c in candidates:
         v = _read_int(c)
@@ -128,6 +130,15 @@ def _scan_pci() -> list[DetectedGPU]:
         driver = _driver_name(slot_dir)
         card, render = _drm_nodes(slot_dir)
         vram = _vram_mib(slot_dir)
+        vram_from_table = False
+        if vram is None:
+            # Driver didn't expose VRAM via sysfs (common on older i915 and some
+            # early xe releases). Fall back to the known-size table keyed by
+            # PCI device ID so context sizing still works without clinfo.
+            known = known_vram_mib(device_id)
+            if known is not None:
+                vram = known
+                vram_from_table = True
         gpu = DetectedGPU(
             pci_slot=slot_dir.name,
             device_id=device_id,
@@ -139,6 +150,11 @@ def _scan_pci() -> list[DetectedGPU]:
             drm_render=render,
             sysfs_path=str(slot_dir),
         )
+        if vram_from_table:
+            gpu.notes.append(
+                f"VRAM {vram // 1024} GB from device-ID fallback table "
+                f"(driver exposed no mem_info_vram_total)."
+            )
         if driver is None:
             gpu.notes.append("No kernel driver bound — install `xe` or `i915` modules.")
         found.append(gpu)

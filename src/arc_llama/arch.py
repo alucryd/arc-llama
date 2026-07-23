@@ -17,6 +17,12 @@ class Arch(str, Enum):
     UNKNOWN = "unknown"
 
 
+class Backend(str, Enum):
+    """Which llama.cpp compute backend to use for a GPU."""
+    SYCL = "sycl"     # Intel oneAPI/SYCL path; best prompt-eval on Arc
+    VULKAN = "vulkan" # Cross-vendor Vulkan path; often better token-gen on Arc
+
+
 @dataclass
 class ArchProfile:
     """SYCL recipe for a specific Intel GPU generation."""
@@ -30,6 +36,13 @@ class ArchProfile:
     """Human-readable notes shown in `arc-llama doctor`."""
     safe_kv_q8: bool = True
     """Whether q8_0 K/V cache produces correct generation on this arch."""
+    safe_kv_q8_vulkan: bool = False
+    """Whether q8_0 K/V cache is safe on the Vulkan backend for this arch.
+
+    Vulkan requires --flash-attn for quantized V-cache. Profiles that set
+    this True must also emit ``--flash-attn`` (default_recipe / launch policy
+    do that automatically).
+    """
     prefer_uniform_quants: bool = True
     """If true, recommend Q4_K_M over Unsloth Dynamic XL/UD variants."""
 
@@ -101,6 +114,85 @@ LUNAR_LAKE_IDS: dict[int, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Known VRAM by PCI device ID (MiB). Fallback when the kernel driver doesn't
+# expose mem_info_vram_total via sysfs (common on older i915 and some early
+# xe releases). Source: Intel ARK product pages.
+#
+# Caveat: a few IDs map to multiple SKUs with different memory sizes
+# (notably 0x56A0 = Arc A770, sold in both 8 GB and 16 GB). Where that's the
+# case we list the larger common SKU and rely on sysfs/clinfo to override when
+# available; sizing from this table is conservative-by-default territory.
+# ---------------------------------------------------------------------------
+VRAM_BY_DEVICE_ID: dict[int, int] = {
+    # Alchemist (DG2)
+    0x56A0: 16384,  # Arc A770 — also an 8 GB SKU shares this ID
+    0x56A1: 8192,   # Arc A750
+    0x56A2: 8192,   # Arc A580
+    0x56A3: 6144,   # Arc A380 (variant)
+    0x56A4: 4096,   # Arc A310
+    0x56A5: 6144,   # Arc A380
+    0x56A6: 6144,   # Arc A380
+    0x56A8: 12288,  # Arc Pro A60
+    0x56A9: 12288,  # Arc Pro A60M
+    0x56B2: 12288,  # Arc Pro A60M
+    0x56B3: 12288,  # Arc Pro A60
+    0x56BA: 6144,   # Arc A380E
+    0x56BB: 4096,   # Arc A310E
+    0x5690: 16384,  # Arc A770M
+    0x5691: 12288,  # Arc A730M
+    0x5692: 8192,   # Arc A550M
+    # Battlemage (BMG)
+    0xE20B: 12288,  # Arc B580
+    0xE20C: 10240,  # Arc B570
+    0xE211: 24576,  # Arc Pro B60
+    0xE212: 24576,  # Arc Pro B-series (assumed B60-class)
+}
+
+# ocloc -device strings for AOT (ahead-of-time) SYCL compilation, keyed by PCI
+# device ID. Building llama-server with -DGGML_SYCL_DEVICE_ARCH=<string> bakes
+# device code for your GPU generation and eliminates the ~20s SYCL JIT
+# recompile paid on every cold start — doubly important on Battlemage, where
+# the JIT cache is disabled (SYCL_CACHE_PERSISTENT=0) to dodge a SIGSEGV.
+# Source: Intel oneAPI ocloc device naming.
+AOT_ARCH_BY_DEVICE_ID: dict[int, str] = {
+    # Alchemist ACM-G10 (A770 / A750 / A580)
+    0x56A0: "acm-g10", 0x56A1: "acm-g10", 0x56A2: "acm-g10",
+    0x56A8: "acm-g10", 0x56B3: "acm-g10",  # Arc Pro A60 (ACM-G10)
+    # Alchemist ACM-G11 (A380 / A310)
+    0x56A3: "acm-g11", 0x56A4: "acm-g11", 0x56A5: "acm-g11", 0x56A6: "acm-g11",
+    0x56BA: "acm-g11", 0x56BB: "acm-g11",
+    # Battlemage BMG-G21 (B570 / B580 / Pro B60)
+    0xE20B: "bmg-g21", 0xE20C: "bmg-g21", 0xE211: "bmg-g21", 0xE212: "bmg-g21",
+}
+
+
+def known_vram_mib(device_id: int) -> int | None:
+    """Return a known VRAM size (MiB) for a device ID, or None if unknown."""
+    return VRAM_BY_DEVICE_ID.get(device_id)
+
+
+def aot_arch_for(device_id: int) -> str | None:
+    """Return the ocloc -device string for AOT SYCL compilation, or None.
+
+    Falls back to a generation-level default when the exact device ID isn't
+    listed (all known Battlemage dies are BMG-G21; Alchemist splits across
+    ACM-G10 and ACM-G11, so the fallback uses the device-ID range heuristic).
+    """
+    exact = AOT_ARCH_BY_DEVICE_ID.get(device_id)
+    if exact:
+        return exact
+    arch, _ = arch_for_device_id(device_id)
+    if arch == Arch.BATTLEMAGE:
+        return "bmg-g21"
+    if arch == Arch.ALCHEMIST:
+        # ACM-G10 = A770/A750/A580/Pro A60; ACM-G11 = A380/A310.
+        if 0x56A0 <= device_id <= 0x56A2 or device_id in (0x56A8, 0x56B3, 0x56A9, 0x56B2):
+            return "acm-g10"
+        return "acm-g11"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
 
@@ -122,6 +214,8 @@ ALCHEMIST_PROFILE = ArchProfile(
         "Enable `intel-compute-runtime` and `intel-level-zero-gpu` packages.",
     ],
     safe_kv_q8=True,
+    # With auto --flash-attn (recipes + policy), q8 KV is the competitive default.
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 
@@ -150,11 +244,15 @@ BATTLEMAGE_PROFILE = ArchProfile(
     notes=[
         "Requires kernel 6.14+ and Mesa 24.x+ for stable `xe` driver.",
         "ReBAR REQUIRED — without it llama.cpp will fall back to slow paths.",
-        "First inference per cold start pays ~20s of SYCL JIT compile.",
+        "First inference per cold start pays ~20s of SYCL JIT compile. An AOT "
+        "build (-DGGML_SYCL_DEVICE_ARCH=bmg-g21) eliminates it entirely.",
         "q8_0 K/V cache works correctly but on some builds underutilises memory "
-        "bandwidth on dense models. Verify perf if you care; correctness is OK.",
+        "bandwidth on dense models. Run `arc-llama tune MODEL` to measure.",
+        "Compare SYCL vs Vulkan and draft-mtp with `arc-llama benchmark` — "
+        "relative wins depend on model class and llama-server build.",
     ],
     safe_kv_q8=True,
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 
@@ -176,6 +274,7 @@ LUNAR_LAKE_PROFILE = ArchProfile(
         "Prefer smaller models (≤7B Q4_K_M) for usable speeds.",
     ],
     safe_kv_q8=True,
+    safe_kv_q8_vulkan=True,
     prefer_uniform_quants=True,
 )
 

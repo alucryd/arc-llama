@@ -8,6 +8,15 @@ from __future__ import annotations
 # instructions are therefore sent as the first user message instead.
 SYSTEM_PROMPT = "You are a helpful assistant."
 
+PLANNING_INSTRUCTIONS = (
+    "You are working inside the user's project directory.\n"
+    "\n"
+    "Before making any changes, produce a clear implementation plan for the "
+    "user's request. List the files you need to read or modify, the commands "
+    "you intend to run, and the order of operations. Do not write any files or "
+    "run any commands yet. Keep the plan concise but specific enough to review.\n"
+)
+
 USER_INSTRUCTIONS = (
     "You are working inside the user's project directory.\n"
     "\n"
