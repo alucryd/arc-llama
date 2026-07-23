@@ -53,3 +53,35 @@ def test_init_fails_when_llama_server_binary_missing(monkeypatch, tmp_path, cli_
     assert result.exit_code == 3
     assert "llama-server binary not found" in result.output
     assert "/nonexistent/llama-server" in result.output
+
+
+def test_init_writes_config_without_binary_and_hints_install_runtime(
+    monkeypatch, tmp_path, cli_runner
+):
+    """A new user with no llama-server yet: init still writes a GPU config and
+    points them at install-runtime, instead of hard-failing."""
+    config_file = tmp_path / "config.toml"
+    cfg = _make_test_config(tmp_path)
+
+    monkeypatch.setattr("arc_llama.cli.load_config", lambda path: cfg)
+    monkeypatch.setattr("arc_llama.cli.default_config_path", lambda: config_file)
+    monkeypatch.setattr("arc_llama.cli.detect_gpus", lambda: cfg.gpus)
+    monkeypatch.setattr(
+        "arc_llama.cli.init_config_from_detection",
+        lambda gpus, llama_server_path: cfg,
+    )
+    monkeypatch.setattr(
+        "arc_llama.cli._resolve_llama_server",
+        lambda explicit: str(tmp_path / "no-such-llama-server"),
+    )
+    # detect_gpus is mocked to return GPUConfig objects; the real gpu-table
+    # renderer expects detected-GPU objects (with vram_gb), so stub it out.
+    monkeypatch.setattr("arc_llama.cli._print_gpu_table", lambda gpus: None)
+
+    result = cli_runner.invoke(
+        cli, ["--config", str(config_file), "init", "--no-scan"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "install-runtime" in result.output
+    assert config_file.exists()

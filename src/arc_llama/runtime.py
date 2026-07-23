@@ -247,6 +247,8 @@ def install_runtime(
                     if cfg is None:
                         cfg = load_config(config_path)
                     cfg.paths.llama_server = str(existing)
+                    for gpu_cfg in cfg.gpus:
+                        gpu_cfg.backend = backend
                     cfg.save(config_path)
                 return RuntimeInstallResult(
                     binary_path=existing,
@@ -291,6 +293,8 @@ def install_runtime(
             if cfg is None:
                 cfg = load_config(config_path)
             cfg.paths.llama_server = str(binary)
+            for gpu_cfg in cfg.gpus:
+                gpu_cfg.backend = backend
             cfg.save(config_path)
 
         return RuntimeInstallResult(

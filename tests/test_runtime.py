@@ -299,3 +299,44 @@ def test_install_runtime_force_redownloads(monkeypatch, tmp_path):
         backend="vulkan", cfg=cfg, set_default=False, config_path=config_path, force=True
     )
     assert call_count["n"] == 2
+
+
+def test_install_runtime_aligns_gpu_backend(monkeypatch, tmp_path):
+    import arc_llama.runtime as rt
+    from arc_llama.config import Config, GPUConfig, PathsConfig
+
+    fake_archive = _build_fake_archive(tmp_path)
+
+    monkeypatch.setattr(rt, "resolve_release", lambda client, version: _fake_release())
+
+    def fake_download(client, asset, dest_file, on_progress=None):
+        shutil.copy(fake_archive, dest_file)
+        return dest_file
+
+    monkeypatch.setattr(rt, "download_asset", fake_download)
+    monkeypatch.setattr(rt, "detect_llama_server_backend", lambda p: Backend.VULKAN)
+    monkeypatch.setattr(rt, "host_platform", lambda: ("linux", "x64"))
+
+    cfg = Config(
+        paths=PathsConfig(state_dir=str(tmp_path), llama_server=""),
+        gpus=[
+            GPUConfig(
+                pci_slot="0000:03:00.0",
+                sycl_index=0,
+                arch="battlemage",
+                vram_mb=24576,
+                enabled=True,
+                backend="sycl",
+            )
+        ],
+    )
+
+    result = install_runtime(
+        backend="vulkan",
+        cfg=cfg,
+        set_default=True,
+        config_path=tmp_path / "config.toml",
+    )
+
+    assert cfg.gpus[0].backend == "vulkan"
+    assert cfg.paths.llama_server == str(result.binary_path)

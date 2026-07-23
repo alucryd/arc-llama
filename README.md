@@ -13,10 +13,11 @@ It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
 > [!NOTE]
-> **Status: 0.3.0.** Tested end-to-end on Battlemage B60. HF download,
-> streaming, and the OpenAI-compatible API all pass. Other SKUs (A770, A380,
-> B580) need community confirmation -- open an issue if something breaks on
-> your card.
+> **Status: 0.5.0.** Tested end-to-end on Battlemage B60: `arc-llama
+> install-runtime` fetches a portable Vulkan `llama-server` and serves real
+> inference with no oneAPI install or source build. HF download, streaming,
+> and the OpenAI-compatible API all pass. Other SKUs (A770, A380, B580) need
+> community confirmation -- open an issue if something breaks on your card.
 
 ## What you get
 
@@ -60,32 +61,36 @@ pip install arc-llama
 # cd arc-llama
 # pip install -e .
 
-# 2. Detect GPUs and write a starter config
-arc-llama init --llama-server /path/to/your/built/llama-server
+# 2. Detect GPUs and write a starter config (no llama-server needed yet)
+arc-llama init
 
-# 3. Look at what was found
+# 3. Download a portable Vulkan llama-server and wire it into the config.
+#    No oneAPI, no building llama.cpp. (Use --backend sycl for the SYCL build.)
+arc-llama install-runtime
+
+# 4. Look at what was found
 arc-llama doctor
 arc-llama gpus
 
-# 4. Auto-register every GGUF found under your scan paths.
+# 5. Auto-register every GGUF found under your scan paths.
 #    `init` ran this once; rerun any time you drop new files in.
 arc-llama scan
 # (or for one-offs: arc-llama add /path/to/some.gguf,
 #  or HF: arc-llama add unsloth/gemma-4-31B-it-GGUF:Q4_K_M --from-hf)
 
-# 5. Run the OpenAI-compatible server (also serves the web UI at /)
+# 6. Run the OpenAI-compatible server (also serves the web UI at /)
 arc-llama serve
 
-# 6. (Optional) Measure, then let arc-llama find the fastest recipe for a
+# 7. (Optional) Measure, then let arc-llama find the fastest recipe for a
 #    model on YOUR card (staged sweep over KV type, ubatch, flash attention;
-#    ~10 min, writes the winner into the config)
-arc-llama benchmark qwen3-7b
-arc-llama tune qwen3-7b
+#    ~10 min, writes the winner into the config). Use `tune --all` for every model.
+arc-llama benchmark <model>
+arc-llama tune <model>
 
-# 7. (Optional) Open the terminal UI in another window
+# 8. (Optional) Open the terminal UI in another window
 arc-llama tui
 
-# 8. (Optional) Install a systemd --user unit
+# 9. (Optional) Install a systemd --user unit
 arc-llama systemd --write
 systemctl --user daemon-reload
 systemctl --user enable --now arc-llama.service
@@ -338,6 +343,7 @@ docker run ... \
 - ~~Container image with `llama-server` + arc-llama prebuilt.~~ ✅
 - ~~`arc-llama benchmark` , quick prompt-eval/gen tok/s harness.~~ ✅
 - ~~`arc-llama tune` , measure-and-persist recipe autotuner.~~ ✅
+- ~~`arc-llama install-runtime` , download a prebuilt llama-server (Vulkan-first).~~ ✅
 - ~~`arc-llama tune --all` , sweep every registered model in one run.~~ ✅
 
 ## Contributing
