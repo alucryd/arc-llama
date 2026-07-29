@@ -101,3 +101,21 @@ def make_config(tmp_path: Path, *, single_resident: bool = True) -> Config:
         ),
     ]
     return cfg
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config_home(tmp_path: Path, monkeypatch):
+    """Redirect XDG dirs to a temp path so the suite never touches the developer's real config."""
+    config_home = tmp_path / ".config"
+    config_home.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(config_home))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+
+
+@pytest.fixture
+def base_config(tmp_path: Path) -> Config:
+    """A populated Config using temp paths, suitable for CLI tests."""
+    return make_config(tmp_path)
