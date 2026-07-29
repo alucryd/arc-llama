@@ -6,6 +6,7 @@ nextn_predict_layers, block_count) without loading tensor data.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,14 @@ def read_gguf_meta(path: Path | str) -> dict[str, Any]:
         if expert_count_field is not None:
             try:
                 meta["expert_count"] = int(expert_count_field.contents())
+            except (TypeError, ValueError):
+                pass
+        # Trained context length: llama.cpp silently clamps the served ctx
+        # to this value, so any configured ctx above it is a lie.
+        ctx_field = reader.get_field(f"{arch}.context_length")
+        if ctx_field is not None:
+            try:
+                meta["context_length"] = int(ctx_field.contents())
             except (TypeError, ValueError):
                 pass
 
@@ -182,6 +191,33 @@ def expert_count(path: Path | str) -> int | None:
     return None
 
 
+def trained_context_length(path: Path | str) -> int | None:
+    """Return the model's trained context length, if known.
+
+    Never raises: missing or malformed files return None.
+    """
+    meta = read_gguf_meta(path)
+    arch = meta.get("architecture", "")
+    # Architecture-specific key is canonical; keep a bare fallback so mocked
+    # metadata and alternate converter spellings still work.
+    keys: list[str] = []
+    if arch:
+        keys.append(f"{arch}.context_length")
+    keys.append("context_length")
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str):
+            try:
+                n = int(value)
+                if n > 0:
+                    return n
+            except ValueError:
+                pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
@@ -198,10 +234,6 @@ def mtp_info(path: Path | str) -> dict[str, Any]:
         "is_hybrid_ssm": is_hybrid_ssm(path),
     }
 
-
-# ---------------------------------------------------------------------------
-# VRAM estimation
-# ---------------------------------------------------------------------------
 
 # Map GGML quantization type -> bytes per element. SYCL/Vulkan keep quantized
 # weights in their packed device format, so the raw tensor byte size is the
@@ -233,12 +265,152 @@ def _tensor_vram_bytes(tensor: Any) -> int:
     return 0
 
 
-def estimate_weight_vram_bytes(path: Path | str) -> int | None:
-    """Estimate the VRAM footprint of the model weights alone.
+# ---------------------------------------------------------------------------
+# Override-tensor helpers (--override-tensor <pattern>=CPU)
+# ---------------------------------------------------------------------------
 
-    Sums the raw quantized tensor sizes from the GGUF file, which closely
-    matches the device-side footprint on SYCL/Vulkan. Falls back to the file
-    size if the GGUF cannot be inspected.
+_OVERRIDABLE_BUFFER_TYPE = "CPU"
+
+
+def _expert_projection_class(name: str) -> str | None:
+    """Projection class of a routed-expert tensor, e.g. 'gate_up', 'down'.
+
+    Some upstream MoE checkpoints spell the routed-expert marker ``chexps``
+    (e.g. ``blk.0.ffn_down_chexps.weight``); the optional ``ch`` prefix is
+    kept out of the projection class so pattern generation groups by the
+    projection type, not by the spelling variant.
+    """
+    m = re.match(r"^blk\.\d+\.ffn_(.+?)_(?:ch)?exps\.", name)
+    return m.group(1) if m else None
+
+
+def override_tensor_saved_bytes(table: dict[str, int], patterns: list[str]) -> int:
+    """Bytes that would move off the GPU for the given ``--override-tensor`` patterns.
+
+    Verified against llama.cpp ``src/llama-model-loader.cpp:1161-1162``: each
+    pattern is applied with ``std::regex_search`` over the full tensor name, so
+    the Python side uses ``re.search`` for a faithful byte count.
+    """
+    compiled: list[re.Pattern[str]] = []
+    for pat in patterns:
+        try:
+            compiled.append(re.compile(pat))
+        except re.error as exc:
+            raise ValueError(f"invalid override-tensor regex {pat!r}: {exc}") from exc
+    return sum(
+        nbytes
+        for name, nbytes in table.items()
+        if any(c.search(name) for c in compiled)
+    )
+
+
+def validate_override_patterns(table: dict[str, int] | None, patterns: list[str]) -> tuple[bool, str]:
+    """Return (ok, error_message) for a proposed list of regex patterns.
+
+    A pattern that matches zero tensors is rejected: unlike ``--n-cpu-moe``,
+    ``-ot`` silently does nothing when its regex is wrong, and the only way
+    to catch that without real hardware is to validate against the model's
+    actual tensor list.
+    """
+    if table is None:
+        return True, ""  # cannot validate without a readable GGUF
+    for pat in patterns:
+        try:
+            compiled = re.compile(pat)
+        except re.error as exc:
+            return False, f"override_tensor regex {pat!r} is invalid: {exc}"
+        if not any(compiled.search(name) for name in table):
+            return False, f"override_tensor pattern {pat!r} matches zero tensors"
+    return True, ""
+
+
+def propose_override_tensor_patterns(table: dict[str, int]) -> list[str]:
+    """Generate candidate ``--override-tensor`` regexes from real tensor names.
+
+    Candidates are ordered from the cheapest expected throughput cost to the
+    most expensive. The projection class that offloads the fewest bytes is
+    tried first because moving less weight off the GPU means fewer PCIe
+    round-trips per token; heavier options follow. The last candidate always
+    offloads every routed-expert tensor, mirroring full ``--n-cpu-moe``.
+    """
+    if not table:
+        return []
+    by_class: dict[str, int] = {}
+    for name, nbytes in table.items():
+        if _expert_tensor_layer(name) is None:
+            continue
+        cls = _expert_projection_class(name)
+        if cls is None:
+            continue
+        by_class[cls] = by_class.get(cls, 0) + nbytes
+    if not by_class:
+        return []
+    # Cheapest-first: offload the smallest projection class first.
+    ordered = sorted(by_class, key=lambda c: by_class[c])
+    # Match both plain ``_exps`` and the upstream ``_chexps`` spelling, but
+    # not shared experts (``_shexp``) or router gates (``_inp``).
+    catch_all = r"blk\.\d+\.ffn_.*_(?:ch)?exps\."
+    candidates: list[str] = []
+    for cls in ordered:
+        pat = rf"blk\.\d+\.ffn_{re.escape(cls)}_(?:ch)?exps\."
+        # Skip if the catch-all would be identical (only one projection class).
+        if pat != catch_all:
+            candidates.append(pat)
+    # Final fallback: all routed expert tensors, regardless of projection.
+    candidates.append(catch_all)
+    return candidates
+
+
+# Routed-expert tensors are the ones llama.cpp's --n-cpu-moe N moves to the
+# host: the per-layer `_exps` tensors of layers 0..N-1. Shared experts
+# (ffn_*_shexp) and router gates (ffn_gate_inp) stay on the GPU, as do
+# attention and embedding tensors.
+#
+# Match on the `_exps` marker rather than an enumerated list of projection
+# names. Models fuse projections differently -- Gemma 4 26B-A4B ships
+# `blk.N.ffn_gate_up_exps.weight`, a single fused gate+up tensor -- and an
+# enumeration of {gate,up,down}_exps silently counted only the down
+# projection there, under-reporting expert bytes by ~2.7x (143 MB/layer
+# against a measured 393 MB/layer). Under-counting pushes
+# min_moe_offload_layers to demand far more offloaded layers than needed,
+# which is the expensive direction: on a B60 at ctx 16384, full offload cost
+# 79% of prompt-eval throughput. Any future fusion spelling is matched by
+# construction here.
+#
+# `.scale` sub-tensors (e.g. blk.N.ffn_down_exps.scale) are counted: they are
+# quantisation metadata for those expert weights and travel with them to the
+# host, so excluding them would under-report the saving again, just by less.
+_EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\.ffn_\w*exps\b")
+_SHARED_EXPERT_MARKER = "shexp"
+
+# A sparse MoE keeps the large majority of its weights in routed experts. If
+# the matched share falls below this, the tensor naming almost certainly moved
+# again and we are silently under-counting, so warn loudly and name the
+# tensors we failed to match. This is the check that would have caught the
+# fused-projection bug without hardware.
+_MIN_PLAUSIBLE_EXPERT_SHARE = 0.20
+
+
+def _expert_tensor_layer(name: str) -> int | None:
+    """Layer index of a routed-expert tensor name, or None.
+
+    Shared experts are excluded: they are resident on every token, so
+    llama.cpp keeps them on the device and --n-cpu-moe does not move them.
+    """
+    if _SHARED_EXPERT_MARKER in name:
+        return None
+    m = _EXPERT_TENSOR_RE.match(name)
+    return int(m.group(1)) if m else None
+
+
+def scan_weight_tensors(path: Path | str) -> tuple[int, dict[int, int]] | None:
+    """One pass over the GGUF tensor table.
+
+    Returns ``(total_weight_bytes, {layer_idx: routed_expert_bytes})``, or
+    None when the file cannot be read. This is the single parser behind both
+    ``estimate_weight_vram_bytes`` and the MoE offload accounting — the VRAM
+    estimator and the offload search must never disagree about what a model
+    weighs, so they share this scan.
     """
     p = Path(path)
     if not p.exists():
@@ -246,13 +418,107 @@ def estimate_weight_vram_bytes(path: Path | str) -> int | None:
     try:
         reader = gguf.GGUFReader(p)
     except Exception as exc:
-        log.debug("gguf weight estimate failed for %s: %s", p, exc)
+        log.debug("gguf weight scan failed for %s: %s", p, exc)
         return None
 
     total = 0
+    expert_by_layer: dict[int, int] = {}
+    unmatched_expert_names: list[str] = []
     for tensor in reader.tensors:
-        total += _tensor_vram_bytes(tensor)
-    return total
+        nbytes = _tensor_vram_bytes(tensor)
+        total += nbytes
+        name = getattr(tensor, "name", "") or ""
+        layer = _expert_tensor_layer(name)
+        if layer is not None:
+            expert_by_layer[layer] = expert_by_layer.get(layer, 0) + nbytes
+        elif "exps" in name and _SHARED_EXPERT_MARKER not in name:
+            # Looks like a routed-expert tensor but did not parse as one.
+            unmatched_expert_names.append(name)
+
+    expert_bytes = sum(expert_by_layer.values())
+    looks_moe = bool(expert_by_layer) or bool(unmatched_expert_names)
+    if looks_moe and total > 0:
+        share = expert_bytes / total
+        if share < _MIN_PLAUSIBLE_EXPERT_SHARE:
+            log.warning(
+                "%s: routed-expert tensors are only %.1f%% of total weight bytes, "
+                "which is implausibly low for a MoE model -- expert offload "
+                "accounting is probably under-counting. Unmatched expert-like "
+                "tensors: %s",
+                p.name, share * 100,
+                ", ".join(sorted(set(unmatched_expert_names))[:8]) or "(none)",
+            )
+    return total, expert_by_layer
+
+
+def estimate_weight_vram_bytes(path: Path | str, *, n_cpu_moe: int = 0) -> int | None:
+    """Estimate the VRAM footprint of the model weights alone.
+
+    Sums the raw quantized tensor sizes from the GGUF file, which closely
+    matches the device-side footprint on SYCL/Vulkan. Falls back to the file
+    size if the GGUF cannot be inspected.
+
+    When ``n_cpu_moe`` > 0, subtracts the routed-expert tensor bytes of the
+    first N layers — exactly the bytes ``--n-cpu-moe N`` keeps on the host
+    (N is a *layer* count, not an expert count). Returns None when the GGUF
+    cannot be read, and also when offload accounting was requested but the
+    model is MoE yet has no recognisable expert tensors: in that case the
+    offloaded bytes are genuinely unknown and callers must NOT fall back to
+    counting full weights — that fallback is what made offload-configured
+    models unloadable.
+    """
+    scan = scan_weight_tensors(path)
+    if scan is None:
+        return None
+    total, expert_by_layer = scan
+    if n_cpu_moe <= 0:
+        return total
+    if not expert_by_layer:
+        # Parsed fine but nothing to offload: either a dense model (the flag
+        # is inert and the full count is correct) or an MoE variant whose
+        # tensor names we don't recognise (the full count would be wrong).
+        if is_moe(path):
+            log.debug(
+                "gguf %s is MoE but no routed-expert tensors were found; "
+                "offload bytes undetermined",
+                path,
+            )
+            return None
+        return total
+    saved = sum(b for layer, b in expert_by_layer.items() if layer < n_cpu_moe)
+    return total - saved
+
+
+def expert_tensor_bytes_by_layer(path: Path | str) -> dict[int, int] | None:
+    """Routed-expert tensor bytes per layer index, or None if unreadable."""
+    scan = scan_weight_tensors(path)
+    return scan[1] if scan is not None else None
+
+
+# ---------------------------------------------------------------------------
+# VRAM estimation
+# ---------------------------------------------------------------------------
+
+
+def weight_tensor_table(path: Path | str) -> dict[str, int] | None:
+    """Return ``{tensor_name: packed_bytes}`` for every weight tensor, or None.
+
+    This is the single parser behind both the offload byte counters and the
+    override-tensor pattern generator, so they can never disagree about what
+    a model weighs or what a regex actually matches.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        reader = gguf.GGUFReader(p)
+    except Exception as exc:
+        log.debug("gguf weight table read failed for %s: %s", p, exc)
+        return None
+    return {
+        getattr(tensor, "name", "") or "": _tensor_vram_bytes(tensor)
+        for tensor in reader.tensors
+    }
 
 
 def gguf_vram_estimate(path: Path | str) -> dict[str, Any]:

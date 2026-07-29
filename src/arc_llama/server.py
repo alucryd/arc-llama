@@ -76,7 +76,7 @@ async def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
-def create_app(cfg: Config | None = None) -> FastAPI:
+def create_app(cfg: Config | None = None, config_path: Path | None = None) -> FastAPI:
     cfg = cfg or load_config()
     state_dir = None
     if cfg.paths.state_dir:
@@ -102,10 +102,25 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             app.state.semantic_index = SemanticIndex(Path(".arc_llama_semantic_index"))
         load_skills(cfg.paths.skills_dir)
         app.state.mcp_manager = MCPClientManager(cfg.active_mcp_servers())
+        tuner: Any | None = None
+        if getattr(cfg, "tune", None) and cfg.tune.auto:
+            from arc_llama import __version__
+            from arc_llama.autotune import start_autotuner
+            from arc_llama.config import default_config_path
+
+            save_path = config_path or default_config_path()
+
+            def _save_cfg() -> None:
+                cfg.save(save_path)
+
+            tuner = start_autotuner(cfg, app.state.router, version=__version__, on_save=_save_cfg)
+            app.state.tuner = tuner
         try:
             await app.state.mcp_manager.start()
             yield
         finally:
+            if tuner is not None:
+                await tuner.stop()
             await app.state.mcp_manager.stop()
             await app.state.router.shutdown()
 
@@ -623,6 +638,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "batch_size": r.get("batch_size"),
                 "kv_class": m.kv_class,
                 "aliases": list(m.aliases),
+                "tune_state": m.tune_state,
+                "tuned_at": m.tuned_at,
+                "tune_error": m.tune_error,
+                "tune_fingerprint": m.tune_fingerprint,
             })
         gpus = [{
             "pci_slot": g.pci_slot,
@@ -638,6 +657,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "host": c.server.host,
                 "port": c.server.port,
                 "single_resident": c.server.single_resident,
+                "auto_tune": c.tune.auto,
             },
             "gpus": gpus,
             "models": models,
@@ -680,6 +700,58 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         rt: Router = request.app.state.router
         stopped = await rt.stop_all()
         return {"stopped": stopped}
+
+    @app.get("/admin/tune/status")
+    async def admin_tune_status(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, Any]:
+        """Return the current auto-tuner state and per-model tune status."""
+        rt: Router = request.app.state.router
+        c: Config = request.app.state.cfg
+        tuner = getattr(request.app.state, "tuner", None)
+        return {
+            "auto_tune": c.tune.auto,
+            "idle_seconds": c.tune.idle_seconds,
+            "sweep_running": bool(tuner and tuner.is_sweep_running),
+            "sweep_model": getattr(tuner, "running_model", None),
+            "sweep_stage": getattr(tuner, "running_stage", None),
+            "models": [
+                {
+                    "name": m.name,
+                    "tune_state": m.tune_state,
+                    "tuned_at": m.tuned_at,
+                    "tune_error": m.tune_error,
+                    "tune_fingerprint": m.tune_fingerprint,
+                }
+                for m in rt.all_models()
+            ],
+        }
+
+    @app.post("/admin/tune/{name}")
+    async def admin_tune_queue(
+        name: str, request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, Any]:
+        """Queue a model for immediate tuning when the next idle window arrives."""
+        c: Config = request.app.state.cfg
+        m = c.find_model(name)
+        if m is None:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
+        tuner = getattr(request.app.state, "tuner", None)
+        if tuner is None:
+            raise HTTPException(status_code=503, detail="Auto-tuner is not running")
+        ok = tuner.queue_now(name)
+        return {"queued": ok, "name": name}
+
+    @app.delete("/admin/tune")
+    async def admin_tune_abort(
+        request: Request, _auth: None = Depends(_require_admin)
+    ) -> dict[str, bool]:
+        """Abort the currently running sweep."""
+        tuner = getattr(request.app.state, "tuner", None)
+        if tuner is None:
+            return {"aborted": False}
+        aborted = tuner.abort_sweep()
+        return {"aborted": aborted}
 
     @app.post("/admin/parse-pdf")
     async def admin_parse_pdf(
@@ -727,11 +799,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
         Body is a partial recipe dict — only provided fields change. Recognised
         fields: `ctx`, `cache_type_k`, `cache_type_v`, `parallel`, `kv_class`,
-        `spec_type`, `ubatch_size`, `batch_size`, `flash_attn` (null clears).
+        `spec_type`, `ubatch_size`, `batch_size`, `flash_attn` (null clears),
+        `n_cpu_moe` (null or 0 clears), `override_tensor` (list of regex
+        patterns, null clears). When `override_tensor` is set, `n_cpu_moe` is
+        cleared and vice versa: the two flags are alternative means to the
+        same end and applying both would double-count the offload.
         If the model is currently loaded, the server is stopped first; callers
         decide whether to reload it afterwards via /admin/load.
         """
         from arc_llama.config import default_config_path
+        from arc_llama.gguf_meta import validate_override_patterns, weight_tensor_table
         from arc_llama.recipes import FLASH_ATTN_VALUES, KVCacheType
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
@@ -825,11 +902,49 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     detail=f"flash_attn must be one of {list(FLASH_ATTN_VALUES)} or null",
                 )
             changed.append("flash_attn")
+        if "n_cpu_moe" in body:
+            v = body["n_cpu_moe"]
+            if v is None:
+                recipe.pop("n_cpu_moe", None)
+            else:
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400, detail="n_cpu_moe must be an integer or null"
+                    ) from None
+                if not (0 <= n <= 1024):
+                    raise HTTPException(
+                        status_code=400, detail="n_cpu_moe must be 0..1024 (layers)"
+                    )
+                if n == 0:
+                    recipe.pop("n_cpu_moe", None)
+                else:
+                    recipe["n_cpu_moe"] = n
+                    recipe.pop("override_tensor", None)
+            changed.append("n_cpu_moe")
+        if "override_tensor" in body:
+            v = body["override_tensor"]
+            if v is None:
+                recipe.pop("override_tensor", None)
+            else:
+                if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="override_tensor must be a list of strings or null",
+                    )
+                table = weight_tensor_table(model.path)
+                ok, err = validate_override_patterns(table, v)
+                if not ok:
+                    raise HTTPException(status_code=400, detail=err)
+                recipe["override_tensor"] = list(v)
+                recipe.pop("n_cpu_moe", None)
+            changed.append("override_tensor")
         if not changed:
             raise HTTPException(status_code=400, detail="no recognised fields to edit")
         model.recipe = recipe
         try:
-            c.save(default_config_path())
+            c.save(config_path or default_config_path())
         except OSError as e:
             log.warning("edit %s: persist failed: %s", name, e)
         rebuilt, was_running = await rt.rebuild_model(name)
@@ -863,7 +978,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e)) from e
         if added:
             try:
-                c.save(default_config_path())
+                c.save(config_path or default_config_path())
             except OSError as e:
                 log.warning("scan: persist failed: %s", e)
             # Rebuild the router's server map so new entries are immediately
@@ -936,39 +1051,80 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             media_type=upstream_resp.headers.get("content-type", "application/json"),
         )
 
-    # Local model — router manages llama-server lifecycle.
+    # Local model — router manages llama-server lifecycle. The in-flight count
+    # spans the ENTIRE request lifetime from here until the forwarded response
+    # (including a streamed body consumed after this handler returns) is done,
+    # because that whole window is time the request is using the GPU. The
+    # auto-tuner's abort hook keys off this counter; if it drops to zero while
+    # generation is still running, a sweep will restart the backend out from
+    # under the user.
+    rt.inflight += 1
+    streaming_response_started = False
     try:
-        model, srv = await rt.ensure_active(model_query)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Unknown model: {model_query!r}") from None
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    target_url = f"{srv.plan.backend_url}{target_path}"
-    want_stream = streaming_ok and bool(body.get("stream"))
-    fwd_headers = {"Content-Type": "application/json"}
-    if want_stream:
-        client = httpx.AsyncClient(timeout=None)
-        req = client.build_request(
-            "POST", target_url, content=body_bytes, headers=fwd_headers,
-        )
-        upstream = await client.send(req, stream=True)
+        try:
+            model, srv = await rt.ensure_active(model_query)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {model_query!r}") from None
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        # Tell the background tuner this model was actually used by a real request.
+        # Upstream models do not reach this point, so only local models can become
+        # auto-tune candidates.
+        tuner = getattr(request.app.state, "tuner", None)
+        if tuner is not None:
+            tuner.bump_use(model.name)
+        target_url = f"{srv.plan.backend_url}{target_path}"
+        want_stream = streaming_ok and bool(body.get("stream"))
+        fwd_headers = {"Content-Type": "application/json"}
 
-        async def close_upstream() -> None:
-            await upstream.aclose()
-            await client.aclose()
+        async def _complete() -> None:
+            """Mark the completion of request handling as router activity.
 
-        return StreamingResponse(
-            upstream.aiter_raw(),
-            status_code=upstream.status_code,
-            headers=_strip_response_headers(dict(upstream.headers)),
-            media_type=upstream.headers.get("content-type", "text/event-stream"),
-            background=BackgroundTask(close_upstream),
-        )
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
+            This is called after the response body has been fully sent, so a
+            long generation against an already-warm model still counts as
+            activity and prevents the auto-tuner from starting.
+            """
+            rt.last_activity = time.time()
+
+        if want_stream:
+            client = httpx.AsyncClient(timeout=None)
+            req = client.build_request(
+                "POST", target_url, content=body_bytes, headers=fwd_headers,
+            )
+            upstream = await client.send(req, stream=True)
+
+            async def close_upstream() -> None:
+                # Runs as a BackgroundTask once the streamed body is fully
+                # sent — this is where the streaming request's in-flight
+                # window ends.
+                try:
+                    await upstream.aclose()
+                    await client.aclose()
+                finally:
+                    await _complete()
+                    rt.inflight -= 1
+
+            streaming_response_started = True
+            return StreamingResponse(
+                upstream.aiter_raw(),
+                status_code=upstream.status_code,
+                headers=_strip_response_headers(dict(upstream.headers)),
+                media_type=upstream.headers.get("content-type", "text/event-stream"),
+                background=BackgroundTask(close_upstream),
+            )
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
+        await _complete()
         return Response(
             content=r.content,
             status_code=r.status_code,
             headers=_strip_response_headers(dict(r.headers)),
             media_type=r.headers.get("content-type", "application/json"),
         )
+    finally:
+        # Every non-streaming exit — success, failed load, forward error —
+        # decrements here. The streaming path hands the decrement to
+        # close_upstream above, which runs after the body is consumed.
+        if not streaming_response_started:
+            rt.inflight -= 1
+

@@ -252,6 +252,11 @@ class LlamaServer:
         self.name = name
         self.process: subprocess.Popen[bytes] | None = None
         self.started_at: float | None = None
+        # Cached health state: True only after wait_ready() has seen a healthy
+        # /health response. is_running means "subprocess alive"; a cold start
+        # leaves the port unbound for tens of seconds, so callers that forward
+        # traffic must check this, not is_running. Cleared on start and stop.
+        self.ready: bool = False
         self._log_file: Any = None  # file handle opened in start(), closed in stop()
         self._log_path: Path | None = None
 
@@ -263,6 +268,7 @@ class LlamaServer:
         if self.is_running:
             log.debug("[%s] already running, pid=%s", self.name, self.process.pid)  # type: ignore[union-attr]
             return
+        self.ready = False
         stdout = subprocess.DEVNULL
         stderr = subprocess.DEVNULL
         self._log_path = None
@@ -308,6 +314,7 @@ class LlamaServer:
                     if r.status_code == 200 and r.json().get("status") == "ok":
                         elapsed = time.time() - self.started_at if self.started_at else 0
                         log.info("[%s] ready after %.1fs", self.name, elapsed)
+                        self.ready = True
                         return True
                 except Exception:
                     pass
@@ -335,6 +342,7 @@ class LlamaServer:
         return "\n".join(all_lines[-lines:])
 
     def stop(self, drain_seconds: float = 3.0) -> None:
+        self.ready = False
         if not self.is_running:
             return
         proc = self.process

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -9,8 +10,10 @@ from arc_llama.config import (
     GPUConfig,
     MCPServerConfig,
     ModelConfig,
+    PathsConfig,
     ProfileConfig,
     ServerConfig,
+    TuneConfig,
 )
 from arc_llama.server import create_app
 
@@ -25,6 +28,9 @@ class FakeBackend:
 
 
 class FakeRouter:
+    last_activity = 0.0
+    inflight = 0
+
     def __init__(self, cfg, log_dir=None):
         self.cfg = cfg
         self.model = ModelConfig(
@@ -50,6 +56,11 @@ class FakeRouter:
     async def ensure_active(self, query):
         if query not in {"qwen", "qwen.gguf"}:
             raise KeyError(query)
+        # Use a model from cfg if it exists there, so the request path sees
+        # the same object the Autotuner is watching.
+        for m in self.cfg.models:
+            if m.name == "qwen":
+                return m, FakeBackend()
         return self.model, FakeBackend()
 
     async def shutdown(self):
@@ -609,6 +620,9 @@ def test_agent_plan_endpoint_requires_admin_token(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class FakeRouterWithRebuild(FakeRouter):
+    def _build_servers(self):
+        pass
+
     async def rebuild_model(self, name):
         return True, False
 
@@ -669,3 +683,411 @@ def test_admin_edit_rejects_bad_batch_size(monkeypatch, tmp_path):
     with TestClient(app) as client:
         response = client.post("/admin/models/qwen/edit", json={"batch_size": 0})
     assert response.status_code == 400
+
+
+def test_admin_edit_persists_to_custom_config_path(monkeypatch, tmp_path):
+    """Regression: /admin/models/{name}/edit must honour --config."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouterWithRebuild)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    custom_path = tmp_path / "custom.toml"
+    default_path = tmp_path / "default" / "config.toml"
+    monkeypatch.setattr("arc_llama.config.default_config_path", lambda: default_path)
+
+    cfg = Config(
+        server=ServerConfig(admin_token=None),
+        gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
+        models=[ModelConfig(
+            name="qwen", path="/models/qwen.gguf", port=18080,
+            gpu_pci_slot="0000:03:00.0", recipe={"ctx": 8192},
+        )],
+        tune=TuneConfig(auto=False),
+    )
+    app = create_app(cfg, config_path=custom_path)
+
+    with TestClient(app) as client:
+        response = client.post("/admin/models/qwen/edit", json={"ctx": 4096})
+
+    assert response.status_code == 200
+    assert custom_path.exists()
+    assert not default_path.exists()
+    model = next(m for m in cfg.models if m.name == "qwen")
+    assert model.recipe["ctx"] == 4096
+
+
+def test_admin_scan_persists_to_custom_config_path(monkeypatch, tmp_path):
+    """Regression: /admin/scan must honour --config when persisting discoveries."""
+    import arc_llama.server as server_mod
+    from arc_llama import models as models_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouterWithRebuild)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    custom_path = tmp_path / "custom.toml"
+    default_path = tmp_path / "default" / "config.toml"
+    monkeypatch.setattr("arc_llama.config.default_config_path", lambda: default_path)
+
+    cfg = Config(
+        server=ServerConfig(admin_token=None),
+        paths=PathsConfig(models_dir=str(tmp_path / "models")),
+        gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
+        models=[],
+        tune=TuneConfig(auto=False),
+    )
+    app = create_app(cfg, config_path=custom_path)
+
+    fake_model = ModelConfig(
+        name="new", path=str(tmp_path / "new.gguf"), port=18081,
+        gpu_pci_slot="0000:03:00.0",
+    )
+
+    monkeypatch.setattr(models_mod, "discover_ggufs", lambda c: [fake_model])
+
+    def fake_register(c, found):
+        c.models.extend(found)
+        return found
+
+    monkeypatch.setattr(models_mod, "register_discovered", fake_register)
+
+    with TestClient(app) as client:
+        response = client.post("/admin/scan")
+
+    assert response.status_code == 200
+    assert custom_path.exists()
+    assert not default_path.exists()
+    assert any(m.name == "new" for m in cfg.models)
+
+
+def test_local_request_bumps_tuner_use_count(monkeypatch, tmp_path):
+    """A real /v1/chat/completions request must call Autotuner.bump_use."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+
+    cfg = Config(
+        server=ServerConfig(admin_token=None),
+        paths=PathsConfig(models_dir=str(tmp_path / "models")),
+        gpus=[
+            GPUConfig(
+                pci_slot="0000:03:00.0",
+                sycl_index=0,
+                arch="battlemage",
+                vram_mb=24 * 1024,
+            ),
+        ],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path=str(tmp_path / "qwen.gguf"),
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+            ),
+        ],
+        # Keep auto=False so the real lifespan does not spin up a background
+        # tuner and overwrite our fake one.
+        tune=TuneConfig(auto=False, idle_seconds=120, min_uses=1),
+    )
+
+    bumped: list[str] = []
+
+    class FakeTuner:
+        def bump_use(self, name: str) -> None:
+            bumped.append(name)
+
+        async def stop(self) -> None:
+            pass
+
+    app = create_app(cfg)
+    # Bypass lifespan so our fake tuner survives and does not need a full loop.
+    app.state.tuner = FakeTuner()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert "qwen" in bumped
+
+
+def test_custom_config_path_used_by_autotune_save(monkeypatch, tmp_path):
+    """create_app(config_path=...) must make the autotuner save to that path."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+
+    custom_path = tmp_path / "custom.toml"
+    cfg = Config(
+        gpus=[
+            GPUConfig(
+                pci_slot="0000:03:00.0",
+                sycl_index=0,
+                arch="battlemage",
+                vram_mb=24 * 1024,
+            ),
+        ],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path=str(tmp_path / "qwen.gguf"),
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+            ),
+        ],
+        tune=TuneConfig(auto=True, idle_seconds=120, min_uses=1),
+    )
+
+    app = create_app(cfg, config_path=custom_path)
+
+    saved = []
+
+    class FakeTuner:
+        def __init__(self, on_save):
+            self.on_save = on_save
+
+        async def stop(self) -> None:
+            pass
+
+    import arc_llama.autotune as autotune_mod
+
+    def fake_start_autotuner(cfg, router, *, version, on_save=None):
+        saved.append(on_save)
+        return FakeTuner(on_save)
+
+    monkeypatch.setattr(autotune_mod, "start_autotuner", fake_start_autotuner)
+
+    # Trigger lifespan to wire the tuner. The fake tuner has a no-op stop()
+    # so shutdown does not fail.
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+    assert saved
+    on_save = saved[0]
+    assert on_save is not None
+    # Invoking on_save should write to the custom path.
+    on_save()
+    assert custom_path.exists()
+
+
+def test_admin_tune_abort_uses_public_method(monkeypatch):
+    """DELETE /admin/tune must call Autotuner.abort_sweep(), not _abort_event."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+
+    calls: list[bool] = []
+
+    class FakeTuner:
+        running_model = "qwen"
+
+        def abort_sweep(self) -> bool:
+            calls.append(True)
+            return True
+
+        async def stop(self) -> None:
+            pass
+
+    cfg = Config(
+        server=ServerConfig(admin_token="secret"),
+        gpus=[
+            GPUConfig(
+                pci_slot="0000:03:00.0",
+                sycl_index=0,
+                arch="battlemage",
+                vram_mb=24 * 1024,
+            ),
+        ],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path="/models/qwen.gguf",
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+            ),
+        ],
+        tune=TuneConfig(auto=False),
+    )
+    app = create_app(cfg)
+    app.state.tuner = FakeTuner()
+
+    with TestClient(app) as client:
+        response = client.delete("/admin/tune", headers={"Authorization": "Bearer secret"})
+
+    assert response.status_code == 200
+    assert response.json()["aborted"] is True
+    assert calls
+
+
+# ---------------------------------------------------------------------------
+# inflight must span the whole request lifetime (AUTOTUNE_ROUND3 defect A)
+#
+# These drive the real app through TestClient against a fake backend whose
+# response is slow, and assert router.inflight > 0 while the response is
+# still being produced. Calling ensure_active directly would prove nothing:
+# the defect shipped precisely because the counter only covered ensure_active.
+# ---------------------------------------------------------------------------
+
+
+def _wait_drained(router, timeout: float = 5.0) -> None:
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while router.inflight != 0 and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+
+
+def test_inflight_covers_non_streaming_generation(monkeypatch):
+    import threading
+
+    import arc_llama.server as server_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, content=None, headers=None):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", SlowClient)
+    app = create_app(Config(tune=TuneConfig(auto=False)))
+
+    with TestClient(app) as client:
+        result: dict = {}
+
+        def do_request():
+            result["r"] = client.post(
+                "/v1/chat/completions",
+                json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        t = threading.Thread(target=do_request)
+        t.start()
+        try:
+            # The fake backend has the request and is "generating": the
+            # request holds the GPU, so the counter must be up.
+            assert entered.wait(timeout=5)
+            assert app.state.router.inflight > 0
+        finally:
+            release.set()
+            t.join(timeout=10)
+
+    assert result["r"].status_code == 200
+    _wait_drained(app.state.router)
+    assert app.state.router.inflight == 0
+
+
+def test_inflight_covers_streaming_generation(monkeypatch):
+    import threading
+
+    import arc_llama.server as server_mod
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowStream:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+        closed = False
+
+        async def aiter_raw(self):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            yield b"data: one\n\n"
+
+        async def aclose(self):
+            self.closed = True
+
+    class SlowStreamClient:
+        def __init__(self, timeout=None):
+            pass
+
+        def build_request(self, method, url, content=None, headers=None):
+            return {"method": method, "url": url, "content": content, "headers": headers}
+
+        async def send(self, request, stream=False):
+            assert stream is True
+            return SlowStream()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", SlowStreamClient)
+    app = create_app(Config(tune=TuneConfig(auto=False)))
+
+    with TestClient(app) as client:
+        result: dict = {}
+
+        def do_request():
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "qwen", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            ) as r:
+                result["status"] = r.status_code
+                result["body"] = b"".join(r.iter_bytes())
+
+        t = threading.Thread(target=do_request)
+        t.start()
+        try:
+            # The streamed body has started but not finished: still inflight.
+            assert entered.wait(timeout=5)
+            assert app.state.router.inflight > 0
+        finally:
+            release.set()
+            t.join(timeout=10)
+
+    assert result["status"] == 200
+    assert result["body"] == b"data: one\n\n"
+    # The decrement lives in the close_upstream BackgroundTask, which runs
+    # after the body is fully sent.
+    _wait_drained(app.state.router)
+    assert app.state.router.inflight == 0
+
+
+def test_inflight_decremented_when_load_fails(monkeypatch):
+    """A failed load must not leak the in-flight count."""
+    import arc_llama.server as server_mod
+
+    class FailingRouter(FakeRouter):
+        async def ensure_active(self, query):
+            raise RuntimeError("llama-server did not become healthy")
+
+    monkeypatch.setattr(server_mod, "Router", FailingRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", FakeAsyncClient)
+    app = create_app(Config(tune=TuneConfig(auto=False)))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 503
+    _wait_drained(app.state.router)
+    assert app.state.router.inflight == 0

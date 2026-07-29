@@ -6,12 +6,16 @@ from pathlib import Path
 import pytest
 
 from arc_llama.gguf_meta import (
+    estimate_weight_vram_bytes,
     expert_count,
+    expert_tensor_bytes_by_layer,
     has_mtp_heads,
     is_hybrid_ssm,
     is_moe,
     mtp_info,
     read_gguf_meta,
+    scan_weight_tensors,
+    trained_context_length,
 )
 
 # Real GGUFs on the host's storage, discovered during exploration.
@@ -80,6 +84,39 @@ class TestMtpInfo:
         assert info["nextn_predict_layers"] == 1
 
 
+class TestTrainedContextLength:
+    def test_missing_file_returns_none(self):
+        assert trained_context_length("/nonexistent.gguf") is None
+
+    def test_reads_arch_specific_context_length(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(
+            "arc_llama.gguf_meta.read_gguf_meta",
+            lambda _path: {"architecture": "qwen2", "qwen2.context_length": 32768},
+        )
+        assert trained_context_length("/fake.gguf") == 32768
+
+    def test_falls_back_to_bare_key(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(
+            "arc_llama.gguf_meta.read_gguf_meta",
+            lambda _path: {"architecture": "qwen2", "context_length": 32768},
+        )
+        assert trained_context_length("/fake.gguf") == 32768
+
+    def test_returns_none_when_unknown(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(
+            "arc_llama.gguf_meta.read_gguf_meta",
+            lambda _path: {"architecture": "qwen2"},
+        )
+        assert trained_context_length("/fake.gguf") is None
+
+    def test_ignores_non_positive_values(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(
+            "arc_llama.gguf_meta.read_gguf_meta",
+            lambda _path: {"architecture": "qwen2", "qwen2.context_length": 0},
+        )
+        assert trained_context_length("/fake.gguf") is None
+
+
 class TestMoeDetection:
     def test_missing_file_is_not_moe(self):
         assert is_moe("/nonexistent.gguf") is False
@@ -135,3 +172,176 @@ class TestMoeDetection:
         assert meta["architecture"] == "qwen3moe"
         assert is_moe(_QWEN_CODER_MOE) is True
         assert expert_count(_QWEN_CODER_MOE) == 128
+
+
+# ---------------------------------------------------------------------------
+# MoE expert offload accounting (--n-cpu-moe N = N layers of expert tensors)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTensor:
+    def __init__(self, name: str, n_bytes: int):
+        self.name = name
+        self.n_bytes = n_bytes
+
+
+class _FakeField:
+    def __init__(self, value: str):
+        self._value = value
+
+    def contents(self) -> str:
+        return self._value
+
+
+class _FakeReader:
+    """Stands in for gguf.GGUFReader: a tensor table plus an arch field."""
+
+    def __init__(self, tensors: list[_FakeTensor], arch: str):
+        self._tensors = tensors
+        self._arch = arch
+
+    @property
+    def tensors(self) -> list[_FakeTensor]:
+        return self._tensors
+
+    def get_field(self, key: str):
+        if key == "general.architecture":
+            return _FakeField(self._arch)
+        return None
+
+
+def _patch_reader(monkeypatch: pytest.MonkeyPatch, tensors, arch: str = "qwen3moe"):
+    monkeypatch.setattr(
+        "arc_llama.gguf_meta.gguf.GGUFReader",
+        lambda _path: _FakeReader(tensors, arch),
+    )
+
+
+def _moe_tensors() -> list[_FakeTensor]:
+    return [
+        _FakeTensor("token_embd.weight", 1000),
+        _FakeTensor("blk.0.attn_q.weight", 500),
+        _FakeTensor("blk.0.ffn_up_exps.weight", 300),
+        _FakeTensor("blk.0.ffn_down_exps.weight", 300),
+        _FakeTensor("blk.0.ffn_up_shexp.weight", 200),  # shared expert: stays on GPU
+        _FakeTensor("blk.0.ffn_gate_inp.weight", 50),   # router gate: stays on GPU
+        _FakeTensor("blk.1.ffn_gate_exps.weight", 400),
+        _FakeTensor("blk.1.ffn_up_exps.weight", 400),
+        _FakeTensor("blk.1.ffn_down_exps.weight", 400),
+    ]
+
+
+def _fused_moe_tensors() -> list[_FakeTensor]:
+    """Real tensor names from gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf.
+
+    Gemma fuses the gate and up projections into a single `ffn_gate_up_exps`
+    tensor. An enumerated {gate,up,down}_exps pattern misses it and counts
+    only the down projection, which under-reported expert bytes by ~2.7x on
+    real hardware.
+    """
+    return [
+        _FakeTensor("token_embd.weight", 1000),
+        _FakeTensor("blk.0.attn_q.weight", 100),
+        _FakeTensor("blk.0.ffn_gate_up_exps.weight", 800),   # fused: must count
+        _FakeTensor("blk.0.ffn_down_exps.weight", 400),
+        _FakeTensor("blk.0.ffn_down_exps.scale", 20),        # quant metadata: counts
+        _FakeTensor("blk.0.ffn_gate_inp.weight", 30),        # router: excluded
+        _FakeTensor("blk.0.ffn_up_shexp.weight", 60),        # shared expert: excluded
+    ]
+
+
+class TestFusedExpertProjections:
+    def test_fused_gate_up_tensor_is_counted(self, tmp_path, monkeypatch):
+        f = tmp_path / "gemma.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(monkeypatch, _fused_moe_tensors(), arch="gemma3moe")
+        _total, by_layer = scan_weight_tensors(f)
+        # 800 (fused gate+up) + 400 (down) + 20 (scale); router and shexp excluded.
+        assert by_layer == {0: 1220}
+
+    def test_unfused_layout_still_counted(self, tmp_path, monkeypatch):
+        f = tmp_path / "qwen.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(monkeypatch, _moe_tensors())
+        _total, by_layer = scan_weight_tensors(f)
+        assert by_layer == {0: 600, 1: 1200}
+
+    def test_implausibly_small_expert_share_warns(self, tmp_path, monkeypatch, caplog):
+        """The guard that would have caught the fused-projection bug."""
+        f = tmp_path / "odd.gguf"
+        f.write_bytes(b"x")
+        tensors = [
+            _FakeTensor("token_embd.weight", 9000),
+            _FakeTensor("blk.0.ffn_down_exps.weight", 100),
+            _FakeTensor("blk.0.ffn_someNewFusion.weight", 900),
+        ]
+        _patch_reader(monkeypatch, tensors)
+        with caplog.at_level("WARNING"):
+            scan_weight_tensors(f)
+        assert "implausibly low" in caplog.text
+
+    def test_healthy_moe_does_not_warn(self, tmp_path, monkeypatch, caplog):
+        f = tmp_path / "gemma.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(monkeypatch, _fused_moe_tensors(), arch="gemma3moe")
+        with caplog.at_level("WARNING"):
+            scan_weight_tensors(f)
+        assert "implausibly low" not in caplog.text
+
+
+class TestOffloadAccounting:
+    def test_scan_returns_total_and_per_layer_experts(self, tmp_path, monkeypatch):
+        f = tmp_path / "m.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(monkeypatch, _moe_tensors())
+        total, by_layer = scan_weight_tensors(f)
+        assert total == 1000 + 500 + 300 + 300 + 200 + 50 + 400 * 3
+        assert by_layer == {0: 600, 1: 1200}
+
+    def test_estimate_subtracts_offloaded_layers(self, tmp_path, monkeypatch):
+        f = tmp_path / "m.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(monkeypatch, _moe_tensors())
+        total = 1000 + 500 + 300 + 300 + 200 + 50 + 400 * 3
+        assert estimate_weight_vram_bytes(f) == total
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=0) == total
+        # N=1 offloads layer 0's routed experts only (600), not the shared
+        # expert (200) and not the router gate (50).
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=1) == total - 600
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=2) == total - 600 - 1200
+        # N beyond the layer count offloads everything MoE.
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=99) == total - 600 - 1200
+
+    def test_dense_model_with_offload_flag_is_unchanged(self, tmp_path, monkeypatch):
+        """A non-MoE model has no expert tensors; the flag is inert and the
+        full-weight count is correct (byte-for-byte unchanged)."""
+        f = tmp_path / "m.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(
+            monkeypatch,
+            [_FakeTensor("token_embd.weight", 1000), _FakeTensor("blk.0.ffn_up.weight", 500)],
+            arch="llama",
+        )
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=4) == 1500
+
+    def test_moe_without_recognisable_expert_tensors_returns_none(
+        self, tmp_path, monkeypatch
+    ):
+        """MoE arch but tensor names we don't recognise: the offloaded bytes
+        are unknown, so the estimate must be None — callers must not fall
+        back to counting full weights and refusing the load."""
+        f = tmp_path / "m.gguf"
+        f.write_bytes(b"x")
+        _patch_reader(
+            monkeypatch,
+            [_FakeTensor("token_embd.weight", 1000), _FakeTensor("blk.0.moe_stuff.weight", 500)],
+            arch="qwen3moe",
+        )
+        assert estimate_weight_vram_bytes(f, n_cpu_moe=4) is None
+        # Without offload requested the full count is still fine.
+        assert estimate_weight_vram_bytes(f) == 1500
+
+    def test_unreadable_file_returns_none(self):
+        assert estimate_weight_vram_bytes("/nonexistent.gguf", n_cpu_moe=4) is None
+        assert scan_weight_tensors("/nonexistent.gguf") is None
+        assert expert_tensor_bytes_by_layer("/nonexistent.gguf") is None

@@ -89,9 +89,22 @@ class LaunchRecipe:
     mlock: bool = False
     """--mlock: pin host-side weights in RAM so they can't be swapped out."""
     n_cpu_moe: int | None = None
-    """Number of MoE experts per layer to keep on CPU (--n-cpu-moe)."""
+    """Number of MoE layers whose routed-expert tensors stay on CPU (--n-cpu-moe).
+
+    N is a *layer* count: the expert weights of layers 0..N-1 are host-resident.
+    Not an expert count — llama.cpp matches blk.N.ffn_{gate,up,down}_exps.*."""
     extra_flags: list[str] = field(default_factory=list)
     """Anything else the user wants appended to the command line verbatim."""
+
+    override_tensor: list[str] | None = None
+    """Tensor-buffer overrides as repeated ``--override-tensor <pattern>=CPU``.
+
+    Each string is a regex over tensor names; together they move a subset of
+    expert tensors to host memory with finer granularity than ``--n-cpu-moe``.
+    If both ``override_tensor`` and ``n_cpu_moe`` are present, ``override_tensor``
+    wins and ``n_cpu_moe`` is cleared: the two flags are alternative means to
+    the same end and applying both would double-count the offload.
+    """
 
     def to_argv(self, fa_takes_value: bool = True) -> list[str]:
         argv = [
@@ -132,7 +145,13 @@ class LaunchRecipe:
             argv += ["--no-mmap"]
         if self.mlock:
             argv += ["--mlock"]
-        if self.n_cpu_moe is not None:
+        if self.override_tensor:
+            # llama.cpp common/arg.cpp:247 parses --override-tensor as
+            # <pattern>=<buffer_type>, splitting each value on its first '='.
+            # CPU is a valid backend buffer name, so render as ``pat=CPU``.
+            for pat in self.override_tensor:
+                argv += ["--override-tensor", f"{pat}=CPU"]
+        elif self.n_cpu_moe is not None:
             argv += ["--n-cpu-moe", str(self.n_cpu_moe)]
         argv += list(self.extra_flags)
         return argv
@@ -168,10 +187,13 @@ def suggest_ctx(
     compute_buffer_mb: int = 768,
     safety_margin_mb: int = 256,
     ctx_cap: int = DEFAULT_CTX_CAP,
+    trained_ctx: int | None = None,
 ) -> int:
     """Pick the largest power-of-2-ish context that fits comfortably in VRAM.
 
     Rounds *down* to the nearest multiple of 4096 and clamps to `ctx_cap`.
+    If `trained_ctx` is known, the result is also clamped to it (the model
+    silently uses its trained length as a ceiling at runtime).
     """
     free_for_kv = vram_mb - model_file_mb - compute_buffer_mb - safety_margin_mb
     if free_for_kv <= 0:
@@ -191,7 +213,11 @@ def suggest_ctx(
         return 4096
     max_tokens = (free_for_kv * 1024 * 1024) // bytes_per_token
     rounded = (max_tokens // 4096) * 4096
-    return max(4096, min(rounded, ctx_cap))
+    # Clamp to the smallest applicable ceiling: trained context, then ctx_cap.
+    ceiling = ctx_cap
+    if trained_ctx is not None and trained_ctx < ceiling:
+        ceiling = trained_ctx
+    return max(4096, min(rounded, ceiling))
 
 
 PERF_UBATCH_MIN_VRAM_MB = 16384
@@ -221,6 +247,7 @@ def default_recipe(
     kv_class: str = "default",
     prefer_q8_kv: bool = True,
     backend: Backend = Backend.SYCL,
+    trained_ctx: int | None = None,
 ) -> LaunchRecipe:
     """A safe starting recipe for a freshly added model on a given arch/backend."""
     profile: ArchProfile = profile_for(arch)
@@ -251,6 +278,7 @@ def default_recipe(
         kv_type=kv_type,
         kv_class=kv_class,
         compute_buffer_mb=PERF_COMPUTE_BUFFER_MB if perf_batching else 768,
+        trained_ctx=trained_ctx,
     )
     return LaunchRecipe(
         n_gpu_layers=999,
@@ -295,6 +323,8 @@ def recipe_to_dict(recipe: LaunchRecipe) -> dict:
         d["spec_draft_n_max"] = recipe.spec_draft_n_max
     if recipe.n_cpu_moe is not None:
         d["n_cpu_moe"] = recipe.n_cpu_moe
+    if recipe.override_tensor:
+        d["override_tensor"] = list(recipe.override_tensor)
     if recipe.no_mmap:
         d["no_mmap"] = True
     if recipe.mlock:

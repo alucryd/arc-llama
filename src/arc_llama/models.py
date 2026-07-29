@@ -21,29 +21,43 @@ from arc_llama.config import (
     Config,
     ModelConfig,
 )
-from arc_llama.gguf_meta import expert_count, has_mtp_heads, is_moe, read_gguf_meta
+from arc_llama.gguf_meta import has_mtp_heads, is_moe, read_gguf_meta, trained_context_length
 from arc_llama.recipes import default_recipe, recipe_to_dict
 
 log = logging.getLogger("arc_llama.models")
 
 
-def _suggest_moe_offload(vram_mb: int, model_file_mb: int, num_experts: int) -> int | None:
-    """Conservatively suggest how many experts per layer to keep on CPU.
+def _suggest_moe_offload(
+    path: Path,
+    *,
+    vram_mb: int,
+    recipe_dict: dict[str, Any],
+    kv_class: str,
+) -> int | None:
+    """Smallest ``--n-cpu-moe`` layer count estimated to fit the card, or None.
 
-    Returns ``None`` when there is enough headroom that offloading is unnecessary
-    or when the expert count is not known. The heuristic is intentionally simple:
-    only offload if the model file is within ~15% of the GPU's VRAM budget, and
-    never offload more than half the experts.
+    ``--n-cpu-moe N`` keeps the routed-expert tensors of the first N *layers*
+    on the host (not N experts), so the suggestion must come from per-layer
+    expert-tensor accounting against the recipe's own ctx/KV — anything else
+    disagrees with the load-time VRAM guard and the two cancel out: ``add``
+    enables offload, then the guard counts full weights and refuses the load.
+    This shares the router's estimator so registration and the guard agree by
+    construction. Returns None when no offload is needed or when expert
+    tensor bytes cannot be determined (in which case the guard skips rather
+    than refuses, so no blind guess is needed here either).
     """
-    if num_experts <= 0:
-        return None
-    # No pressure: model fits with >15% VRAM headroom.
-    if model_file_mb < vram_mb * 0.85:
-        return None
-    # Pressure ratio: how much of the model exceeds the 85% threshold.
-    pressure = max(0.0, min(1.0, (model_file_mb - vram_mb * 0.85) / (vram_mb * 0.15)))
-    offload = max(1, int(num_experts * pressure * 0.5))
-    return min(offload, num_experts // 2)
+    from arc_llama.router import min_moe_offload_layers
+
+    probe = ModelConfig(
+        name="(offload-probe)",
+        path=str(path),
+        port=0,
+        gpu_pci_slot="",
+        kv_class=kv_class,
+        recipe=dict(recipe_dict),
+    )
+    n = min_moe_offload_layers(probe, vram_mb)
+    return n if n and n > 0 else None
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 HF_SPEC_RE = re.compile(
@@ -144,12 +158,14 @@ def add_local_model(
     from arc_llama.arch import Arch, Backend
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
+    trained_ctx = trained_context_length(p)
     recipe = default_recipe(
         arch=arch,
         vram_mb=gpu.vram_mb or 8192,
         model_file_mb=p.stat().st_size // (1024 * 1024),
         kv_class=kv_class,
         backend=backend,
+        trained_ctx=trained_ctx,
     )
     recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
     # Auto-enable draft-mtp for models that actually carry MTP heads.
@@ -175,25 +191,24 @@ def add_local_model(
                 "with --spec-draft-model (spec_draft_n_max=%d)",
                 name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
             )
-    # Suggest MoE expert offload on VRAM-tight cards.
+    # Suggest MoE expert offload when the estimated footprint needs it.
     if is_moe(p):
-        num_experts = expert_count(p)
-        if num_experts is not None:
-            n_cpu = _suggest_moe_offload(
-                vram_mb=gpu.vram_mb or 8192,
-                model_file_mb=p.stat().st_size // (1024 * 1024),
-                num_experts=num_experts,
+        n_cpu = _suggest_moe_offload(
+            p,
+            vram_mb=gpu.vram_mb or 8192,
+            recipe_dict=recipe_dict,
+            kv_class=kv_class,
+        )
+        if n_cpu:
+            recipe_dict["n_cpu_moe"] = n_cpu
+            log.info(
+                "model %s is MoE; offloading expert tensors of %d layer(s) to CPU",
+                name, n_cpu,
             )
-            if n_cpu:
-                recipe_dict["n_cpu_moe"] = n_cpu
-                log.info(
-                    "model %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
-                    name, num_experts, n_cpu,
-                )
         else:
             log.debug(
-                "model %s looks like MoE but expert count could not be read; "
-                "manual --n-cpu-moe tuning may help",
+                "model %s is MoE and fits without offload (or its expert "
+                "tensors could not be accounted)",
                 name,
             )
     if recipe_overrides:
@@ -507,12 +522,14 @@ def register_discovered(
             log.info("skipping %s (speculative draft for a sibling model)", rp.name)
             continue
         kv_class = resolve_kv_class(rp)
+        trained_ctx = trained_context_length(rp)
         recipe = default_recipe(
             arch=arch,
             vram_mb=gpu.vram_mb or 8192,
             model_file_mb=rp.stat().st_size // (1024 * 1024),
             kv_class=kv_class,
             backend=backend,
+            trained_ctx=trained_ctx,
         )
         recipe_dict: dict[str, Any] = recipe_to_dict(recipe)
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
@@ -535,25 +552,24 @@ def register_discovered(
                     "discovered %s: sidecar draft %s; auto-enabling draft-mtp n_max=%d",
                     rp.name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
                 )
-        # Suggest MoE expert offload on VRAM-tight cards.
+        # Suggest MoE expert offload when the estimated footprint needs it.
         if is_moe(rp):
-            num_experts = expert_count(rp)
-            if num_experts is not None:
-                n_cpu = _suggest_moe_offload(
-                    vram_mb=gpu.vram_mb or 8192,
-                    model_file_mb=rp.stat().st_size // (1024 * 1024),
-                    num_experts=num_experts,
+            n_cpu = _suggest_moe_offload(
+                rp,
+                vram_mb=gpu.vram_mb or 8192,
+                recipe_dict=recipe_dict,
+                kv_class=kv_class,
+            )
+            if n_cpu:
+                recipe_dict["n_cpu_moe"] = n_cpu
+                log.info(
+                    "discovered %s is MoE; offloading expert tensors of %d layer(s) to CPU",
+                    rp.name, n_cpu,
                 )
-                if n_cpu:
-                    recipe_dict["n_cpu_moe"] = n_cpu
-                    log.info(
-                        "discovered %s is MoE with %d experts; offloading %d expert(s) per layer to CPU",
-                        rp.name, num_experts, n_cpu,
-                    )
             else:
                 log.debug(
-                    "discovered %s looks like MoE but expert count could not be read; "
-                    "manual --n-cpu-moe tuning may help",
+                    "discovered %s is MoE and fits without offload (or its "
+                    "expert tensors could not be accounted)",
                     rp.name,
                 )
         name = short_name_from_path(rp, used_names)

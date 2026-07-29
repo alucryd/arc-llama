@@ -47,6 +47,9 @@ something useful before lunch.
   panel. Pure HTML/JS, no build step.
 - **A terminal UI** (`arc-llama tui`) using Textual , same load/stop/edit
   controls, no browser needed. Optional install: `pip install 'arc-llama[tui]'`.
+- **Background autotune.** Drop in a GGUF, use it once, and `arc-llama serve`
+  measures a faster recipe in the next idle window — no manual `tune`. Sweeps
+  abort instantly if a real request arrives.
 - **No magic with your existing stack.** It uses your `llama-server` binary;
   you're never locked into a specific build.
 
@@ -81,11 +84,12 @@ arc-llama scan
 # 6. Run the OpenAI-compatible server (also serves the web UI at /)
 arc-llama serve
 
-# 7. (Optional) Measure, then let arc-llama find the fastest recipe for a
-#    model on YOUR card (staged sweep over KV type, ubatch, flash attention;
-#    ~10 min, writes the winner into the config). Use `tune --all` for every model.
+# 7. Drop a GGUF and use it once — auto-tune fires after the idle window,
+#    or tune manually now:
 arc-llama benchmark <model>
 arc-llama tune <model>
+arc-llama tune --status            # print per-model tune state, no sweep
+arc-llama serve --no-auto-tune     # disable the background sweeps
 
 # 8. (Optional) Open the terminal UI in another window
 arc-llama tui
@@ -140,12 +144,15 @@ arc-llama benchmark qwen3-7b --sweep-ctx 8192,32768 --kv f16 --kv q8_0
 arc-llama tune qwen3-7b
 arc-llama tune qwen3-7b --target generation   # optimise chat latency only
 arc-llama tune qwen3-7b --dry-run             # look, don't touch
+arc-llama tune --status                       # print state, no sweep
 ```
 
-Both need a running `arc-llama serve` so measurements inherit the exact SYCL
-env and router policy your real requests get. Candidates that fail to start
-(e.g. compute-buffer OOM from a bigger ubatch) simply lose the round — the
-tuner always leaves the model in a working config.
+Manual `tune` needs a running `arc-llama serve` so measurements inherit the
+exact SYCL env and router policy your real requests get. When enabled, the
+background autotuner runs the same `tune_model` path over loopback HTTP. Set
+`[tune] auto = false` or pass `--no-auto-tune` to disable. Candidates that fail
+to start (e.g. compute-buffer OOM from a bigger ubatch) simply lose the round
+— the tuner always leaves the model in a working config.
 
 arc-llama also probes your `llama-server --help` once per binary to emit the
 right flag dialect (`-fa on|off|auto` on current builds vs boolean `-fa` on
@@ -200,6 +207,10 @@ single_resident = true
 llama_server = "/usr/local/bin/llama-server"
 models_dir   = "~/.local/share/arc-llama/models"
 state_dir    = "~/.local/state/arc-llama"
+
+[tune]
+auto         = true      # idle-time background sweeps
+idle_seconds = 120
 
 [[gpus]]
 pci_slot   = "0000:03:00.0"
@@ -345,6 +356,7 @@ docker run ... \
 - ~~`arc-llama tune` , measure-and-persist recipe autotuner.~~ ✅
 - ~~`arc-llama install-runtime` , download a prebuilt llama-server (Vulkan-first).~~ ✅
 - ~~`arc-llama tune --all` , sweep every registered model in one run.~~ ✅
+- ~~Background auto-tune on first use, aborting on new requests.~~ ✅
 
 ## Contributing
 

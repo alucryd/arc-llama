@@ -20,7 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from arc_llama.config import Config, GPUConfig, ModelConfig
-from arc_llama.gguf_meta import estimate_weight_vram_bytes
+from arc_llama.gguf_meta import (
+    estimate_weight_vram_bytes,
+    override_tensor_saved_bytes,
+    scan_weight_tensors,
+    weight_tensor_table,
+)
 from arc_llama.launcher import LlamaServer, build_plan
 from arc_llama.recipes import KVCacheType, estimate_kv_bytes
 
@@ -31,30 +36,140 @@ _VRAM_COMPUTE_BUFFER_MB = 768
 _VRAM_SAFETY_MARGIN_MB = 256
 
 
-def _estimate_model_vram_mb(model: ModelConfig) -> int:
-    """Rough VRAM footprint for one model instance.
+def _estimate_model_vram_mb(
+    model: ModelConfig,
+    *,
+    ctx: int | None = None,
+    kv_type: KVCacheType | None = None,
+    n_cpu_moe: int | None = None,
+    override_tensor: list[str] | None = None,
+    compute_buffer_mb: int | None = None,
+) -> int | None:
+    """Rough VRAM footprint for one model instance, or None when it cannot
+    be estimated.
 
     Uses GGUF tensor metadata to estimate the decompressed weight footprint,
     which is much closer to reality for heavily quantized files than the raw
     file size. Falls back to file size if the GGUF cannot be read.
+
+    ``ctx`` / ``kv_type`` / ``n_cpu_moe`` / ``override_tensor`` override the
+    recipe's values, letting callers ask "would this model fit at context N
+    with KV type T and this offload?" — the tuner uses this to prune KV
+    candidates that cannot hold the declared workload context and to find
+    the minimum feasible expert offload.
+
+    The ``n_cpu_moe`` accounting subtracts the routed-expert tensor bytes of
+    the first N layers — exactly what ``--n-cpu-moe N`` keeps on the host —
+    so a model that only fits *with* expert offload is no longer refused.
+    ``override_tensor`` does the same for the regex patterns it matches.
+    When offload is in force but the expert tensor bytes cannot be
+    determined, the estimate is None and callers must skip the fit guard
+    rather than fall back to counting full weights: that fallback is the bug
+    that made offload-configured models unloadable. A wrongly-permitted load
+    fails loudly at llama-server startup with a real OOM; a wrongly-refused
+    one silently disables the feature.
     """
     path = Path(model.path)
-    weight_bytes = estimate_weight_vram_bytes(path)
-    if weight_bytes is None:
-        try:
-            weight_bytes = path.stat().st_size
-        except OSError:
-            weight_bytes = 0
-        log.debug(
-            "VRAM estimate for %s falling back to file size: %.0f MiB",
-            model.name, weight_bytes / (1_048_576),
-        )
-    weight_mb = weight_bytes // (1_048_576)
     recipe = model.recipe or {}
-    ctx = int(recipe.get("ctx", 8192))
-    kv_type = KVCacheType(recipe.get("cache_type_k", "f16"))
-    kv_mb = estimate_kv_bytes(ctx, kv_type, model.kv_class) // (1_048_576)
-    return weight_mb + kv_mb + _VRAM_COMPUTE_BUFFER_MB + _VRAM_SAFETY_MARGIN_MB
+    weight_bytes: int | None = None
+    # -ot and --n-cpu-moe are alternatives, never both: when patterns are in
+    # force the layer count stays 0 so the n_cpu_moe branch below is skipped.
+    eff_moe = 0
+    eff_ot = override_tensor if override_tensor is not None else recipe.get("override_tensor")
+    if eff_ot:
+        table = weight_tensor_table(path)
+        if table is None:
+            log.warning(
+                "VRAM estimate for %s unavailable: cannot read tensor table "
+                "for override_tensor; skipping the fit guard",
+                model.name,
+            )
+            return None
+        try:
+            weight_bytes = estimate_weight_vram_bytes(path)
+            if weight_bytes is None:
+                weight_bytes = path.stat().st_size
+            weight_bytes -= override_tensor_saved_bytes(table, eff_ot)
+        except ValueError as exc:
+            log.warning("VRAM estimate for %s unavailable: %s", model.name, exc)
+            return None
+    elif n_cpu_moe is not None:
+        eff_moe = n_cpu_moe
+    else:
+        eff_moe = int(recipe.get("n_cpu_moe") or 0)
+    if eff_moe > 0:
+        weight_bytes = estimate_weight_vram_bytes(path, n_cpu_moe=eff_moe)
+        if weight_bytes is None:
+            log.warning(
+                "VRAM estimate for %s unavailable: expert tensor bytes for "
+                "--n-cpu-moe %d could not be determined; skipping the fit "
+                "guard rather than counting full weights",
+                model.name, eff_moe,
+            )
+            return None
+    if weight_bytes is None:
+        weight_bytes = estimate_weight_vram_bytes(path)
+        if weight_bytes is None:
+            try:
+                weight_bytes = path.stat().st_size
+            except OSError:
+                weight_bytes = 0
+            log.debug(
+                "VRAM estimate for %s falling back to file size: %.0f MiB",
+                model.name, weight_bytes / (1_048_576),
+            )
+    weight_mb = weight_bytes // (1_048_576)
+    eff_ctx = ctx if ctx is not None else int(recipe.get("ctx", 8192))
+    eff_kv = kv_type if kv_type is not None else KVCacheType(recipe.get("cache_type_k", "f16"))
+    kv_mb = estimate_kv_bytes(eff_ctx, eff_kv, model.kv_class) // (1_048_576)
+    buffer_mb = compute_buffer_mb if compute_buffer_mb is not None else _VRAM_COMPUTE_BUFFER_MB
+    return weight_mb + kv_mb + buffer_mb + _VRAM_SAFETY_MARGIN_MB
+
+
+def min_moe_offload_layers(
+    model: ModelConfig,
+    vram_mb: int | None,
+    *,
+    ctx: int | None = None,
+    kv_type: KVCacheType | None = None,
+) -> int | None:
+    """Smallest ``--n-cpu-moe`` layer count at which *model* is estimated to fit.
+
+    Returns 0 when the model fits with no offload, the minimal feasible layer
+    count otherwise, and the MoE layer count when not even full offload fits
+    (the best llama.cpp can do — the fit guard remains the arbiter). Returns
+    None when the VRAM budget is unknown or the expert tensor bytes cannot be
+    determined, in which case no offload math is possible.
+
+    Costs one GGUF scan: the per-layer expert bytes are read once and every
+    candidate N after that is pure arithmetic, using the same weight/KV/
+    buffer accounting as ``_estimate_model_vram_mb`` so the registration-time
+    suggestion, the load-time guard, and the tuner all agree.
+    """
+    if not vram_mb:
+        return None
+    scan = scan_weight_tensors(model.path)
+    if scan is None:
+        return None
+    total_bytes, expert_by_layer = scan
+    if not expert_by_layer:
+        return None
+    recipe = model.recipe or {}
+    eff_ctx = ctx if ctx is not None else int(recipe.get("ctx", 8192))
+    eff_kv = kv_type if kv_type is not None else KVCacheType(recipe.get("cache_type_k", "f16"))
+    kv_mb = estimate_kv_bytes(eff_ctx, eff_kv, model.kv_class) // (1_048_576)
+    fixed_mb = kv_mb + _VRAM_COMPUTE_BUFFER_MB + _VRAM_SAFETY_MARGIN_MB
+    n_layers = max(expert_by_layer) + 1
+    # Saved bytes grow monotonically with N, so a linear scan from 0 finds
+    # the minimum; MoE layer counts are at most ~100 and each step here is
+    # arithmetic only (no re-reads).
+    saved_bytes = 0
+    for n in range(0, n_layers + 1):
+        weight_mb = (total_bytes - saved_bytes) // (1_048_576)
+        if weight_mb + fixed_mb <= vram_mb:
+            return n
+        saved_bytes += expert_by_layer.get(n, 0)
+    return n_layers
 
 
 class Router:
@@ -73,6 +188,11 @@ class Router:
             "last_load_at": None,
             "last_error": None,
         }
+        self.last_activity: float = time.time()
+        # Requests holding the GPU right now. Owned by server.py's _proxy_post:
+        # incremented on request entry, decremented only when the forwarded
+        # response (streaming included) has been fully produced.
+        self.inflight: int = 0
         self._build_servers()
 
     def _build_servers(self) -> None:
@@ -127,20 +247,47 @@ class Router:
         return its (config, LlamaServer). Caller forwards the request to
         `srv.plan.backend_url`.
 
-        Fast-path: if the model is already running and no eviction is needed,
-        return immediately without acquiring the swap lock.
+        Fast-path: if the model is already running *and ready* (its cached
+        health state, set by wait_ready — no per-request probing) and no
+        eviction is needed, return immediately without acquiring the swap lock.
 
-        Concurrent requests for the same model that is currently loading will
-        wait on a shared future instead of each trying to start a new process.
+        A request that finds the subprocess alive but not yet ready (a cold
+        start takes tens of seconds to bind the port) waits on the shared load
+        future instead of forwarding into a closed port, and concurrent
+        requests for the same loading model all wait on that one future rather
+        than each trying to start a new process.
+
+        This method deliberately does NOT touch ``self.inflight``: the counter
+        is owned by the request lifecycle in server.py (`_proxy_post`), which
+        increments it on entry and decrements only after the forwarded response
+        has been fully produced. Counting here would cover just the (often
+        millisecond) swap decision and leave generation — the part that
+        actually holds the GPU — invisible to the auto-tuner's abort hook.
         """
-        # Fast-path: already running → no lock, no eviction, no start.
+        self.last_activity = time.time()
+        # Fast-path: already running AND ready → no lock, no eviction, no start.
+        # is_running alone is not sufficient: the subprocess is alive for the
+        # whole cold start, but the port only accepts connections once
+        # wait_ready has passed, which is what `ready` caches.
         fast = self.resolve(query)
         if fast is not None:
             target_model, target_gpu, target_srv = fast
             if target_srv.is_running:
-                # Verify policy: if single-resident, we are the one; if multi,
-                # same-GPU contention would have been resolved when we started.
-                return target_model, target_srv
+                if target_srv.ready:
+                    # Verify policy: if single-resident, we are the one; if multi,
+                    # same-GPU contention would have been resolved when we started.
+                    return target_model, target_srv
+                # Alive but not healthy yet: a load is in progress. Wait on the
+                # starter's shared future (bounded by the starter's wait_ready
+                # budget) instead of forwarding into a port that is not
+                # listening. Shielded so a cancelled waiter cannot poison the
+                # future the starter and other waiters still rely on.
+                loading = self._loading_futures.get(target_model.name)
+                if loading is not None:
+                    return await asyncio.shield(loading)
+                # Running-but-not-ready with no load we can join (should not
+                # happen — every start registers a future before spawning).
+                # Fall through to the slow path and let it re-wait or restart.
 
         # Slow path: may need to swap / start. Serialize with the lock.
         async with self._lock:
@@ -153,14 +300,17 @@ class Router:
             # If someone else is already loading this model, wait on them.
             existing_future = self._loading_futures.get(target_model.name)
             if existing_future is not None:
-                return await existing_future
+                return await asyncio.shield(existing_future)
 
             await self._evict_for(target_model, target_gpu)
 
-            if target_srv.is_running:
+            if target_srv.is_running and target_srv.ready:
                 return target_model, target_srv
 
-            self._check_vram_fit(target_model, target_gpu)
+            # estimate_weight_vram_bytes reads GGUF metadata synchronously;
+            # run the whole fit check in a thread so a multi-second disk read
+            # cannot stall the event loop (and /admin/tune/status with it).
+            await asyncio.to_thread(self._check_vram_fit, target_model, target_gpu)
 
             # We are the one responsible for starting.
             log.info("loading model %s on GPU %s ...", target_model.name, target_gpu.pci_slot)
@@ -177,7 +327,6 @@ class Router:
                         target_model.name,
                     )
                     target_srv.stop()
-                    self.metrics["load_errors"] += 1
                     self.metrics["last_error"] = f"{target_model.name} did not become healthy"
                     detail = f"llama-server for {target_model.name} did not become healthy"
                     if tail:
@@ -193,9 +342,11 @@ class Router:
                 if not future.done():
                     self.metrics["load_errors"] += 1
                     self.metrics["last_error"] = str(exc)
-                    future.set_exception(RuntimeError(
-                        f"llama-server for {target_model.name} did not become healthy"
-                    ))
+                    # Give waiters the same detailed error the starter raises
+                    # (including the llama-server log tail), so _proxy_post can
+                    # surface a 503 with real diagnostics rather than a bare
+                    # "did not become healthy".
+                    future.set_exception(exc)
                 raise
             finally:
                 self._loading_futures.pop(target_model.name, None)
@@ -208,16 +359,35 @@ class Router:
         """
         if not target_gpu.vram_mb:
             return
-        used_mb = _estimate_model_vram_mb(target)
+        target_mb = _estimate_model_vram_mb(target)
+        if target_mb is None:
+            # Expert offload is in force but its bytes cannot be accounted.
+            # Refusing here would silently disable expert offload (the model
+            # fits precisely *because* of it); permit instead and let
+            # llama-server's own OOM be the loud failure if we're wrong.
+            log.warning(
+                "skipping VRAM fit guard for %s: footprint with expert "
+                "offload could not be estimated",
+                target.name,
+            )
+            return
+        used_mb = target_mb
         for name, srv in self._servers.items():
             if name == target.name or not srv.is_running:
                 continue
             other = next((m for m in self.cfg.models if m.name == name), None)
             if other is None or other.gpu_pci_slot != target_gpu.pci_slot:
                 continue
-            used_mb += _estimate_model_vram_mb(other)
+            other_mb = _estimate_model_vram_mb(other)
+            if other_mb is None:
+                log.warning(
+                    "VRAM estimate for co-resident %s unavailable; not "
+                    "counting it against the fit budget",
+                    name,
+                )
+                continue
+            used_mb += other_mb
         if used_mb > target_gpu.vram_mb:
-            target_mb = _estimate_model_vram_mb(target)
             raise RuntimeError(
                 f"model {target.name!r} needs ~{target_mb} MiB on GPU "
                 f"{target_gpu.pci_slot} but only {target_gpu.vram_mb} MiB is available "

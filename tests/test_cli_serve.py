@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -110,3 +111,72 @@ def test_serve_scan_is_idempotent(runner, tmp_path, monkeypatch):
             assert result.exit_code == 0, result.output
 
     assert len(cfg.models) == 1  # not duplicated on the second run
+
+
+def test_serve_banner_printed_once(runner, tmp_path, monkeypatch):
+    """Round 7 leftover: ``arc-llama serve`` prints its Auto-tune banner exactly once."""
+    models_dir = tmp_path / "models"
+    cfg = _cfg(models_dir)
+    cfg.tune.auto = True
+    (models_dir / "Qwen3-8B-Q4_K_M.gguf").write_bytes(b"fake")
+    monkeypatch.setattr("arc_llama.cli.load_config", lambda path: cfg)
+
+    with (
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+        patch("arc_llama.server.create_app", return_value=_fake_app()),
+        patch("uvicorn.run"),
+        patch("signal.signal"),
+        patch("atexit.register"),
+    ):
+        result = runner.invoke(
+            cli, ["--config", str(tmp_path / "config.toml"), "serve"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("Auto-tune") == 1
+
+
+async def test_serve_load_error_counted_once(tmp_path, monkeypatch):
+    """Round 7 leftover: a failed health check increments load_errors exactly once."""
+    from conftest import make_config
+
+    import arc_llama.router as router_mod
+    from arc_llama.router import Router
+
+    cfg = make_config(tmp_path, single_resident=False)
+    monkeypatch.setattr(router_mod, "LlamaServer", NeverReadyServer)
+    rt = Router(cfg)
+
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        await rt.ensure_active("qwen")
+    assert rt.metrics["load_errors"] == 1
+
+
+class NeverReadyServer:
+    """Stub server that fails the health check and yields a log tail."""
+
+    def __init__(self, plan, name):
+        self.plan = plan
+        self.name = name
+        self.running = False
+        self.ready = False
+
+    @property
+    def is_running(self):
+        return self.running
+
+    def start(self, log_dir=None):
+        self.running = True
+        self.ready = False
+
+    async def wait_ready(self):
+        await asyncio.sleep(0.01)
+        return False
+
+    def tail_log(self, lines=50):
+        return "boom: failed to bind port"
+
+    def stop(self):
+        self.running = False
+        self.ready = False

@@ -94,6 +94,54 @@ class TestSuggestCtx:
         )
         assert q4_ctx > q8_ctx
 
+    def test_trained_context_clamps_when_smaller(self):
+        # VRAM would allow a huge ctx, but the model was trained shorter.
+        ctx = suggest_ctx(
+            vram_mb=1024 * 1024,
+            model_file_mb=1,
+            kv_type=KVCacheType.Q8_0,
+            ctx_cap=1_000_000,
+            trained_ctx=32768,
+        )
+        assert ctx == 32768
+
+    def test_trained_context_ignored_when_larger(self):
+        ctx = suggest_ctx(
+            vram_mb=8 * 1024,
+            model_file_mb=6 * 1024,
+            kv_type=KVCacheType.F16,
+            ctx_cap=1_000_000,
+            trained_ctx=128_000,
+        )
+        assert ctx < 128_000
+        assert ctx % 4096 == 0
+
+    def test_none_trained_context_preserves_existing_behavior(self):
+        ctx_without = suggest_ctx(
+            vram_mb=8 * 1024,
+            model_file_mb=6 * 1024,
+            kv_type=KVCacheType.F16,
+            ctx_cap=1_000_000,
+        )
+        ctx_with_none = suggest_ctx(
+            vram_mb=8 * 1024,
+            model_file_mb=6 * 1024,
+            kv_type=KVCacheType.F16,
+            ctx_cap=1_000_000,
+            trained_ctx=None,
+        )
+        assert ctx_without == ctx_with_none
+
+    def test_trained_context_below_floor_returns_floor(self):
+        # Tight VRAM already gives 4096; a smaller trained_ctx must not drop us below floor.
+        ctx = suggest_ctx(
+            vram_mb=1024,
+            model_file_mb=2048,
+            kv_type=KVCacheType.F16,
+            trained_ctx=2048,
+        )
+        assert ctx == 4096
+
 
 class TestDefaultRecipe:
     def test_battlemage_prefers_q8(self):
@@ -114,6 +162,16 @@ class TestDefaultRecipe:
         )
         assert r.ctx >= 4096
         assert r.cache_type_k == KVCacheType.Q8_0
+
+    def test_trained_context_clamps_recipe_ctx(self):
+        # 24 GB would normally suggest the default cap; trained_ctx wins.
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            trained_ctx=32768,
+        )
+        assert r.ctx == 32768
 
     def test_no_prefer_q8_gives_f16(self):
         r = default_recipe(
