@@ -202,6 +202,7 @@ async def _complete(
     max_tokens: int,
     ignore_eos: bool = False,
     cache_prompt: bool = True,
+    is_chat: bool = True,
 ) -> tuple[float, dict[str, Any]]:
     """Send one non-streamed completion. Returns (wall_seconds, response_json).
 
@@ -214,19 +215,27 @@ async def _complete(
 
     ``cache_prompt=False`` forces a full re-prefill each call; prompt-eval
     needs it so repeated runs measure real prefill instead of a cache hit.
+
+    ``is_chat`` selects the endpoint and request shape. Generation
+    benchmarking uses the raw ``/v1/completions`` endpoint because
+    ``ignore_eos`` past a chat template's EOS can produce output that
+    ``/v1/chat/completions`` refuses to parse.
     """
     body: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if is_chat:
+        body["messages"] = [{"role": "user", "content": prompt}]
+    else:
+        body["prompt"] = prompt
     if ignore_eos:
         body["ignore_eos"] = True
     if not cache_prompt:
         body["cache_prompt"] = False
     t0 = time.perf_counter()
-    resp = await client.post("/v1/chat/completions", json=body)
+    resp = await client.post("/v1/chat/completions" if is_chat else "/v1/completions", json=body)
     wall = time.perf_counter() - t0
     resp.raise_for_status()
     return wall, resp.json()
@@ -279,8 +288,10 @@ async def _measure_generation(
     best_tok_s = 0.0
     best_ms = 0.0
     for _ in range(repeats):
+        # Use the raw completions endpoint: ignore_eos past a chat template's
+        # EOS can produce output that /v1/chat/completions refuses to parse.
         wall, obj = await _complete(
-            client, model, prompt, max_tokens=gen_tokens, ignore_eos=True
+            client, model, prompt, max_tokens=gen_tokens, ignore_eos=True, is_chat=False
         )
         t = obj.get("timings") or {}
         if t.get("predicted_per_second"):

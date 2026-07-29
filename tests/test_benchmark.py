@@ -14,6 +14,7 @@ from arc_llama.benchmark import (
     _fmt_speed,
     _fmt_time,
     _fmt_vram,
+    _measure_generation,
     _read_pid_vram_mb,
     _read_vram_total,
     _read_vram_used,
@@ -261,6 +262,17 @@ class FakeHttpxClient:
                 "timings": {"prompt_per_second": 4000.0, "prompt_ms": 128.0,
                             "predicted_per_second": 40.0, "predicted_ms": 6400.0},
             })
+        if "/v1/completions" in path:
+            # Raw completions endpoint: response shape uses `text` choices,
+            # but the benchmark only needs timings and completion_tokens.
+            return FakeHttpxResponse(200, json_data={
+                "choices": [{"text": "Hello there world!",
+                             "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 256,
+                          "total_tokens": 257},
+                "timings": {"prompt_per_second": 4000.0, "prompt_ms": 0.25,
+                            "predicted_per_second": 40.0, "predicted_ms": 6400.0},
+            })
         return FakeHttpxResponse(200)
 
     def stream(self, method: str, path: str, **kwargs):
@@ -402,3 +414,23 @@ class TestPrintResult:
         print_result(r)
         out = capsys.readouterr().out
         assert "something broke" in out
+
+
+class TestMeasureGeneration:
+    @pytest.mark.asyncio
+    async def test_uses_completions_endpoint_not_chat(self):
+        fake_client = FakeHttpxClient()
+        tok_s, ms = await _measure_generation(fake_client, "qwen", 16, repeats=2)
+
+        chat_calls = [c for c in fake_client.calls if c[0] == "POST" and "/v1/chat/completions" in c[1]]
+        comp_calls = [c for c in fake_client.calls if c[0] == "POST" and "/v1/completions" in c[1]]
+
+        assert not chat_calls
+        assert len(comp_calls) == 2
+        body = comp_calls[0][2]["json"]
+        assert "prompt" in body
+        assert "messages" not in body
+        assert body.get("ignore_eos") is True
+        assert body.get("max_tokens") == 16
+        assert tok_s is not None
+        assert ms is not None

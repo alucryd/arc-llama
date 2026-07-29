@@ -188,7 +188,7 @@ class ArcLlamaTUI(App):
         gpus = self.query_one("#gpus", DataTable)
         gpus.add_columns("PCI", "Arch", "Name", "SYCL", "VRAM", "Enabled")
         models = self.query_one("#models", DataTable)
-        models.add_columns("Status", "Name", "GPU", "Port", "ctx", "K/V", "Path")
+        models.add_columns("Status", "Tune", "Name", "GPU", "Port", "ctx", "K/V", "Path")
         upstreams = self.query_one("#upstreams", DataTable)
         upstreams.add_columns("Name", "URL", "Models", "Last Fetch")
         await self._refresh()
@@ -243,11 +243,19 @@ class ArcLlamaTUI(App):
         models.clear()
         for m in s.get("models", []):
             loaded = bool(m.get("loaded"))
+            tune_state = m.get("tune_state") or "untuned"
+            tune_label = tune_state
+            if tune_state == "tuned":
+                tune_label = "TUNED"
+            elif tune_state == "failed":
+                tune_label = "FAILED"
+            elif tune_state == "skipped":
+                tune_label = "SKIPPED"
             status = "[b]LOADED[/]" if loaded else "[dim]idle[/]"
             kv = f"{m.get('cache_type_k') or '?'}/{m.get('cache_type_v') or '?'}"
             path = m.get("path") or "—"
             short = "/".join(Path(path).parts)[-50:]
-            row_text = (status, m["name"], m.get("gpu_pci_slot", "?"),
+            row_text = (status, tune_label, m["name"], m.get("gpu_pci_slot", "?"),
                         str(m.get("port") or "?"), str(m.get("ctx") or "?"), kv, short)
             if loaded:
                 models.add_row(*row_text)

@@ -267,7 +267,8 @@ def mock_recipe_and_mtp():
     """Patch default_recipe and has_mtp_heads for add_local_model/register_discovered."""
     from arc_llama.recipes import KVCacheType, LaunchRecipe
 
-    def _recipe(*, arch, vram_mb, model_file_mb, kv_class, backend=None):
+    def _recipe(*, arch, vram_mb, model_file_mb, kv_class, backend=None,
+                trained_ctx=None):
         return LaunchRecipe(
             n_gpu_layers=999,
             ctx=8192,
@@ -487,21 +488,23 @@ def test_add_local_model_passes_backend_to_recipe(tmp_path):
 
 
 def test_add_local_model_moe_offload_on_tight_vram(tmp_path):
-    """MoE models on tight VRAM get n_cpu_moe set."""
+    """MoE models whose estimated footprint exceeds VRAM get n_cpu_moe set to
+    the minimum feasible layer count (from the shared router estimator)."""
     cfg = _make_config_with_gpu(tmp_path)
     cfg.gpus[0].vram_mb = 10 * 1024  # 10 GB
     model_file = tmp_path / "model.gguf"
     model_file.write_bytes(b"fake")
 
-    # Pretend the file is ~10 GB so it sits at the VRAM limit.
-    fake_stat = type("S", (), {"st_size": 10 * 1024 * 1024 * 1024})()
+    # Fake tensor table: 12 GiB total, 8 MoE layers of 1 GiB expert tensors
+    # each. Fixed costs (KV q8_0 @4096 + buffers) are ~1.1 GiB, so the model
+    # fits only once 4 layers' expert bytes are host-side.
+    fake_scan = (12 * 1024**3, {i: 1024**3 for i in range(8)})
 
     with (
         patch("arc_llama.models.default_recipe") as mock_recipe,
         patch("arc_llama.models.has_mtp_heads", return_value=False),
         patch("arc_llama.models.is_moe", return_value=True),
-        patch("arc_llama.models.expert_count", return_value=64),
-        patch.object(Path, "stat", return_value=fake_stat),
+        patch("arc_llama.router.scan_weight_tensors", return_value=fake_scan),
     ):
         from arc_llama.recipes import KVCacheType, LaunchRecipe
 
@@ -520,22 +523,22 @@ def test_add_local_model_moe_offload_on_tight_vram(tmp_path):
             gpu_pci_slot="0000:03:00.0",
         )
 
-    assert "n_cpu_moe" in mc.recipe
-    assert isinstance(mc.recipe["n_cpu_moe"], int)
-    assert 1 <= mc.recipe["n_cpu_moe"] <= 32
+    assert mc.recipe["n_cpu_moe"] == 4
 
 
 def test_add_local_model_moe_no_offload_when_vram_headroom(tmp_path):
-    """MoE models with plenty of VRAM do not get n_cpu_moe."""
+    """MoE models that fit without offload do not get n_cpu_moe."""
     cfg = _make_config_with_gpu(tmp_path)  # 24 GB
     model_file = tmp_path / "model.gguf"
     model_file.write_bytes(b"fake")
+
+    fake_scan = (4 * 1024**3, {i: 512 * 1024**2 for i in range(4)})
 
     with (
         patch("arc_llama.models.default_recipe") as mock_recipe,
         patch("arc_llama.models.has_mtp_heads", return_value=False),
         patch("arc_llama.models.is_moe", return_value=True),
-        patch("arc_llama.models.expert_count", return_value=64),
+        patch("arc_llama.router.scan_weight_tensors", return_value=fake_scan),
     ):
         from arc_llama.recipes import KVCacheType, LaunchRecipe
 

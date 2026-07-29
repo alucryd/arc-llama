@@ -143,6 +143,47 @@ class PathsConfig:
 
 
 @dataclass
+class TuneConfig:
+    """Background auto-tuning policy.
+
+    Tuning is an idle-time, single-model sweep. These knobs decide whether the
+    auto-tuner runs at all, how quiet the router has to be before it starts, and
+    the benchmark shape it uses.
+    """
+
+    auto: bool = True
+    """Run background sweeps when models are idle and eligible."""
+    idle_seconds: int = 120
+    """Seconds of router inactivity required before a sweep may start."""
+    target: str = "balanced"
+    """Target balance passed to tune_model: balanced, generation, or prompt."""
+    prompt_tokens: int = 1024
+    gen_tokens: int = 128
+    min_uses: int = 1
+    """Requests a model must serve before it becomes eligible for auto-tune."""
+    retune_on_fingerprint_change: bool = True
+    """Treat a fingerprint mismatch as a fresh untuned state."""
+
+
+@dataclass
+class WorkloadConfig:
+    """Declared usage profile, gathered by `arc-llama init`.
+
+    Every field may be empty ("not sure" / never asked), in which case the
+    tuner behaves exactly as if no profile existed. The answers steer what the
+    auto-tuner measures: which context depth rankings are taken at, which KV
+    types are even eligible, and how prompt-eval vs generation is weighted.
+    """
+
+    context_length: str = ""
+    """"" | short (<8k) | long (~32k) | very_long (100k+)."""
+    style: str = ""
+    """"" | agentic (tool-calling loops) | conversational (chat)."""
+    priority: str = ""
+    """"" | first_token (time to first token) | throughput (steady-state tok/s)."""
+
+
+@dataclass
 class AgentConfig:
     root: str = "."
     """Default filesystem root for the agent file/shell tools.
@@ -200,6 +241,10 @@ class ModelConfig:
     recipe: dict[str, Any] = field(default_factory=dict)
     aliases: list[str] = field(default_factory=list)
     """Extra strings that should match this model in the OpenAI `model` field."""
+    tune_state: str = "untuned"  # untuned | tuned | failed | skipped
+    tuned_at: float | None = None
+    tune_fingerprint: str = ""
+    tune_error: str = ""
 
     def launch_recipe(self) -> LaunchRecipe:
         r = self.recipe or {}
@@ -227,6 +272,7 @@ class ModelConfig:
             no_mmap=bool(r.get("no_mmap", False)),
             mlock=bool(r.get("mlock", False)),
             n_cpu_moe=r.get("n_cpu_moe"),
+            override_tensor=list(r.get("override_tensor", [])) if r.get("override_tensor") else None,
             extra_flags=list(r.get("extra_flags", [])),
         )
 
@@ -236,6 +282,8 @@ class Config:
     version: int = CONFIG_VERSION
     server: ServerConfig = field(default_factory=ServerConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    tune: TuneConfig = field(default_factory=TuneConfig)
+    workload: WorkloadConfig = field(default_factory=WorkloadConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     gpus: list[GPUConfig] = field(default_factory=list)
     models: list[ModelConfig] = field(default_factory=list)
@@ -337,6 +385,8 @@ class Config:
             "version": self.version,
             "server": asdict(self.server),
             "paths": asdict(self.paths),
+            "tune": asdict(self.tune),
+            "workload": asdict(self.workload),
             "agent": asdict(self.agent),
             "gpus": [asdict(g) for g in self.gpus],
             "models": [asdict(m) for m in self.models],
@@ -383,6 +433,8 @@ def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     # Ensure all top-level sections exist so downstream code can assume them.
     raw.setdefault("server", {})
     raw.setdefault("paths", {})
+    raw.setdefault("tune", {})
+    raw.setdefault("workload", {})
     raw.setdefault("agent", {})
     raw.setdefault("gpus", [])
     raw.setdefault("models", [])
@@ -452,6 +504,10 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise ValueError("config 'mcp_servers' must be an array")
     if not isinstance(raw.get("profiles", []), list):
         raise ValueError("config 'profiles' must be an array")
+    if not isinstance(raw.get("tune", {}), dict):
+        raise ValueError("config 'tune' must be a table")
+    if not isinstance(raw.get("workload", {}), dict):
+        raise ValueError("config 'workload' must be a table")
 
 
 def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
@@ -495,6 +551,8 @@ def load_config(path: Path | None = None) -> Config:
         version=int(raw.get("version", CONFIG_VERSION)),
         server=ServerConfig(**raw.get("server", {})),
         paths=PathsConfig(**raw.get("paths", {})),
+        tune=TuneConfig(**raw.get("tune", {})),
+        workload=WorkloadConfig(**raw.get("workload", {})),
         agent=AgentConfig(**raw.get("agent", {})),
         gpus=[GPUConfig(**g) for g in raw.get("gpus", [])],
         models=[ModelConfig(**m) for m in raw.get("models", [])],

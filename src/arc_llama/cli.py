@@ -164,6 +164,51 @@ def cli(ctx: click.Context, verbose: bool, config_path: Path | None) -> None:
 # init
 # ===========================================================================
 
+
+def _gather_workload_profile(
+    cfg: Config,
+    context: str | None,
+    style: str | None,
+    priority: str | None,
+) -> None:
+    """Record the three workload answers into cfg.workload.
+
+    Flags always win and make Docker/CI non-blocking. When a flag is absent
+    and stdin is interactive, ask — every question offers "not-sure", which
+    keeps the default (empty = unprofiled, tuner behaves as before). Nothing
+    here asks about ubatch, KV type, or flags directly; the answers steer the
+    tuner indirectly via the [workload] section.
+    """
+
+    def _norm(v: str | None) -> str:
+        # Spelled out rather than `v in (None, "not-sure")` so the type
+        # checker can narrow v to str on the fallthrough.
+        return "" if v is None or v == "not-sure" else v
+
+    if sys.stdin.isatty():
+        if context is None:
+            context = click.prompt(
+                "Typical conversation length? (short <8k / long ~32k / very_long 100k+)",
+                type=click.Choice(["short", "long", "very_long", "not-sure"]),
+                default="not-sure",
+            )
+        if style is None:
+            style = click.prompt(
+                "Mostly agentic tool-calling loops, or mostly conversational chat?",
+                type=click.Choice(["agentic", "conversational", "not-sure"]),
+                default="not-sure",
+            )
+        if priority is None:
+            priority = click.prompt(
+                "What hurts more: waiting for the first token, or the speed after it starts?",
+                type=click.Choice(["first_token", "throughput", "not-sure"]),
+                default="not-sure",
+            )
+    cfg.workload.context_length = _norm(context)
+    cfg.workload.style = _norm(style)
+    cfg.workload.priority = _norm(priority)
+
+
 @cli.command()
 @click.option(
     "--llama-server",
@@ -180,6 +225,27 @@ def cli(ctx: click.Context, verbose: bool, config_path: Path | None) -> None:
     "--scan-path", "scan_paths", multiple=True, type=click.Path(),
     help="Extra directory to walk for GGUFs. Repeatable.",
 )
+@click.option(
+    "--workload-context",
+    type=click.Choice(["short", "long", "very_long", "not-sure"]),
+    default=None,
+    help="Typical conversation length: short (<8k), long (~32k), very_long (100k+). "
+         "'not-sure' keeps the default.",
+)
+@click.option(
+    "--workload-style",
+    type=click.Choice(["agentic", "conversational", "not-sure"]),
+    default=None,
+    help="Mostly agentic tool-calling loops, or mostly conversational chat. "
+         "'not-sure' keeps the default.",
+)
+@click.option(
+    "--workload-priority",
+    type=click.Choice(["first_token", "throughput", "not-sure"]),
+    default=None,
+    help="What hurts more: waiting for the first token, or the speed after it "
+         "starts. 'not-sure' keeps the default.",
+)
 @click.pass_context
 def init(
     ctx: click.Context,
@@ -187,6 +253,9 @@ def init(
     force: bool,
     scan: bool,
     scan_paths: tuple[str, ...],
+    workload_context: str | None,
+    workload_style: str | None,
+    workload_priority: str | None,
 ) -> None:
     """Detect GPUs and write a starter config; auto-register any GGUFs found."""
     config_path: Path = ctx.obj["config_path"]
@@ -244,6 +313,7 @@ def init(
             gpu_cfg.backend = bin_backend.value
     if scan_paths:
         cfg.paths.scan_paths = list(scan_paths)
+    _gather_workload_profile(cfg, workload_context, workload_style, workload_priority)
     _save_or_die(cfg, config_path)
     console.print(f"[green]Wrote config to {config_path}[/green]")
     _print_gpu_table(gpus)
@@ -937,7 +1007,49 @@ def remove(ctx: click.Context, name: str) -> None:
 
 # ===========================================================================
 # serve
+def _print_autotune_banner(cfg: Config) -> None:
+    """Tell the operator whether background tuning is active and how to disable it."""
+    if not getattr(cfg, "tune", None) or not cfg.tune.auto:
+        console.print("[dim]Auto-tune: off (use --auto-tune or set [tune] auto=true to enable).[/dim]")
+        return
+    untuned_count = sum(1 for m in cfg.models if m.tune_state in ("untuned", "skipped"))
+    if untuned_count:
+        console.print(
+            f"[dim]Auto-tune: on -- {untuned_count} model(s) eligible; "
+            f"sweep starts after {cfg.tune.idle_seconds}s idle. "
+            f"Use --no-auto-tune to disable.[/dim]"
+        )
+    else:
+        console.print("[dim]Auto-tune: on -- no eligible models.[/dim]")
+
+
 # ===========================================================================
+
+def _print_tune_status_table(cfg: Config) -> None:
+    """Print the per-model tune state for `arc-llama tune --status`."""
+    from rich.table import Table
+
+    table = Table(title="Tune status")
+    table.add_column("Model")
+    table.add_column("State")
+    table.add_column("Tuned at")
+    table.add_column("Fingerprint")
+    table.add_column("Error")
+    for m in cfg.models:
+        tuned_at = ""
+        if m.tuned_at:
+            from datetime import datetime, timezone
+
+            tuned_at = datetime.fromtimestamp(m.tuned_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        table.add_row(
+            m.name,
+            m.tune_state,
+            tuned_at,
+            (m.tune_fingerprint[:16] + "...") if m.tune_fingerprint else "",
+            m.tune_error[:60],
+        )
+    console.print(table)
+
 
 def _print_serve_banner(cfg: Config) -> None:
     """Print the applied Arc profile per GPU + model at serve startup.
@@ -1017,6 +1129,10 @@ def _print_serve_banner(cfg: Config) -> None:
     help="Auto-register any new GGUFs found in models_dir/scan_paths on startup "
          "(default: on). Drop a model in and it just appears.",
 )
+@click.option(
+    "--auto-tune/--no-auto-tune", "auto_tune", default=None,
+    help="Enable background auto-tuning (default: from config tune.auto).",
+)
 @click.pass_context
 def serve(
     ctx: click.Context,
@@ -1025,6 +1141,7 @@ def serve(
     profile: str | None,
     admin_token: str | None,
     scan: bool,
+    auto_tune: bool | None,
 ) -> None:
     """Run the OpenAI-compatible router."""
     cfg = load_config(ctx.obj["config_path"])
@@ -1036,6 +1153,8 @@ def serve(
         cfg.agent.profile = profile
     if admin_token:
         cfg.server.admin_token = admin_token
+    if auto_tune is not None:
+        cfg.tune.auto = auto_tune
 
     # Zero-config discovery: pick up any GGUF dropped into models_dir/scan_paths
     # since the last run, so `serve` reflects the filesystem without a manual
@@ -1054,6 +1173,7 @@ def serve(
                 + ", ".join(m.name for m in added)
             )
 
+    _print_autotune_banner(cfg)
     if not cfg.models:
         console.print(
             "[yellow]No models registered yet — drop a GGUF in "
@@ -1076,7 +1196,7 @@ def serve(
         console.print("[red]uvicorn not installed.[/red]")
         sys.exit(1)
     from arc_llama.server import create_app
-    app = create_app(cfg)
+    app = create_app(cfg, config_path=ctx.obj["config_path"])
 
     # Belt-and-suspenders for graceful shutdown: even if uvicorn's lifespan
     # handling misfires (e.g. on SIGTERM during a busy event loop), atexit
@@ -1250,6 +1370,10 @@ def benchmark_cmd(
     help="Write the winning config into the model's recipe (default) or restore the original.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables.")
+@click.option(
+    "--status", "status_only", is_flag=True,
+    help="Print the per-model tune state table and exit without measuring.",
+)
 @click.pass_context
 def tune_cmd(
     ctx: click.Context,
@@ -1261,6 +1385,7 @@ def tune_cmd(
     gen_tokens: int,
     apply_: bool,
     as_json: bool,
+    status_only: bool,
 ) -> None:
     """Find the fastest recipe for MODEL by measuring, then persist it.
 
@@ -1271,9 +1396,17 @@ def tune_cmd(
     """
     from dataclasses import asdict
 
+    from arc_llama.autotune import (
+        compute_fingerprint,
+        set_tuned_state,
+    )
     from arc_llama.tune import print_multi_summary, print_report, tune_all, tune_model
 
     cfg = load_config(ctx.obj["config_path"])
+
+    if status_only:
+        _print_tune_status_table(cfg)
+        sys.exit(0)
 
     if all_models and model:
         console.print("[red]Pass either MODEL or --all, not both.[/red]")
@@ -1299,6 +1432,21 @@ def tune_cmd(
                 target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
                 apply=apply_, cfg=cfg, on_start=on_start,
             ))
+            for r in reports:
+                if not r.error and not r.aborted:
+                    m = cfg.find_model(r.model)
+                    if m is not None:
+                        gpu = cfg.find_gpu(m.gpu_pci_slot)
+                        from arc_llama import __version__, workload
+                        fp = compute_fingerprint(
+                            m, cfg.paths.llama_server, gpu, __version__,
+                            workload.fingerprint_key(cfg.workload),
+                        )
+                        set_tuned_state(cfg, m, fp)
+            try:
+                cfg.save(ctx.obj["config_path"])
+            except OSError as e:
+                console.print(f"[yellow]Warning: failed to save tune state: {e}[/yellow]")
             if as_json:
                 click.echo(json.dumps([asdict(r) for r in reports], indent=2, default=str))
             else:
@@ -1316,6 +1464,21 @@ def tune_cmd(
     except KeyboardInterrupt:
         console.print("[yellow]Tune interrupted.[/yellow]")
         sys.exit(130)
+
+    if not report.error and not report.aborted:
+        m = cfg.find_model(report.model)
+        if m is not None:
+            gpu = cfg.find_gpu(m.gpu_pci_slot)
+            from arc_llama import __version__, workload
+            fp = compute_fingerprint(
+                m, cfg.paths.llama_server, gpu, __version__,
+                workload.fingerprint_key(cfg.workload),
+            )
+            set_tuned_state(cfg, m, fp)
+            try:
+                cfg.save(ctx.obj["config_path"])
+            except OSError as e:
+                console.print(f"[yellow]Warning: failed to save tune state: {e}[/yellow]")
 
     if as_json:
         click.echo(json.dumps(asdict(report), indent=2, default=str))
