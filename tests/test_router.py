@@ -36,6 +36,11 @@ class FakeServer:
         self.ready = False
         self.stops.append(self.name)
 
+    async def astop(self, drain_seconds=3.0):
+        # Mirrors LlamaServer.astop, which offloads the blocking stop() to a
+        # thread. The router awaits this from the event loop.
+        self.stop()
+
 
 async def test_single_resident_policy_stops_other_models_before_starting_target(tmp_path, monkeypatch):
     from conftest import make_config

@@ -404,11 +404,11 @@ class Router:
                 continue
             other_model = next((m for m in self.cfg.models if m.name == name), None)
             if other_model is None:
-                srv.stop()
+                await srv.astop()
                 continue
             if single or other_model.gpu_pci_slot == target_gpu.pci_slot:
                 log.info("evicting %s before starting %s", name, target.name)
-                srv.stop()
+                await srv.astop()
 
     async def stop_one(self, name: str) -> bool:
         """Stop a single model's llama-server. Returns True if it was running."""
@@ -416,7 +416,7 @@ class Router:
             srv = self._servers.get(name)
             if srv is None or not srv.is_running:
                 return False
-            srv.stop()
+            await srv.astop()
             self.metrics["stops"] += 1
             return True
 
@@ -426,7 +426,7 @@ class Router:
             stopped = 0
             for srv in self._servers.values():
                 if srv.is_running:
-                    srv.stop()
+                    await srv.astop()
                     stopped += 1
             self.metrics["stops"] += stopped
             return stopped
@@ -442,7 +442,7 @@ class Router:
             old = self._servers.pop(name, None)
             was_running = bool(old and old.is_running)
             if old is not None and old.is_running:
-                old.stop()
+                await old.astop()
             cfg_model = next((m for m in self.cfg.models if m.name == name), None)
             if cfg_model is None:
                 return False, was_running
@@ -456,4 +456,4 @@ class Router:
     async def shutdown(self) -> None:
         async with self._lock:
             for srv in self._servers.values():
-                srv.stop()
+                await srv.astop()

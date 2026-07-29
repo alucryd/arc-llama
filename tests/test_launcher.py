@@ -1,6 +1,7 @@
 """Tests for arc_llama.launcher — env construction, command-line building."""
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -313,6 +314,95 @@ class TestLlamaServerLifecycle:
         srv.stop()
         assert srv.is_running is False
 
+    @pytest.mark.asyncio
+    async def test_wait_ready_cancellation_calls_astop(self, monkeypatch):
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        srv.process = type("P", (), {"poll": lambda self: None, "pid": 1})()
+        srv.started_at = 0.0
+
+        astops = []
+        async def _recording_astop(drain_seconds=3.0):
+            astops.append(drain_seconds)
+        monkeypatch.setattr(srv, "astop", _recording_astop)
+
+        import httpx
+        async def _fake_get(self, url):
+            return type("R", (), {"status_code": 503})()
+        monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+        async def _sleep_then_cancel(delay):
+            raise asyncio.CancelledError("mock cancel")
+        monkeypatch.setattr(asyncio, "sleep", _sleep_then_cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await srv.wait_ready(timeout=2.0)
+        assert astops == [3.0]
+
+    @pytest.mark.asyncio
+    async def test_wait_ready_cancellation_falls_back_to_blocking_stop(self, monkeypatch):
+        """If astop() is itself cancelled, the blocking stop() must still run.
+
+        CancelledError is a BaseException, so a naive `except Exception` around
+        the async cleanup would let it escape and orphan the subprocess.
+        """
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        srv.process = type("P", (), {"poll": lambda self: None, "pid": 1})()
+        srv.started_at = 0.0
+
+        async def _cancelled_astop(drain_seconds=3.0):
+            raise asyncio.CancelledError("cancelled during cleanup")
+        monkeypatch.setattr(srv, "astop", _cancelled_astop)
+
+        stops = []
+        monkeypatch.setattr(srv, "stop", lambda *a, **k: stops.append(True))
+
+        import httpx
+        async def _fake_get(self, url):
+            return type("R", (), {"status_code": 503})()
+        monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+        async def _sleep_then_cancel(delay):
+            raise asyncio.CancelledError("mock cancel")
+        monkeypatch.setattr(asyncio, "sleep", _sleep_then_cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await srv.wait_ready(timeout=2.0)
+        assert stops == [True], "blocking stop() must run when astop() is cancelled"
+
+    @pytest.mark.asyncio
+    async def test_astop_offloads_to_thread(self, monkeypatch):
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+
+        to_thread_calls = []
+        async def _fake_to_thread(func, *args, **kwargs):
+            to_thread_calls.append((func, args, kwargs))
+            return func(*args, **kwargs)
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        stop_calls = []
+        def _recording_stop(drain_seconds=3.0):
+            stop_calls.append(drain_seconds)
+        monkeypatch.setattr(srv, "stop", _recording_stop)
+
+        await srv.astop(drain_seconds=1.5)
+        assert to_thread_calls
+        assert stop_calls == [1.5]
+
 
 class TestLogHandling:
     def test_log_rotation_renames_existing_large_log(self, tmp_path):
@@ -358,6 +448,40 @@ class TestLogHandling:
         finally:
             subprocess.Popen = original_popen
         srv.stop()
+
+    def test_start_closes_log_file_on_popen_failure(self, monkeypatch, tmp_path):
+        plan = build_plan(
+            Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})()),
+            ModelConfig(name="m", path="/m.gguf", port=18080, gpu_pci_slot="00:00.0"),
+            GPUConfig(pci_slot="00:00.0", sycl_index=0, arch="battlemage"),
+        )
+        srv = LlamaServer(plan)
+        log_dir = tmp_path / "logs"
+
+        closes = []
+        class FakeFile:
+            def write(self, data):
+                pass
+            def flush(self):
+                pass
+            def close(self):
+                closes.append(True)
+
+        real_open = open
+        def _fake_open(path, mode="r", *args, **kwargs):
+            if mode == "ab" and str(path).endswith(".log"):
+                return FakeFile()
+            return real_open(path, mode, *args, **kwargs)
+        monkeypatch.setattr("builtins.open", _fake_open)
+
+        def _fake_popen(*args, **kwargs):
+            raise FileNotFoundError("llama-server not found")
+        monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+
+        with pytest.raises(FileNotFoundError):
+            srv.start(log_dir=log_dir)
+        assert closes
+        assert srv._log_path is None
 
 
 class TestWindowsLifecycle:
