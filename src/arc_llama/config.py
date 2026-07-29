@@ -545,7 +545,18 @@ def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
         return
     cfg.server.admin_token = secrets.token_urlsafe(32)
     if persist:
-        cfg.save(path)
+        try:
+            cfg.save(path)
+        except OSError as exc:
+            logging.getLogger("arc_llama.config").warning(
+                "No admin_token was configured -- generated one but could not "
+                "save it to %s: %s. The token is in-memory only for this run; "
+                "admin endpoints and auto_confirm agent runs will use a new "
+                "token after restart. Set ARC_LLAMA_ADMIN_TOKEN to use your "
+                "own token without persisting it to disk.",
+                path, exc,
+            )
+            return
     logging.getLogger("arc_llama.config").warning(
         "No admin_token was configured -- generated one and saved it to %s. "
         "Admin endpoints and auto_confirm agent runs now require an "

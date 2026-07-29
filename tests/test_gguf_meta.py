@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -9,6 +10,7 @@ from arc_llama.gguf_meta import (
     estimate_weight_vram_bytes,
     expert_count,
     expert_tensor_bytes_by_layer,
+    gguf,
     has_mtp_heads,
     is_hybrid_ssm,
     is_moe,
@@ -33,6 +35,112 @@ def _have_fixtures() -> bool:
 
 def _have_moe_fixtures() -> bool:
     return _GEMMA_MOE.exists() and _QWEN_CODER_MOE.exists()
+
+
+class _FakeField:
+    def __init__(self, value: Any):
+        self._value = value
+
+    def contents(self) -> Any:
+        return self._value
+
+
+# Distinct from the tensor-table _FakeReader defined further down: this one
+# answers get_field() lookups, that one answers .tensors. Same name would
+# shadow, and the later definition would silently win.
+class _FakeFieldReader:
+    def __init__(self, fields: dict[str, Any]):
+        self._fields = fields
+
+    def get_field(self, key: str):
+        if key not in self._fields:
+            return None
+        return _FakeField(self._fields[key])
+
+
+class TestReadGgufMetaExpertCountKeys:
+    def _patch_reader(
+        self, monkeypatch: pytest.MonkeyPatch, fields: dict[str, Any]
+    ) -> None:
+        monkeypatch.setattr(
+            "arc_llama.gguf_meta.gguf.GGUFReader",
+            lambda _path: _FakeFieldReader(fields),
+        )
+
+    def test_reads_arch_prefixed_expert_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        p = tmp_path / "model.gguf"
+        p.write_text("")
+        self._patch_reader(
+            monkeypatch,
+            {
+                gguf.Keys.General.ARCHITECTURE: "gemma4",
+                "gemma4.expert_count": 128,
+            },
+        )
+        meta = read_gguf_meta(p)
+        assert meta["expert_count"] == 128
+
+    def test_reads_bare_alternative_expert_count_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        p = tmp_path / "model.gguf"
+        p.write_text("")
+        self._patch_reader(
+            monkeypatch,
+            {
+                gguf.Keys.General.ARCHITECTURE: "gemma4",
+                "num_experts": 64,
+            },
+        )
+        meta = read_gguf_meta(p)
+        assert meta["expert_count"] == 64
+
+    def test_reads_arch_prefixed_alternative_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        p = tmp_path / "model.gguf"
+        p.write_text("")
+        self._patch_reader(
+            monkeypatch,
+            {
+                gguf.Keys.General.ARCHITECTURE: "gemma4",
+                "gemma4.moe_expert_count": 32,
+            },
+        )
+        meta = read_gguf_meta(p)
+        assert meta["expert_count"] == 32
+
+    def test_skips_zero_and_uses_next_positive_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        p = tmp_path / "model.gguf"
+        p.write_text("")
+        self._patch_reader(
+            monkeypatch,
+            {
+                gguf.Keys.General.ARCHITECTURE: "gemma4",
+                "expert_count": 0,
+                "num_experts": 8,
+            },
+        )
+        meta = read_gguf_meta(p)
+        assert meta["expert_count"] == 8
+
+    def test_no_expert_count_when_no_keys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        p = tmp_path / "model.gguf"
+        p.write_text("")
+        self._patch_reader(
+            monkeypatch,
+            {
+                gguf.Keys.General.ARCHITECTURE: "llama",
+            },
+        )
+        meta = read_gguf_meta(p)
+        assert "expert_count" not in meta
 
 
 class TestReadGgufMeta:
