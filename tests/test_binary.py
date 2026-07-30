@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -160,16 +161,25 @@ class TestVulkanDeviceResolution:
         ]
         assert resolve_vulkan_index(devices) is None
 
-    def test_parses_real_list_devices_output(self, tmp_path):
-        script = tmp_path / "fake-llama-server"
-        script.write_text(
-            "#!/bin/sh\n"
-            "echo 'Available devices:'\n"
-            "echo '  Vulkan0: NVIDIA GeForce RTX 4060 Ti (16380 MiB, 13404 MiB free)'\n"
-            "echo '  Vulkan1: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21) (24480 MiB, 21994 MiB free)'\n"
+    def test_parses_real_list_devices_output(self, monkeypatch, tmp_path):
+        """Verbatim output from the b10192 Vulkan build on the mixed-GPU box.
+
+        subprocess.run is stubbed rather than executing a shell script, so this
+        runs on Windows too. The parser is what is under test, not exec.
+        """
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: NVIDIA GeForce RTX 4060 Ti (16380 MiB, 13404 MiB free)\n"
+            "  Vulkan1: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"
+            " (24480 MiB, 21994 MiB free)\n"
         )
-        script.chmod(0o755)
-        devices = list_vulkan_devices(script)
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        devices = list_vulkan_devices(tmp_path / "llama-server")
         assert devices == [
             (0, "NVIDIA GeForce RTX 4060 Ti"),
             (1, "Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"),
