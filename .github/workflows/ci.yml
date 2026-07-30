@@ -36,3 +36,64 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+  bare-install:
+    # The `test` job installs .[dev], which pulls in textual, so it can never
+    # catch an eager import of an optional dependency. 0.4.0 and 0.5.0 both
+    # shipped to PyPI unable to run a single command for exactly that reason,
+    # with the whole matrix green. This job installs the built wheel the way a
+    # real user does, with no extras, and runs every command.
+    name: Bare install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Oldest supported version: most likely to expose a packaging break.
+          python-version: "3.10"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel
+
+      - name: Install the wheel with no extras
+        run: python -m pip install --quiet dist/*.whl
+
+      - name: Confirm the optional extras really are absent
+        # Guards the guard: if an extra ever becomes a base dependency, this
+        # job would silently stop testing anything.
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+
+          present = [
+              m for m in ("textual", "fastembed", "mcp")
+              if importlib.util.find_spec(m) is not None
+          ]
+          if present:
+              sys.exit(f"optional extras present, job proves nothing: {present}")
+          print("no optional extras installed")
+          PY
+
+      - name: Every command must run on a default install
+        run: |
+          arc-llama --version
+          arc-llama --help
+          arc-llama serve --help
+          arc-llama list --help
+          arc-llama init --help
+          arc-llama install-runtime --help
+          arc-llama scan --help
