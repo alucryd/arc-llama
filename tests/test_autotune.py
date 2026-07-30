@@ -545,3 +545,37 @@ async def test_pick_candidate_prefers_never_tuned_over_stale_fingerprint(cfg: Co
     picked = tuner._pick_candidate()
     assert picked is not None
     assert picked.name == "m"
+
+
+async def test_stop_terminates_the_loop_on_every_python(cfg: Config) -> None:
+    """stop() must actually end the background loop, not just ask nicely.
+
+    On Python < 3.12 `asyncio.wait_for` discards a CancelledError that arrives
+    after its inner future has already resolved. stop() sets the abort event
+    and cancels in the same tick, hitting that window every time, so the loop
+    used to survive its own cancellation and `await self._task` never
+    returned. In the server that showed up as lifespan shutdown hanging
+    forever, i.e. every TestClient context manager in the suite deadlocking.
+    """
+    router = FakeRouter(cfg)
+    # A long interval parks the loop inside the wait, which is where stop()
+    # finds it in practice.
+    tuner = Autotuner(cfg, router, version="0.6.0", loop_interval=60)
+    tuner.start()
+    await asyncio.sleep(0.1)
+    task = tuner._task
+    assert task is not None and not task.done()
+
+    # Deliberately not asyncio.wait_for: timing stop() out would *cancel* it,
+    # and stop() swallows CancelledError, so wait_for would report success on
+    # exactly the broken code this test exists to catch. asyncio.wait leaves
+    # the coroutine alone and just tells us whether it finished.
+    stopper = asyncio.ensure_future(tuner.stop())
+    done, _pending = await asyncio.wait({stopper}, timeout=5)
+    try:
+        assert stopper in done, "stop() never returned: the loop outlived its own cancellation"
+        assert task.done()
+        assert tuner._task is None
+    finally:
+        stopper.cancel()
+        task.cancel()

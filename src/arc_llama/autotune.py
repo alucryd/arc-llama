@@ -171,6 +171,7 @@ class Autotuner:
         self.loop_interval = loop_interval
         self._task: asyncio.Task[None] | None = None
         self._abort_event = asyncio.Event()
+        self._stopping = False
         self.running_model: str | None = None
         self.running_stage: str | None = None
         self._lock = asyncio.Lock()
@@ -203,6 +204,7 @@ class Autotuner:
         if self._task is not None and not self._task.done():
             return
         self._abort_event.clear()
+        self._stopping = False
         self._task = asyncio.create_task(self._loop())
         log.info("autotune: started background loop")
 
@@ -210,6 +212,10 @@ class Autotuner:
         async with self._lock:
             if self._task is None:
                 return
+            # Set _stopping before the abort event: _loop checks it at the top
+            # of every iteration, so the loop exits even if the cancellation is
+            # lost (see _wait_for_abort).
+            self._stopping = True
             self._abort_event.set()
             self._task.cancel()
             try:
@@ -244,25 +250,37 @@ class Autotuner:
         self._abort_event.set()
         return True
 
+    async def _wait_for_abort(self, timeout: float) -> None:
+        """Wait up to *timeout* seconds for the abort event to be set.
+
+        Deliberately not `asyncio.wait_for`. On Python < 3.12 `wait_for`
+        swallows a CancelledError that lands after the inner future has already
+        resolved, and `stop()` hits that window every time: it sets the abort
+        event and cancels in the same tick, so the event is ready before the
+        cancellation is delivered. The loop then never exits and shutdown hangs
+        forever awaiting the task. `asyncio.wait` has no such window.
+        """
+        waiter = asyncio.ensure_future(self._abort_event.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=timeout)
+        finally:
+            waiter.cancel()
+
     async def _loop(self) -> None:
         try:
-            while True:
+            while not self._stopping:
                 try:
                     await self._tick()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     log.exception("autotune: tick failed: %s", exc)
-                try:
-                    await asyncio.wait_for(
-                        self._abort_event.wait(),
-                        timeout=self.loop_interval,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                if self._stopping:
+                    break
+                await self._wait_for_abort(self.loop_interval)
                 # Only clear if this iteration set it; a new abort signal
                 # should be visible on the next iteration.
-                if self._abort_event.is_set():
+                if self._abort_event.is_set() and not self._stopping:
                     self._abort_event.clear()
         except asyncio.CancelledError:
             log.info("autotune: loop cancelled")
@@ -391,14 +409,14 @@ class Autotuner:
             a recipe (i.e., when no user request is holding the backend).
             """
             deadline = _now() + 30.0
-            while self.router.inflight > 0 and _now() < deadline:
-                try:
-                    await asyncio.wait_for(self._abort_event.wait(), timeout=0.2)
-                except asyncio.TimeoutError:
-                    pass
+            # `not self._stopping` keeps this from spinning during shutdown:
+            # once stop() has set the abort event for good, _wait_for_abort
+            # returns instantly every time round.
+            while self.router.inflight > 0 and _now() < deadline and not self._stopping:
+                await self._wait_for_abort(0.2)
                 # A fresh abort signal during the wait should restart the
                 # bounded wait rather than give up early.
-                if self._abort_event.is_set():
+                if self._abort_event.is_set() and not self._stopping:
                     self._abort_event.clear()
             if self.router.inflight > 0:
                 log.warning(
