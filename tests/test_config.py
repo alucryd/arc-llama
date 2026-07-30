@@ -213,6 +213,24 @@ def test_resolve_admin_token_warning_omits_secret(caplog, tmp_path):
     assert str(path) in caplog.text
 
 
+def test_load_config_survives_read_only_config(tmp_path, monkeypatch, caplog):
+    """A generated admin_token must not crash load_config on a read-only file."""
+    path = tmp_path / "config.toml"
+    Config().save(path)
+
+    def _raise(_self, _p=None):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(Config, "save", _raise)
+
+    with caplog.at_level(logging.WARNING, logger="arc_llama.config"):
+        cfg = load_config(path)
+
+    assert cfg.server.admin_token
+    assert "in-memory only" in caplog.text
+    assert "Permission denied" in caplog.text
+
+
 def test_load_config_ignores_unknown_model_keys(tmp_path, caplog):
     path = tmp_path / "config.toml"
     path.write_text(

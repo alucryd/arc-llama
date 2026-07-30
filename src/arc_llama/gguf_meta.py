@@ -57,15 +57,18 @@ def read_gguf_meta(path: Path | str) -> dict[str, Any]:
         # Expert count is the definitive MoE signal (some architectures,
         # e.g. gemma4, use the same arch string for dense and MoE variants,
         # so this field -- not the arch name -- is what actually tells them
-        # apart).
-        expert_count_field = reader.get_field(
-            gguf.Keys.LLM.EXPERT_COUNT.format(arch=arch)
-        )
-        if expert_count_field is not None:
-            try:
-                meta["expert_count"] = int(expert_count_field.contents())
-            except (TypeError, ValueError):
-                pass
+        # apart). Different converters spell the key differently, so try the
+        # architecture-prefixed form first, then the bare keys.
+        for key in _expert_count_key_candidates(arch):
+            expert_count_field = reader.get_field(key)
+            if expert_count_field is not None:
+                try:
+                    value = int(expert_count_field.contents())
+                    if value > 0:
+                        meta["expert_count"] = value
+                        break
+                except (TypeError, ValueError):
+                    continue
         # Trained context length: llama.cpp silently clamps the served ctx
         # to this value, so any configured ctx above it is a lie.
         ctx_field = reader.get_field(f"{arch}.context_length")
@@ -149,6 +152,20 @@ _EXPERT_COUNT_KEYS: tuple[str, ...] = (
 )
 
 
+def _expert_count_key_candidates(arch: str) -> list[str]:
+    """Return GGUF keys to inspect for the total expert count.
+
+    Architecture-prefixed variants are tried first (the convention used by
+    most upstream converters), then the bare key names for tools that omit
+    the prefix.
+    """
+    keys: list[str] = []
+    if arch:
+        keys.extend(f"{arch}.{key}" for key in _EXPERT_COUNT_KEYS)
+    keys.extend(_EXPERT_COUNT_KEYS)
+    return keys
+
+
 def is_moe(path: Path | str) -> bool:
     """Return True if the GGUF at *path* is a MoE architecture.
 
@@ -173,10 +190,7 @@ def expert_count(path: Path | str) -> int | None:
     meta = read_gguf_meta(path)
     arch = meta.get("architecture", "")
     # Try architecture-specific keys first, then generic ones.
-    keys: list[str] = []
-    if arch:
-        keys.extend(f"{arch}.{key}" for key in _EXPERT_COUNT_KEYS)
-    keys.extend(_EXPERT_COUNT_KEYS)
+    keys = _expert_count_key_candidates(arch)
     for key in keys:
         value = meta.get(key)
         if isinstance(value, int) and value > 0:

@@ -2194,6 +2194,7 @@ def arcllama_main(
             "Set ARC_LLAMA_EXPERIMENTAL_AGENT=1 to enable it.[/red]"
         )
         sys.exit(1)
+    cfg = load_config()
     try:
         run_agent_tui(
             base_url=base_url,
@@ -2201,6 +2202,7 @@ def arcllama_main(
             root=root,
             folder=folder,
             profile=profile,
+            config=cfg,
         )
     except SystemExit as e:
         console.print(f"[red]{e}[/red]")
