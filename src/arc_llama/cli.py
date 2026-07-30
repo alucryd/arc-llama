@@ -44,7 +44,6 @@ from arc_llama.agent import run_agent
 from arc_llama.agent.checkpoints import CheckpointStore
 from arc_llama.agent.interactive import InteractiveAgent
 from arc_llama.agent.mcp_client import MCPClientManager
-from arc_llama.agent_tui import run_agent_tui
 from arc_llama.arch import Arch, Backend, aot_arch_for
 from arc_llama.binary import detect_backends, detect_llama_server_backend
 from arc_llama.chat_store import ChatMessage, ChatStore
@@ -2153,6 +2152,11 @@ def agent_tui_cmd(
     """Launch the interactive arcllama agent TUI."""
     cfg = load_config(ctx.obj["config_path"])
     try:
+        # Imported here, not at module scope: agent_tui raises SystemExit at
+        # import time when textual is missing, and textual is an optional
+        # extra. An eager import takes down every other command with it.
+        from arc_llama.agent_tui import run_agent_tui
+
         run_agent_tui(
             base_url=base_url,
             model=model,
@@ -2196,6 +2200,8 @@ def arcllama_main(
         sys.exit(1)
     cfg = load_config()
     try:
+        from arc_llama.agent_tui import run_agent_tui
+
         run_agent_tui(
             base_url=base_url,
             model=model,
