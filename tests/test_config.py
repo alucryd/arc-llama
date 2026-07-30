@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,8 @@ from arc_llama.config import (
     MCPServerConfig,
     ModelConfig,
     ProfileConfig,
+    _resolve_admin_token,
+    default_config_path,
     load_config,
     migrate_config,
 )
@@ -191,3 +194,62 @@ def test_migrate_config_adds_profiles_and_agent_profile():
     raw = migrate_config({})
     assert raw["profiles"] == []
     assert "profile" in raw["agent"]
+
+
+def test_default_config_path_is_isolated(tmp_path):
+    """The autouse fixture redirects XDG dirs under tmp_path."""
+    assert default_config_path().is_relative_to(tmp_path)
+
+
+def test_resolve_admin_token_warning_omits_secret(caplog, tmp_path):
+    cfg = Config()
+    path = tmp_path / "config.toml"
+    with caplog.at_level(logging.WARNING, logger="arc_llama.config"):
+        _resolve_admin_token(cfg, path, persist=False)
+    assert cfg.server.admin_token is not None
+    assert len(cfg.server.admin_token) > 16
+    assert cfg.server.admin_token not in caplog.text
+    assert "generated" in caplog.text
+    assert str(path) in caplog.text
+
+
+def test_load_config_ignores_unknown_model_keys(tmp_path, caplog):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+version = 1
+[server]
+host = "127.0.0.1"
+port = 11437
+admin_token = "secret"
+[[models]]
+name = "qwen"
+path = "/models/qwen.gguf"
+port = 18080
+gpu_pci_slot = "0000:03:00.0"
+field_from_a_newer_arc_llama = "whatever"
+"""
+    )
+    with caplog.at_level(logging.WARNING, logger="arc_llama.config"):
+        cfg = load_config(path)
+    assert cfg.models[0].name == "qwen"
+    # Deliberately not a real field: this test must keep exercising the
+    # unknown-key path even as new fields are added to ModelConfig.
+    assert not hasattr(cfg.models[0], "field_from_a_newer_arc_llama")
+    assert "field_from_a_newer_arc_llama" in caplog.text
+
+
+def test_load_config_ignores_unknown_top_level_keys(tmp_path, caplog):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+version = 1
+unknown_section = { foo = 1 }
+[server]
+host = "127.0.0.1"
+"""
+    )
+    with caplog.at_level(logging.WARNING, logger="arc_llama.config"):
+        cfg = load_config(path)
+    assert cfg.server.host == "127.0.0.1"
+    assert "unknown_section" in caplog.text

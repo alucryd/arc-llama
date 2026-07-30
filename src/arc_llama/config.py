@@ -42,7 +42,7 @@ import logging
 import os
 import secrets
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -417,6 +417,24 @@ def _strip_none(obj: Any) -> Any:
     return obj
 
 
+def _filter_fields(cls: type, raw: dict[str, Any]) -> dict[str, Any]:
+    """Return only the keys recognised by ``cls``, warning about extras.
+
+    Keeps forward-compatible loading: a config written by a newer
+    arc-llama may contain fields this version does not know about.
+    """
+    known = {f.name for f in fields(cls)}
+    filtered: dict[str, Any] = {}
+    for k, v in raw.items():
+        if k in known:
+            filtered[k] = v
+        else:
+            logging.getLogger("arc_llama.config").warning(
+                "Ignoring unknown config key %r in %s", k, cls.__name__
+            )
+    return filtered
+
+
 def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
     """Bump an on-disk config dict to the current schema version.
 
@@ -530,10 +548,10 @@ def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
         cfg.save(path)
     logging.getLogger("arc_llama.config").warning(
         "No admin_token was configured -- generated one and saved it to %s. "
-        "Admin endpoints and auto_confirm agent runs now require "
-        "'Authorization: Bearer %s'.",
+        "Admin endpoints and auto_confirm agent runs now require an "
+        "'Authorization: Bearer <token>' header. Set ARC_LLAMA_ADMIN_TOKEN "
+        "to use your own token without persisting it to disk.",
         path,
-        cfg.server.admin_token,
     )
 
 
@@ -547,18 +565,19 @@ def load_config(path: Path | None = None) -> Config:
         raw = _toml_load(f)
     raw = migrate_config(raw)
     validate_config(raw)
+    top = _filter_fields(Config, raw)
     cfg = Config(
-        version=int(raw.get("version", CONFIG_VERSION)),
-        server=ServerConfig(**raw.get("server", {})),
-        paths=PathsConfig(**raw.get("paths", {})),
-        tune=TuneConfig(**raw.get("tune", {})),
-        workload=WorkloadConfig(**raw.get("workload", {})),
-        agent=AgentConfig(**raw.get("agent", {})),
-        gpus=[GPUConfig(**g) for g in raw.get("gpus", [])],
-        models=[ModelConfig(**m) for m in raw.get("models", [])],
-        upstreams=[UpstreamConfig(**u) for u in raw.get("upstreams", [])],
-        mcp_servers=[MCPServerConfig(**s) for s in raw.get("mcp_servers", [])],
-        profiles=[ProfileConfig(**p) for p in raw.get("profiles", [])],
+        version=int(top.get("version", CONFIG_VERSION)),
+        server=ServerConfig(**_filter_fields(ServerConfig, top.get("server", {}))),
+        paths=PathsConfig(**_filter_fields(PathsConfig, top.get("paths", {}))),
+        tune=TuneConfig(**_filter_fields(TuneConfig, top.get("tune", {}))),
+        workload=WorkloadConfig(**_filter_fields(WorkloadConfig, top.get("workload", {}))),
+        agent=AgentConfig(**_filter_fields(AgentConfig, top.get("agent", {}))),
+        gpus=[GPUConfig(**_filter_fields(GPUConfig, g)) for g in top.get("gpus", [])],
+        models=[ModelConfig(**_filter_fields(ModelConfig, m)) for m in top.get("models", [])],
+        upstreams=[UpstreamConfig(**_filter_fields(UpstreamConfig, u)) for u in top.get("upstreams", [])],
+        mcp_servers=[MCPServerConfig(**_filter_fields(MCPServerConfig, s)) for s in top.get("mcp_servers", [])],
+        profiles=[ProfileConfig(**_filter_fields(ProfileConfig, p)) for p in top.get("profiles", [])],
     )
     _resolve_admin_token(cfg, path, persist=True)
     return cfg

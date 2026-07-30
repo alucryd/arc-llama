@@ -689,8 +689,11 @@ def list_models(ctx: click.Context) -> None:
     loaded: set[str] = set()
     status_connected = False
     status_url = f"http://{cfg.server.host}:{cfg.server.port}/admin/status"
+    headers = {}
+    if cfg.server.admin_token:
+        headers["Authorization"] = f"Bearer {cfg.server.admin_token}"
     try:
-        r = httpx.get(status_url, timeout=2.0)
+        r = httpx.get(status_url, timeout=2.0, headers=headers)
         r.raise_for_status()
         loaded = {m["name"] for m in r.json().get("models", []) if m.get("loaded")}
         status_connected = True
@@ -1185,9 +1188,15 @@ def serve(
             "admin_token is set to something you control (it was auto-generated "
             "if you never set one).[/yellow]"
         )
+    token_source = (
+        "ARC_LLAMA_ADMIN_TOKEN environment variable"
+        if os.environ.get("ARC_LLAMA_ADMIN_TOKEN")
+        else f"config file ({ctx.obj['config_path']})"
+    )
     console.print(
-        f"[dim]Admin token: {cfg.server.admin_token} "
-        "(required for admin endpoints and auto_confirm agent runs)[/dim]"
+        f"[dim]Admin authentication is enabled via {token_source}. "
+        "Admin endpoints and auto_confirm agent runs require "
+        "'Authorization: Bearer <token>'.[/dim]"
     )
     _print_serve_banner(cfg)
     try:

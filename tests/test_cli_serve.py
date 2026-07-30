@@ -8,7 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from arc_llama.cli import cli
-from arc_llama.config import Config, GPUConfig, PathsConfig
+from arc_llama.config import Config, GPUConfig, ModelConfig, PathsConfig
 
 
 def _cfg(models_dir: Path) -> Config:
@@ -137,6 +137,33 @@ def test_serve_banner_printed_once(runner, tmp_path, monkeypatch):
     assert result.output.count("Auto-tune") == 1
 
 
+def test_serve_does_not_print_admin_token(runner, tmp_path, monkeypatch):
+    """The startup banner must not leak the admin bearer token."""
+    models_dir = tmp_path / "models"
+    cfg = _cfg(models_dir)
+    cfg.server.admin_token = "super-secret-token"
+    monkeypatch.setattr("arc_llama.cli.load_config", lambda path: cfg)
+
+    with (
+        patch("arc_llama.models.has_mtp_heads", return_value=False),
+        patch("arc_llama.models.is_moe", return_value=False),
+        patch("arc_llama.server.create_app", return_value=_fake_app()),
+        patch("uvicorn.run"),
+        patch("signal.signal"),
+        patch("atexit.register"),
+    ):
+        result = runner.invoke(
+            cli, ["--config", str(tmp_path / "config.toml"), "serve"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "super-secret-token" not in result.output
+    # Rich hard-wraps the banner to the terminal width, so compare against the
+    # output with runs of whitespace collapsed rather than the raw string.
+    unwrapped = " ".join(result.output.split())
+    assert "Authorization: Bearer <token>" in unwrapped
+
+
 async def test_serve_load_error_counted_once(tmp_path, monkeypatch):
     """Round 7 leftover: a failed health check increments load_errors exactly once."""
     from conftest import make_config
@@ -180,3 +207,40 @@ class NeverReadyServer:
     def stop(self):
         self.running = False
         self.ready = False
+
+
+def test_list_models_sends_admin_bearer(runner, tmp_path, monkeypatch):
+    """list hits /admin/status with the configured bearer token."""
+    models_dir = tmp_path / "models"
+    cfg = _cfg(models_dir)
+    cfg.server.admin_token = "secret-token"
+    cfg.models = [
+        ModelConfig(
+            name="qwen",
+            path=str(models_dir / "qwen.gguf"),
+            port=18080,
+            gpu_pci_slot="0000:03:00.0",
+        ),
+    ]
+    cfg_path = tmp_path / "config.toml"
+    cfg.save(cfg_path)
+    monkeypatch.setattr("arc_llama.cli.load_config", lambda path: cfg)
+
+    calls = []
+
+    def fake_get(url, *, timeout, headers=None):
+        calls.append((url, headers))
+        class Resp:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {"models": [{"name": "qwen", "loaded": True}]}
+        return Resp()
+
+    monkeypatch.setattr("arc_llama.cli.httpx.get", fake_get)
+    result = runner.invoke(cli, ["--config", str(cfg_path), "list"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0][1] == {"Authorization": "Bearer secret-token"}
+    assert "loaded" in result.output
