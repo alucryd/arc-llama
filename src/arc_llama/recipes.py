@@ -188,12 +188,16 @@ def suggest_ctx(
     safety_margin_mb: int = 256,
     ctx_cap: int = DEFAULT_CTX_CAP,
     trained_ctx: int | None = None,
+    parallel: int = 1,
 ) -> int:
     """Pick the largest power-of-2-ish context that fits comfortably in VRAM.
 
     Rounds *down* to the nearest multiple of 4096 and clamps to `ctx_cap`.
     If `trained_ctx` is known, the result is also clamped to it (the model
     silently uses its trained length as a ceiling at runtime).
+
+    The KV cache scales linearly with the number of parallel sequences, so
+    `parallel` multiplies the per-token estimate.
     """
     free_for_kv = vram_mb - model_file_mb - compute_buffer_mb - safety_margin_mb
     if free_for_kv <= 0:
@@ -208,7 +212,9 @@ def suggest_ctx(
         KVCacheType.Q4_1: 0.3125,
         KVCacheType.Q4_0: 0.3125,
     }.get(kv_type, 1.0)
-    bytes_per_token = int(f16_per_token * scale)
+    if parallel < 1:
+        parallel = 1
+    bytes_per_token = int(f16_per_token * scale) * parallel
     if bytes_per_token <= 0:
         return 4096
     max_tokens = (free_for_kv * 1024 * 1024) // bytes_per_token
@@ -248,6 +254,7 @@ def default_recipe(
     prefer_q8_kv: bool = True,
     backend: Backend = Backend.SYCL,
     trained_ctx: int | None = None,
+    parallel: int = 1,
 ) -> LaunchRecipe:
     """A safe starting recipe for a freshly added model on a given arch/backend."""
     profile: ArchProfile = profile_for(arch)
@@ -279,11 +286,12 @@ def default_recipe(
         kv_class=kv_class,
         compute_buffer_mb=PERF_COMPUTE_BUFFER_MB if perf_batching else 768,
         trained_ctx=trained_ctx,
+        parallel=parallel,
     )
     return LaunchRecipe(
         n_gpu_layers=999,
         ctx=ctx,
-        parallel=1,
+        parallel=parallel,
         cache_type_k=kv_type,
         cache_type_v=kv_type,
         flash_attn=flash_attn,
@@ -307,6 +315,14 @@ def recipe_to_dict(recipe: LaunchRecipe) -> dict:
         "cache_type_k": recipe.cache_type_k.value,
         "cache_type_v": recipe.cache_type_v.value,
     }
+    if recipe.threads is not None:
+        d["threads"] = recipe.threads
+    if recipe.temp is not None:
+        d["temp"] = recipe.temp
+    if recipe.top_p is not None:
+        d["top_p"] = recipe.top_p
+    if recipe.top_k is not None:
+        d["top_k"] = recipe.top_k
     if recipe.flash_attn is not None:
         d["flash_attn"] = recipe.flash_attn
     if recipe.ubatch_size is not None:

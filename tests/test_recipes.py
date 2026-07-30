@@ -142,6 +142,55 @@ class TestSuggestCtx:
         )
         assert ctx == 4096
 
+    def test_parallel_scales_kv_estimate(self):
+        # Doubling parallel should halve the suggested context (modulo rounding).
+        # VRAM is kept small deliberately: on a 24 GB card both results clamp to
+        # ctx_cap and the scaling is invisible.
+        ctx1 = suggest_ctx(
+            vram_mb=8 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=1,
+        )
+        ctx2 = suggest_ctx(
+            vram_mb=8 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=2,
+        )
+        assert ctx1 < DEFAULT_CTX_CAP, "cap must not bind, or this proves nothing"
+        assert ctx2 <= ctx1 // 2 + 4096
+        assert ctx2 >= ctx1 // 2 - 4096
+
+    def test_parallel_does_not_raise_ctx_above_cap(self):
+        """A roomy card still clamps to ctx_cap regardless of parallel."""
+        assert suggest_ctx(
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=1,
+        ) == DEFAULT_CTX_CAP
+
+    def test_non_positive_parallel_treated_as_one(self):
+        base = suggest_ctx(
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=1,
+        )
+        assert suggest_ctx(
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=0,
+        ) == base
+        assert suggest_ctx(
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            kv_type=KVCacheType.Q8_0,
+            parallel=-3,
+        ) == base
+
 
 class TestDefaultRecipe:
     def test_battlemage_prefers_q8(self):
@@ -247,6 +296,36 @@ class TestDefaultRecipe:
             model_file_mb=4 * 1024,
         )
         assert r.ubatch_size is None
+
+    def test_default_recipe_passes_parallel_to_suggest_ctx(self, monkeypatch):
+        calls = []
+        def _recording_suggest_ctx(**kwargs):
+            calls.append(kwargs)
+            return 8192
+        monkeypatch.setattr("arc_llama.recipes.suggest_ctx", _recording_suggest_ctx)
+
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert calls[-1]["parallel"] == r.parallel == 1
+
+    def test_default_recipe_honours_parallel_parameter(self, monkeypatch):
+        calls = []
+        def _recording_suggest_ctx(**kwargs):
+            calls.append(kwargs)
+            return 8192
+        monkeypatch.setattr("arc_llama.recipes.suggest_ctx", _recording_suggest_ctx)
+
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+            parallel=4,
+        )
+        assert calls[-1]["parallel"] == 4
+        assert r.parallel == 4
 
     def test_vulkan_f16_when_profile_disallows_q8(self):
         from arc_llama.arch import ArchProfile, Backend
@@ -434,3 +513,31 @@ class TestRecipeToDict:
         assert "spec_type" not in d
         assert "no_mmap" not in d
         assert "mlock" not in d
+        assert "threads" not in d
+        assert "temp" not in d
+        assert "top_p" not in d
+        assert "top_k" not in d
+
+    def test_optional_sampling_fields_serialised_when_set(self):
+        from arc_llama.recipes import recipe_to_dict
+
+        d = recipe_to_dict(LaunchRecipe(threads=8, temp=0.7, top_p=0.9, top_k=40))
+        assert d["threads"] == 8
+        assert d["temp"] == 0.7
+        assert d["top_p"] == 0.9
+        assert d["top_k"] == 40
+
+    def test_sampling_fields_round_trip_through_model_config(self):
+        from arc_llama.config import ModelConfig
+        from arc_llama.recipes import recipe_to_dict
+
+        r = LaunchRecipe(threads=8, temp=0.7, top_p=0.9, top_k=40)
+        mc = ModelConfig(
+            name="m", path="/x.gguf", port=1, gpu_pci_slot="0000:03:00.0",
+            recipe=recipe_to_dict(r),
+        )
+        back = mc.launch_recipe()
+        assert back.threads == 8
+        assert back.temp == 0.7
+        assert back.top_p == 0.9
+        assert back.top_k == 40

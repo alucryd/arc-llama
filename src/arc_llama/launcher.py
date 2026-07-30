@@ -272,13 +272,14 @@ class LlamaServer:
         stdout = subprocess.DEVNULL
         stderr = subprocess.DEVNULL
         self._log_path = None
+        log_file: Any = None
         if log_dir is not None:
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / f"{self.name}.log"
             _rotate_log(log_path)
             self._log_path = log_path
-            self._log_file = open(log_path, "ab")
-            stdout = self._log_file
+            log_file = open(log_path, "ab")
+            stdout = log_file
             stderr = subprocess.STDOUT
         log.info("[%s] starting: %s", self.name, " ".join(self.plan.argv))
         popen_kwargs: dict[str, Any] = {}
@@ -291,42 +292,74 @@ class LlamaServer:
             )
         else:
             popen_kwargs["preexec_fn"] = _preexec_isolate_and_pdeathsig
-        self.process = subprocess.Popen(
-            self.plan.argv,
-            env=self.plan.env,
-            stdout=stdout,
-            stderr=stderr,
-            **popen_kwargs,
-        )
+        try:
+            self.process = subprocess.Popen(
+                self.plan.argv,
+                env=self.plan.env,
+                stdout=stdout,
+                stderr=stderr,
+                **popen_kwargs,
+            )
+        except Exception:
+            if log_file is not None:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            self._log_path = None
+            raise
+        self._log_file = log_file
         self.started_at = time.time()
 
     async def wait_ready(self, timeout: float = DEFAULT_HEALTH_TIMEOUT) -> bool:
         deadline = time.time() + timeout
         last_progress = time.time()
         progress_interval = 15.0  # log every 15 s so the terminal isn't silent
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            while time.time() < deadline:
-                if not self.is_running:
-                    log.warning("[%s] process exited before becoming healthy", self.name)
-                    return False
-                try:
-                    r = await client.get(self.plan.health_url)
-                    if r.status_code == 200 and r.json().get("status") == "ok":
-                        elapsed = time.time() - self.started_at if self.started_at else 0
-                        log.info("[%s] ready after %.1fs", self.name, elapsed)
-                        self.ready = True
-                        return True
-                except Exception:
-                    pass
-                now = time.time()
-                if now - last_progress >= progress_interval:
-                    remaining = max(0, deadline - now)
-                    log.info(
-                        "[%s] still loading... %.0fs elapsed, %.0fs budget remaining",
-                        self.name, timeout - remaining, remaining,
-                    )
-                    last_progress = now
-                await asyncio.sleep(HEALTH_POLL_INTERVAL)
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                while time.time() < deadline:
+                    if not self.is_running:
+                        log.warning("[%s] process exited before becoming healthy", self.name)
+                        return False
+                    try:
+                        r = await client.get(self.plan.health_url)
+                        if r.status_code == 200 and r.json().get("status") == "ok":
+                            elapsed = time.time() - self.started_at if self.started_at else 0
+                            log.info("[%s] ready after %.1fs", self.name, elapsed)
+                            self.ready = True
+                            return True
+                    except Exception:
+                        pass
+                    now = time.time()
+                    if now - last_progress >= progress_interval:
+                        remaining = max(0, deadline - now)
+                        log.info(
+                            "[%s] still loading... %.0fs elapsed, %.0fs budget remaining",
+                            self.name, timeout - remaining, remaining,
+                        )
+                        last_progress = now
+                    await asyncio.sleep(HEALTH_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            # If the waiter is cancelled (router timeout, client disconnect,
+            # shutdown) the llama-server child is still holding GPU VRAM.
+            # Stop it before re-raising so we don't leak a process that blocks
+            # every subsequent model load on a single-GPU box.
+            log.info("[%s] wait_ready cancelled; stopping subprocess", self.name)
+            try:
+                # Shielded: CancelledError is a BaseException, so an unshielded
+                # `await self.astop()` that is cancelled again (loop shutdown)
+                # would propagate straight past the `except Exception` below and
+                # leave the child alive — precisely the leak this handler exists
+                # to prevent.
+                await asyncio.shield(self.astop())
+            except asyncio.CancelledError:
+                # Cancelled while cleaning up. Fall back to the blocking stop:
+                # briefly stalling the loop during teardown is much cheaper than
+                # orphaning a process that holds the GPU.
+                self.stop()
+            except Exception:
+                log.exception("[%s] failed to stop subprocess during cancellation", self.name)
+            raise
         log.warning("[%s] health-check timed out after %.0fs", self.name, timeout)
         return False
 
@@ -398,3 +431,12 @@ class LlamaServer:
             except Exception:
                 pass
             self._log_file = None
+
+    async def astop(self, drain_seconds: float = 3.0) -> None:
+        """Async version of stop() for callers running on the event loop.
+
+        stop() performs blocking waits and subprocess calls; running it
+        directly from async code stalls the loop while a stuck child drains.
+        This wrapper offloads the blocking work to a thread.
+        """
+        await asyncio.to_thread(self.stop, drain_seconds)
