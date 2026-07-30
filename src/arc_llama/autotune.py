@@ -198,6 +198,16 @@ class Autotuner:
         return self.running_model is not None
 
     def start(self) -> None:
+        """Start the background loop.
+
+        Not lock-guarded, unlike stop(): start() and stop() must not be
+        interleaved. The server calls start() once from lifespan startup and
+        stop() once from lifespan shutdown, strictly in that order, and nothing
+        restarts a tuner in place. If a restart path is ever added, this needs
+        to become async and take self._lock, because a start() racing an
+        in-flight stop() would see the old task, no-op, and leave _stopping set
+        with no loop running.
+        """
         if not self.cfg.tune.auto:
             log.debug("autotune: disabled by config")
             return
@@ -265,6 +275,13 @@ class Autotuner:
             await asyncio.wait({waiter}, timeout=timeout)
         finally:
             waiter.cancel()
+            # Awaited, not just cancelled: a bare cancel() leaves the task
+            # pending until the loop next runs it, which on a closing loop
+            # means "Task was destroyed but it is pending!".
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                pass
 
     async def _loop(self) -> None:
         try:
@@ -418,6 +435,13 @@ class Autotuner:
                 # bounded wait rather than give up early.
                 if self._abort_event.is_set() and not self._stopping:
                     self._abort_event.clear()
+            if self._stopping:
+                # Don't start a recipe write we cannot finish. The enclosing
+                # task is already cancelled, so the POST below would be torn
+                # down at its first await anyway; returning here makes that
+                # explicit instead of leaving it to cancellation timing.
+                log.info("autotune: shutting down; skipping deferred restore")
+                return
             if self.router.inflight > 0:
                 log.warning(
                     "autotune: inflight still %d after timeout; applying restore anyway",

@@ -577,5 +577,8 @@ async def test_stop_terminates_the_loop_on_every_python(cfg: Config) -> None:
         assert task.done()
         assert tuner._task is None
     finally:
+        # Awaited so a failing assertion doesn't leave pending tasks behind for
+        # whichever unrelated test happens to run next.
         stopper.cancel()
         task.cancel()
+        await asyncio.gather(stopper, task, return_exceptions=True)
