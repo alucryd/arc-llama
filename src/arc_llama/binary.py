@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -117,4 +118,84 @@ def detect_llama_server_backend(binary_path: str | Path) -> Backend | None:
         return Backend.SYCL
     if Backend.VULKAN in backends:
         return Backend.VULKAN
+    return None
+
+
+_VULKAN_DEVICE_RE = re.compile(r"^\s*Vulkan(\d+):\s*(.+?)\s*$")
+# Trailing memory report, e.g. " (24480 MiB, 21994 MiB free)". Stripped so the
+# name keeps its own parentheses: device names legitimately contain them
+# ("Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"), so we cannot simply cut at
+# the first '(' — that yields the useless name "Intel".
+_VULKAN_MEM_SUFFIX_RE = re.compile(r"\s*\([^()]*MiB[^()]*\)\s*$")
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Alphanumeric tokens of a device name, lowercased.
+
+    Vendor decorations differ between how a GPU is detected and how Vulkan
+    reports it ("Arc Pro B60 Graphics" vs "Intel(R) Arc(tm) Pro B60 Graphics
+    (BMG G21)"), so neither string contains the other. Comparing token sets
+    sidesteps the decorations entirely.
+    """
+    return {t for t in re.split(r"[^0-9a-z]+", name.lower()) if t}
+
+
+def list_vulkan_devices(
+    binary_path: str | Path, *, timeout: float = 30.0
+) -> list[tuple[int, str]]:
+    """Return [(vulkan_index, device_name)] as reported by ``--list-devices``.
+
+    Returns an empty list if the binary cannot be run or prints nothing we
+    recognise; callers must treat that as "unknown", never as "no GPUs".
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [str(binary_path), "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    devices: list[tuple[int, str]] = []
+    for line in (proc.stdout + proc.stderr).splitlines():
+        m = _VULKAN_DEVICE_RE.match(line)
+        if m:
+            name = _VULKAN_MEM_SUFFIX_RE.sub("", m.group(2)).strip()
+            devices.append((int(m.group(1)), name))
+    return devices
+
+
+def resolve_vulkan_index(
+    devices: list[tuple[int, str]], *, gpu_name: str = ""
+) -> int | None:
+    """Pick the Vulkan index for an Intel GPU out of ``devices``.
+
+    Vulkan enumerates every vendor, so the Arc card is not necessarily index 0.
+    Matching is by name because ``--list-devices`` reports no PCI address.
+
+    Returns None when the choice is ambiguous (several Intel devices and no
+    usable *gpu_name* to disambiguate) or when nothing matches. A caller that
+    gets None must not guess: guessing is what sent models to the wrong GPU.
+    """
+    if not devices:
+        return None
+
+    intel = [(i, n) for i, n in devices if "intel" in n.lower()]
+    if not intel:
+        return None
+    if len(intel) == 1:
+        return intel[0][0]
+
+    # Several Intel devices: disambiguate on the detected name, e.g. two Arc
+    # cards where only one is a B60. Substring matching does not work here
+    # because of vendor decorations, so require every token of the detected
+    # name to appear in the Vulkan name.
+    if gpu_name:
+        wanted = _name_tokens(gpu_name)
+        if wanted:
+            exact = [i for i, n in intel if wanted <= _name_tokens(n)]
+            if len(exact) == 1:
+                return exact[0]
     return None

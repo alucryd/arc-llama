@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from arc_llama.arch import Backend
-from arc_llama.binary import detect_backends, detect_llama_server_backend
+from arc_llama.binary import (
+    detect_backends,
+    detect_llama_server_backend,
+    list_vulkan_devices,
+    resolve_vulkan_index,
+)
 
 
 def _make_fake_binary(tmp_path: Path, content: bytes) -> Path:
@@ -109,3 +115,76 @@ def test_vulkan_build_not_misdetected_as_sycl(tmp_path):
     )
     assert detect_backends(binary) == {Backend.VULKAN}
     assert detect_llama_server_backend(binary) == Backend.VULKAN
+
+
+class TestVulkanDeviceResolution:
+    """Vulkan enumerates every vendor, so index 0 is not necessarily the Arc.
+
+    Real output from a machine with an RTX 4060 Ti and an Arc Pro B60:
+
+        Vulkan0: NVIDIA GeForce RTX 4060 Ti (16380 MiB, 13404 MiB free)
+        Vulkan1: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21) (24480 MiB, ...)
+
+    arc-llama used to pass sycl_index (0) as the Vulkan index and ran the
+    model on the NVIDIA card.
+    """
+
+    MIXED = [
+        (0, "NVIDIA GeForce RTX 4060 Ti"),
+        (1, "Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"),
+    ]
+
+    def test_picks_intel_not_index_zero(self):
+        assert resolve_vulkan_index(self.MIXED) == 1
+
+    def test_single_intel_device(self):
+        assert resolve_vulkan_index([(0, "Intel(R) Arc(tm) A770 Graphics")]) == 0
+
+    def test_no_intel_device_returns_none(self):
+        assert resolve_vulkan_index([(0, "NVIDIA GeForce RTX 4060 Ti")]) is None
+
+    def test_empty_returns_none(self):
+        assert resolve_vulkan_index([]) is None
+
+    def test_two_intel_cards_disambiguated_by_name(self):
+        devices = [
+            (0, "Intel(R) Arc(tm) A770 Graphics"),
+            (1, "Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"),
+        ]
+        assert resolve_vulkan_index(devices, gpu_name="Arc Pro B60 Graphics") == 1
+
+    def test_two_intel_cards_without_a_name_is_ambiguous(self):
+        """Ambiguous must be None, not a guess: guessing is the original bug."""
+        devices = [
+            (0, "Intel(R) Arc(tm) A770 Graphics"),
+            (1, "Intel(R) Arc(tm) A770 Graphics"),
+        ]
+        assert resolve_vulkan_index(devices) is None
+
+    def test_parses_real_list_devices_output(self, monkeypatch, tmp_path):
+        """Verbatim output from the b10192 Vulkan build on the mixed-GPU box.
+
+        subprocess.run is stubbed rather than executing a shell script, so this
+        runs on Windows too. The parser is what is under test, not exec.
+        """
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: NVIDIA GeForce RTX 4060 Ti (16380 MiB, 13404 MiB free)\n"
+            "  Vulkan1: Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"
+            " (24480 MiB, 21994 MiB free)\n"
+        )
+
+        def fake_run(*args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        devices = list_vulkan_devices(tmp_path / "llama-server")
+        assert devices == [
+            (0, "NVIDIA GeForce RTX 4060 Ti"),
+            (1, "Intel(R) Arc(tm) Pro B60 Graphics (BMG G21)"),
+        ]
+        assert resolve_vulkan_index(devices) == 1
+
+    def test_unrunnable_binary_returns_empty(self, tmp_path):
+        assert list_vulkan_devices(tmp_path / "does-not-exist") == []

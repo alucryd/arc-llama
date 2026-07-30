@@ -55,9 +55,26 @@ class TestBuildEnv:
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         from arc_llama.arch import profile_for
         profile = profile_for(Arch.BATTLEMAGE)
-        env = build_env(profile, _gpu(sycl_index=2, backend=Backend.VULKAN))
-        assert env["GGML_VK_VISIBLE_DEVICES"] == "2"
+        gpu = _gpu(sycl_index=2, backend=Backend.VULKAN)
+        gpu.vulkan_index = 3
+        env = build_env(profile, gpu)
+        assert env["GGML_VK_VISIBLE_DEVICES"] == "3"
         assert "ONEAPI_DEVICE_SELECTOR" not in env
+
+    def test_vulkan_never_falls_back_to_sycl_index(self, monkeypatch: pytest.MonkeyPatch):
+        """sycl_index is a Level-Zero index and must never be used as a Vulkan one.
+
+        SYCL enumerates Intel devices only; Vulkan enumerates every vendor. On a
+        machine with a discrete NVIDIA card the Arc is Vulkan1 while sycl_index
+        is still 0, so passing sycl_index ran models on the NVIDIA GPU. With no
+        way to resolve the real index we must leave the variable unset rather
+        than guess.
+        """
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+        env = build_env(profile, _gpu(sycl_index=2, backend=Backend.VULKAN))
+        assert "GGML_VK_VISIBLE_DEVICES" not in env
 
     def test_vulkan_strips_sycl_env(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(os, "environ", {
@@ -148,7 +165,10 @@ class TestBuildPlan:
         )
         plan = build_plan(cfg, model, gpu)
         assert "--flash-attn" in plan.argv
-        assert plan.env.get("GGML_VK_VISIBLE_DEVICES") == "0"
+        # /bin/llama-server is not a real llama-server, so the Vulkan index
+        # cannot be resolved and the variable is deliberately left unset
+        # rather than guessed from sycl_index.
+        assert "GGML_VK_VISIBLE_DEVICES" not in plan.env
 
     def test_vulkan_q8_with_flash_attn_already_set(self):
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())

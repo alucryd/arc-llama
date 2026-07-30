@@ -19,12 +19,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
+from arc_llama.binary import list_vulkan_devices, resolve_vulkan_index
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.gguf_meta import has_mtp_heads
 from arc_llama.policy import apply_launch_policy
@@ -144,7 +146,51 @@ _SYCL_ONLY_ENVS: frozenset[str] = frozenset({
 })
 
 
-def build_env(profile: ArchProfile, gpu: GPUConfig) -> dict[str, str]:
+@lru_cache(maxsize=8)
+def _vulkan_devices_cached(binary_path: str) -> tuple[tuple[int, str], ...]:
+    return tuple(list_vulkan_devices(binary_path))
+
+
+def _vulkan_index_for(gpu: GPUConfig, llama_server: str | Path | None) -> int | None:
+    """Resolve the Vulkan device index for *gpu*, or None to leave it unset.
+
+    Returning None means "don't set GGML_VK_VISIBLE_DEVICES at all", which lets
+    llama.cpp apply its own default. That is deliberately preferred over
+    guessing: a wrong index runs the model on another vendor's GPU and looks
+    like success.
+    """
+    if gpu.vulkan_index is not None:
+        return gpu.vulkan_index
+
+    if llama_server:
+        devices = list(_vulkan_devices_cached(str(llama_server)))
+        index = resolve_vulkan_index(devices, gpu_name=gpu.name)
+        if index is not None:
+            return index
+        if len(devices) > 1:
+            log.warning(
+                "Vulkan: could not identify which of %d devices is %s (%s). "
+                "Not setting GGML_VK_VISIBLE_DEVICES; llama.cpp will pick its "
+                "own default, which may be a different vendor's GPU. Set "
+                "vulkan_index for this GPU in the config to be certain. "
+                "Devices: %s",
+                len(devices),
+                gpu.name or "the configured GPU",
+                gpu.pci_slot,
+                ", ".join(f"{i}={n}" for i, n in devices),
+            )
+            return None
+        if len(devices) == 1:
+            return devices[0][0]
+
+    # No binary to ask, so no way to map. Only safe when there is nothing to
+    # confuse: a single-vendor box makes index 0 the right answer anyway.
+    return None
+
+
+def build_env(
+    profile: ArchProfile, gpu: GPUConfig, llama_server: str | Path | None = None
+) -> dict[str, str]:
     """Compose the environment for llama-server based on backend and arch."""
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     env = os.environ.copy()
@@ -156,7 +202,15 @@ def build_env(profile: ArchProfile, gpu: GPUConfig) -> dict[str, str]:
         # Restrict visible Vulkan devices to the one this model is bound to.
         # GGML_VK_VISIBLE_DEVICES accepts a comma-separated list; we expose
         # exactly one device so the model cannot accidentally land elsewhere.
-        env["GGML_VK_VISIBLE_DEVICES"] = str(gpu.sycl_index)
+        #
+        # This must NOT be sycl_index. SYCL enumerates Intel devices only, so
+        # sycl_index 0 is the first Arc card; Vulkan enumerates every vendor,
+        # so on a box with a discrete NVIDIA/AMD card the Arc can be Vulkan1
+        # while sycl_index is still 0. Using sycl_index there silently ran
+        # models on the other vendor's GPU.
+        index = _vulkan_index_for(gpu, llama_server)
+        if index is not None:
+            env["GGML_VK_VISIBLE_DEVICES"] = str(index)
         return env
 
     # SYCL path: apply arch-specific env, stripping known-bad inherited vars.
@@ -173,7 +227,7 @@ def build_plan(
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     profile = profile_for(arch)
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
-    env = build_env(profile, gpu)
+    env = build_env(profile, gpu, cfg.paths.llama_server)
     recipe = model.launch_recipe()
 
     # --- MTP head detection & safety wiring ---

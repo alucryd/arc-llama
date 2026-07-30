@@ -228,6 +228,14 @@ class GPUConfig:
     enabled: bool = True
     name: str = ""
     backend: str = Backend.SYCL.value  # Backend.value
+    vulkan_index: int | None = None
+    """Vulkan device index, which is NOT the same number as sycl_index.
+
+    SYCL/Level-Zero enumerates Intel devices only, so sycl_index 0 is the first
+    Arc card. Vulkan enumerates every vendor, so on a machine with a discrete
+    NVIDIA or AMD card the Arc may be Vulkan1 while sycl_index is still 0.
+    Resolved from `llama-server --list-devices`; set it by hand to override.
+    """
 
 
 @dataclass
