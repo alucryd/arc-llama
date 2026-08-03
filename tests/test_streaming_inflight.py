@@ -219,6 +219,27 @@ def test_many_failed_streams_do_not_accumulate(app):
         assert rt.inflight == 0
 
 
+def test_counter_is_released_even_if_cancelled_during_cleanup(app):
+    """Cleanup runs at the point a request is most likely to be torn down, so
+    the decrement must not sit behind an await that cancellation can interrupt.
+    CancelledError is a BaseException and deliberately not swallowed; the point
+    is that the counter is already settled before it can be raised."""
+
+    class _CancelOnClose(_Stream):
+        async def aclose(self):
+            raise __import__("asyncio").CancelledError()
+
+    _Client.stream_factory = staticmethod(_CancelOnClose)
+    with TestClient(app) as c:
+        rt = app.state.router
+        try:
+            with _post(c) as r:
+                b"".join(r.iter_bytes())
+        except BaseException:
+            pass
+        assert rt.inflight == 0, "cancellation during cleanup skipped the decrement"
+
+
 def test_autotune_still_runs_after_a_failed_stream(app, monkeypatch):
     """End to end on the consequence rather than the counter: a mid-stream
     failure must not gate the tuner off."""

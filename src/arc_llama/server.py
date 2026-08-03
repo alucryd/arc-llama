@@ -1119,6 +1119,23 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
                 if released:
                     return
                 released = True
+
+                # Drop the counter before awaiting anything. There is no await
+                # between the guard above and this decrement, so once we are
+                # here nothing can stop it -- not a client disconnect, not a
+                # cancellation delivered during shutdown. Closing the socket
+                # below is best effort; a leaked connection is recovered when
+                # the process exits, whereas a leaked count is permanent and
+                # silently disables auto-tune for the life of the process.
+                if rt.inflight > 0:
+                    rt.inflight -= 1
+                else:
+                    # Unreachable unless a future change double-releases. Say so
+                    # rather than letting the counter go negative, which would
+                    # wedge _deferred_restore's "wait for zero" loop.
+                    log.warning("streaming proxy: inflight already 0 at release; not decrementing")
+                rt.last_activity = time.time()
+
                 try:
                     await upstream.aclose()
                 except Exception:
@@ -1127,14 +1144,6 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
                     await client.aclose()
                 except Exception:
                     log.debug("streaming proxy: client close failed", exc_info=True)
-                await _complete()
-                if rt.inflight > 0:
-                    rt.inflight -= 1
-                else:
-                    # Unreachable unless a future change double-releases. Say so
-                    # rather than letting the counter go negative, which would
-                    # wedge _deferred_restore's "wait for zero" loop.
-                    log.warning("streaming proxy: inflight already 0 at release; not decrementing")
 
             async def body_iter():
                 # The decrement belongs here rather than only in the
