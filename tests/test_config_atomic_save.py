@@ -170,3 +170,46 @@ def test_failed_persist_rolls_back_the_edit_and_reports_failure(monkeypatch, tmp
 
     assert resp.status_code == 500, f"caller was told the edit succeeded: {resp.status_code}"
     assert model.recipe == {"ctx": 4096}, f"in-memory recipe was not rolled back: {model.recipe}"
+
+
+def test_config_directory_is_private(tmp_path):
+    """The directory holds the admin token as well; keep it 0700 so the token
+    is protected even if the file's own mode is lost."""
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits do not apply on Windows")
+    d = tmp_path / "cfgdir"
+    d.mkdir(mode=0o755)
+    Config().save(d / "config.toml")
+    assert d.stat().st_mode & 0o777 == 0o700
+
+
+def test_concurrent_saves_do_not_share_a_temp_name(tmp_path):
+    """Two writers must not pick the same scratch file and corrupt each other.
+    Threads rather than processes, since that is what a single pid cannot
+    disambiguate."""
+    import threading
+
+    path = tmp_path / "config.toml"
+    Config().save(path)
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(6)
+
+    def writer(port: int):
+        try:
+            barrier.wait()
+            c = Config()
+            c.server.port = port
+            c.save(path)
+        except BaseException as e:  # noqa: BLE001 - recorded, asserted below
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(11000 + i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert not errors, f"concurrent saves raised: {errors}"
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".config.toml")]
+    # Whoever renamed last wins, but the file must be whole and loadable.
+    assert load_config(path).server.port in range(11000, 11006)

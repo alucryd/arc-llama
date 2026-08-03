@@ -426,8 +426,21 @@ class Config:
         path = path or default_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        # The directory holds the admin token too, so keep it private. Belt and
+        # braces with the 0600 below: it survives the file's mode being lost.
+        if os.name != "nt":
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                logging.getLogger("arc_llama.config").debug(
+                    "could not chmod config directory", exc_info=True
+                )
+
         # Same directory, so the rename stays on one filesystem and is atomic.
-        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        # The random suffix keeps two writers from picking the same scratch
+        # name; pid alone is not enough, since a single process can save from
+        # more than one thread.
+        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
         try:
             with open(tmp, "wb") as f:
                 tomli_w.dump(self.to_toml_dict(), f)
