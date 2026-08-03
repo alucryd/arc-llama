@@ -12,6 +12,7 @@ do not duplicate the staged sweep logic. A fingerprint helper here ties the
 validity of a saved recipe to the exact binary, GPU, and arc-llama version
 that measured it.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -38,7 +39,6 @@ log = logging.getLogger("arc_llama.autotune")
 TUNE_SCHEMA_VERSION = 3
 
 LOOP_INTERVAL_SECONDS = 15
-
 
 
 def _file_fingerprint(path: str) -> str:
@@ -134,7 +134,10 @@ def reset_tuned_state_if_stale(
 
     gpu = cfg.find_gpu(model.gpu_pci_slot)
     fp = compute_fingerprint(
-        model, cfg.paths.llama_server, gpu, arc_llama_version,
+        model,
+        cfg.paths.llama_server,
+        gpu,
+        arc_llama_version,
         workload.fingerprint_key(cfg.workload),
     )
     if model.tune_state == "tuned" and not fingerprint_matches(model, fp):
@@ -368,7 +371,10 @@ class Autotuner:
 
         gpu = self.cfg.find_gpu(model.gpu_pci_slot)
         fp = compute_fingerprint(
-            model, self.cfg.paths.llama_server, gpu, self.version,
+            model,
+            self.cfg.paths.llama_server,
+            gpu,
+            self.version,
             workload.fingerprint_key(self.cfg.workload),
         )
         return not fingerprint_matches(model, fp)
@@ -426,15 +432,16 @@ class Autotuner:
             a recipe (i.e., when no user request is holding the backend).
             """
             deadline = _now() + 30.0
-            # `not self._stopping` keeps this from spinning during shutdown:
-            # once stop() has set the abort event for good, _wait_for_abort
-            # returns instantly every time round.
+            # Plain sleep, deliberately not _wait_for_abort. The old wait
+            # cleared _abort_event each lap to stop the set event turning the
+            # 0.2s waits into a spin — but that consumed abort signals that
+            # belong to the outer loop and abort_sweep() callers, so an abort
+            # posted during this drain silently vanished. The event is not
+            # this coroutine's to clear. Responsiveness is unharmed: stop()
+            # cancels the enclosing task, which interrupts the sleep, and
+            # _stopping is checked every lap.
             while self.router.inflight > 0 and _now() < deadline and not self._stopping:
-                await self._wait_for_abort(0.2)
-                # A fresh abort signal during the wait should restart the
-                # bounded wait rather than give up early.
-                if self._abort_event.is_set() and not self._stopping:
-                    self._abort_event.clear()
+                await asyncio.sleep(0.2)
             if self._stopping:
                 # Don't start a recipe write we cannot finish. The enclosing
                 # task is already cancelled, so the POST below would be torn
@@ -488,7 +495,10 @@ class Autotuner:
             else:
                 gpu = self.cfg.find_gpu(model.gpu_pci_slot)
                 fp = compute_fingerprint(
-                    model, self.cfg.paths.llama_server, gpu, self.version,
+                    model,
+                    self.cfg.paths.llama_server,
+                    gpu,
+                    self.version,
                     workload.fingerprint_key(self.cfg.workload),
                 )
                 set_tuned_state(self.cfg, model, fp)

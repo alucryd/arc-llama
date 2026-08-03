@@ -4,6 +4,7 @@ All tests use fakes. No llama-server process, no GPU probing, no systemd, no
 tuning search implementation — autotune.py owns *when* to run, tune.py owns
 *what* to search. The tests make sure the two are wired correctly.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -134,7 +135,9 @@ def test_tune_state_round_trip_through_config(cfg: Config, tmp_path: Path) -> No
     gpu = cfg.find_gpu("0000:03:00.0")
     assert gpu is not None
     path = tmp_path / "config.toml"
-    set_tuned_state(cfg, cfg.models[0], compute_fingerprint(cfg.models[0], cfg.paths.llama_server, gpu, "0.6.0"))
+    set_tuned_state(
+        cfg, cfg.models[0], compute_fingerprint(cfg.models[0], cfg.paths.llama_server, gpu, "0.6.0")
+    )
 
     cfg.save(path)
     loaded = load_config(path)
@@ -190,7 +193,9 @@ class EditRecorder:
         )
 
 
-async def test_preemption_restores_baseline_via_final_edit(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_preemption_restores_baseline_via_final_edit(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A sweep aborted mid-stage must leave the recipe at the baseline state."""
     recorder = EditRecorder(cfg)
     monkeypatch.setattr("arc_llama.tune._apply_edits", recorder.apply)
@@ -224,7 +229,9 @@ async def test_preemption_restores_baseline_via_final_edit(cfg: Config, monkeypa
     }
 
 
-async def test_cancelled_error_in_measure_triggers_restore(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cancelled_error_in_measure_triggers_restore(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
     recorder = EditRecorder(cfg)
     monkeypatch.setattr("arc_llama.tune._apply_edits", recorder.apply)
 
@@ -292,10 +299,14 @@ async def test_candidate_skips_models_under_min_uses(cfg: Config) -> None:
     assert tuner._pick_candidate() is None
 
 
-async def test_candidate_skips_models_with_matching_fingerprint(cfg: Config, tmp_path: Path) -> None:
+async def test_candidate_skips_models_with_matching_fingerprint(
+    cfg: Config, tmp_path: Path
+) -> None:
     gpu = cfg.find_gpu("0000:03:00.0")
     assert gpu is not None
-    cfg.models[0].tune_fingerprint = compute_fingerprint(cfg.models[0], cfg.paths.llama_server, gpu, "0.6.0")
+    cfg.models[0].tune_fingerprint = compute_fingerprint(
+        cfg.models[0], cfg.paths.llama_server, gpu, "0.6.0"
+    )
     cfg.models[0].tune_state = "tuned"
     router = FakeRouter(cfg)
     tuner = _make_tuner(cfg, router)
@@ -356,6 +367,7 @@ async def test_multi_resident_core_running_marks_skipped(cfg: Config) -> None:
     assert cfg.models[0].tune_state != "skipped"
     # Patch Autotuner._run_sweep so we never actually hit the network.
     import arc_llama.autotune as autotune_mod
+
     called_with: list = []
 
     async def fake_run_sweep(self, model):
@@ -372,7 +384,9 @@ async def test_multi_resident_core_running_marks_skipped(cfg: Config) -> None:
     assert not called_with
 
 
-async def test_successful_sweep_sets_tuned_and_fingerprint(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_successful_sweep_sets_tuned_and_fingerprint(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
     router = FakeRouter(cfg)
     router.last_activity = -1000.0
     cfg.tune.idle_seconds = 0
@@ -450,6 +464,7 @@ async def test_deferred_restore_waits_for_inflight_to_drop(cfg: Config) -> None:
 
     async def fake_tune_model(*args, **kwargs):
         on_deferred_restore = kwargs.get("on_deferred_restore")
+
         # Use the real deferred restore callback from Autotuner, but schedule
         # a concurrent task that drops inflight shortly after it starts waiting.
         # Wait until the restore is blocked, then return an aborted report.
@@ -487,7 +502,9 @@ async def test_deferred_restore_waits_for_inflight_to_drop(cfg: Config) -> None:
     assert bodies == [{"cache_type_k": "q8_0", "ubatch_size": 512}]
 
 
-async def test_run_sweep_stage_callback_advances_running_stage(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_sweep_stage_callback_advances_running_stage(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The autotuner's on_stage must be synchronous and advance running_stage.
 
     Regression test for the observed defect: an `async def` stage callback was
@@ -582,3 +599,51 @@ async def test_stop_terminates_the_loop_on_every_python(cfg: Config) -> None:
         stopper.cancel()
         task.cancel()
         await asyncio.gather(stopper, task, return_exceptions=True)
+
+
+async def test_deferred_restore_does_not_consume_abort_signal(cfg: Config) -> None:
+    """The drain loop used to clear the shared _abort_event each lap, eating
+    signals that belong to the outer loop and to abort_sweep() callers: an
+    abort posted while a restore was draining silently vanished."""
+    router = FakeRouter(cfg)
+    tuner = _make_tuner(cfg, router)
+
+    import arc_llama.tune as tune_mod
+
+    applied: list[dict[str, Any]] = []
+
+    async def fake_apply_edits(client, name, edits):
+        applied.append(dict(edits))
+        return None
+
+    tune_mod._apply_edits = fake_apply_edits
+
+    router.inflight = 1
+
+    async def drain_soon():
+        # Post an abort while the restore is mid-drain, then let it finish.
+        await asyncio.sleep(0.1)
+        tuner._abort_event.set()
+        await asyncio.sleep(0.1)
+        router.inflight = 0
+
+    # Reach the deferred-restore callback the way tune_model would.
+    restore = None
+
+    async def fake_tune_model(*args, **kwargs):
+        nonlocal restore
+        restore = kwargs.get("on_deferred_restore")
+        return TuneReport(model="m", target="balanced", aborted=True)
+
+    tune_mod.tune_model = fake_tune_model
+    await tuner._run_sweep(cfg.models[0])
+    assert restore is not None
+
+    drainer = asyncio.create_task(drain_soon())
+    await asyncio.wait_for(restore({"ubatch_size": 512}), timeout=5.0)
+    await drainer
+
+    assert tuner._abort_event.is_set(), (
+        "the deferred restore consumed an abort signal it does not own"
+    )
+    assert applied, "restore never applied after the drain"
