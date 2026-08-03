@@ -617,20 +617,34 @@ def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
     if cfg.server.admin_token:
         return
     cfg.server.admin_token = secrets.token_urlsafe(32)
-    if persist:
-        try:
-            cfg.save(path)
-        except OSError as exc:
-            logging.getLogger("arc_llama.config").warning(
-                "No admin_token was configured -- generated one but could not "
-                "save it to %s: %s. The token is in-memory only for this run; "
-                "admin endpoints and auto_confirm agent runs will use a new "
-                "token after restart. Set ARC_LLAMA_ADMIN_TOKEN to use your "
-                "own token without persisting it to disk.",
-                path,
-                exc,
-            )
-            return
+    if not persist:
+        # Callers pass persist=False when no config file exists yet. The old
+        # message claimed the token was "saved to <path>" on this branch too,
+        # sending users hunting for a file that was never written -- and hiding
+        # that the token rotates on every restart until one is configured.
+        logging.getLogger("arc_llama.config").warning(
+            "No admin_token was configured -- generated an in-memory one for "
+            "this run only (no config file exists at %s, so nothing was "
+            "saved). Admin endpoints and auto_confirm agent runs require an "
+            "'Authorization: Bearer <token>' header, and the token changes on "
+            "every restart until one is persisted. Set ARC_LLAMA_ADMIN_TOKEN "
+            "or create a config to pin it.",
+            path,
+        )
+        return
+    try:
+        cfg.save(path)
+    except OSError as exc:
+        logging.getLogger("arc_llama.config").warning(
+            "No admin_token was configured -- generated one but could not "
+            "save it to %s: %s. The token is in-memory only for this run; "
+            "admin endpoints and auto_confirm agent runs will use a new "
+            "token after restart. Set ARC_LLAMA_ADMIN_TOKEN to use your "
+            "own token without persisting it to disk.",
+            path,
+            exc,
+        )
+        return
     logging.getLogger("arc_llama.config").warning(
         "No admin_token was configured -- generated one and saved it to %s. "
         "Admin endpoints and auto_confirm agent runs now require an "

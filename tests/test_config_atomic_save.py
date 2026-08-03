@@ -213,3 +213,20 @@ def test_concurrent_saves_do_not_share_a_temp_name(tmp_path):
     assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".config.toml")]
     # Whoever renamed last wins, but the file must be whole and loadable.
     assert load_config(path).server.port in range(11000, 11006)
+
+
+def test_missing_config_does_not_claim_token_was_saved(tmp_path, caplog):
+    """load_config on a missing file generates an in-memory token with
+    persist=False, but the old message still said "saved it to <path>" —
+    sending users hunting for a file that was never written."""
+    import logging
+
+    missing = tmp_path / "nope" / "config.toml"
+    with caplog.at_level(logging.WARNING, logger="arc_llama.config"):
+        cfg = load_config(missing)
+
+    assert cfg.server.admin_token, "no token generated at all"
+    assert not missing.exists(), "persist=False path unexpectedly wrote a file"
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "saved it to" not in text, f"message claims a save that never happened: {text}"
+    assert "in-memory" in text
