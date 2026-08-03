@@ -1088,29 +1088,77 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
 
         if want_stream:
             client = httpx.AsyncClient(timeout=None)
-            req = client.build_request(
-                "POST", target_url, content=body_bytes, headers=fwd_headers,
-            )
-            upstream = await client.send(req, stream=True)
+            try:
+                req = client.build_request(
+                    "POST", target_url, content=body_bytes, headers=fwd_headers,
+                )
+                upstream = await client.send(req, stream=True)
+            except BaseException:
+                # Nothing was handed to Starlette, so streaming_response_started
+                # stays False and the outer finally does the decrement. Close the
+                # client here or it leaks: no response owns it yet.
+                await client.aclose()
+                raise
 
-            async def close_upstream() -> None:
-                # Runs as a BackgroundTask once the streamed body is fully
-                # sent — this is where the streaming request's in-flight
-                # window ends.
+            released = False
+
+            async def _release() -> None:
+                """End the in-flight window: close upstream, close the client,
+                drop the counter. Safe to call more than once.
+
+                Relying on the BackgroundTask alone was not enough. Starlette
+                only reaches ``await self.background()`` if streaming the body
+                returned normally, so anything that makes stream_response raise
+                (an upstream that dies mid-generation is the realistic one)
+                skips it entirely and the counter is never decremented. Because
+                autotune._tick() returns early whenever inflight > 0, a single
+                leak silently disables background tuning for the rest of the
+                process lifetime.
+                """
+                nonlocal released
+                if released:
+                    return
+                released = True
                 try:
                     await upstream.aclose()
+                except Exception:
+                    log.debug("streaming proxy: upstream close failed", exc_info=True)
+                try:
                     await client.aclose()
-                finally:
-                    await _complete()
+                except Exception:
+                    log.debug("streaming proxy: client close failed", exc_info=True)
+                await _complete()
+                if rt.inflight > 0:
                     rt.inflight -= 1
+                else:
+                    # Unreachable unless a future change double-releases. Say so
+                    # rather than letting the counter go negative, which would
+                    # wedge _deferred_restore's "wait for zero" loop.
+                    log.warning("streaming proxy: inflight already 0 at release; not decrementing")
+
+            async def body_iter():
+                # The decrement belongs here rather than only in the
+                # BackgroundTask: this finally runs when the body is fully
+                # consumed, when the upstream errors mid-stream, and when the
+                # generator is finalized after a client disconnect. It must not
+                # run any earlier, because dropping the count while generation
+                # is still live lets the autotuner restart the backend out from
+                # under the request.
+                try:
+                    async for chunk in upstream.aiter_raw():
+                        yield chunk
+                finally:
+                    await _release()
 
             streaming_response_started = True
             return StreamingResponse(
-                upstream.aiter_raw(),
+                body_iter(),
                 status_code=upstream.status_code,
                 headers=_strip_response_headers(dict(upstream.headers)),
                 media_type=upstream.headers.get("content-type", "text/event-stream"),
-                background=BackgroundTask(close_upstream),
+                # Kept as a second path so a disconnect that finalizes the
+                # generator late still settles promptly. _release is idempotent.
+                background=BackgroundTask(_release),
             )
         async with httpx.AsyncClient(timeout=600.0) as client:
             r = await client.post(target_url, content=body_bytes, headers=fwd_headers)
