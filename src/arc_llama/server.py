@@ -137,10 +137,16 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         """Liveness probe for the arc-llama router itself."""
         rt: Router = request.app.state.router
         uptime = time.time() - request.app.state.started_at
+        # "Loaded" means the health check passed, not merely that a process
+        # exists: during a cold start (tens of seconds) or a crash-respawn the
+        # subprocess is alive but the port is not serving, and reporting that
+        # as loaded misleads dashboards and scripts that gate on it.
         loaded = [
             m.name
             for m in rt.all_models()
-            if rt._servers.get(m.name) and rt._servers[m.name].is_running
+            if rt._servers.get(m.name)
+            and rt._servers[m.name].is_running
+            and rt._servers[m.name].ready
         ]
         return {
             "status": "ok",
@@ -179,10 +185,16 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         rt: Router = request.app.state.router
         c: Config = request.app.state.cfg
         uptime = time.time() - request.app.state.started_at
+        # "Loaded" means the health check passed, not merely that a process
+        # exists: during a cold start (tens of seconds) or a crash-respawn the
+        # subprocess is alive but the port is not serving, and reporting that
+        # as loaded misleads dashboards and scripts that gate on it.
         loaded = [
             m.name
             for m in rt.all_models()
-            if rt._servers.get(m.name) and rt._servers[m.name].is_running
+            if rt._servers.get(m.name)
+            and rt._servers[m.name].is_running
+            and rt._servers[m.name].ready
         ]
         return {
             "uptime_seconds": round(uptime, 2),
@@ -222,7 +234,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                         "display_name": m.display_name,
                         "path": m.path,
                         "gpu_pci_slot": m.gpu_pci_slot,
-                        "loaded": bool(srv and srv.is_running),
+                        "loaded": bool(srv and srv.is_running and srv.ready),
                         "aliases": list(m.aliases),
                     },
                 }
@@ -644,6 +656,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             srv = rt._servers.get(m.name)
             r = m.recipe or {}
             running = bool(srv and srv.is_running)
+            loaded = bool(running and srv.ready)
             models.append(
                 {
                     "name": m.name,
@@ -651,7 +664,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
                     "path": m.path,
                     "gpu_pci_slot": m.gpu_pci_slot,
                     "port": m.port,
-                    "loaded": running,
+                    "loaded": loaded,
                     "pid": getattr(getattr(srv, "process", None), "pid", None) if running else None,
                     "ctx": r.get("ctx"),
                     "cache_type_k": r.get("cache_type_k"),
@@ -707,7 +720,10 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}") from None
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
-        return {"name": model.name, "loaded": srv.is_running}
+        # ensure_active only returns once wait_ready has passed, so ready is
+        # the accurate claim here; is_running would also report a server that
+        # crashed between readiness and this line.
+        return {"name": model.name, "loaded": bool(srv.is_running and srv.ready)}
 
     @app.post("/admin/stop/{name}")
     async def admin_stop(

@@ -25,6 +25,7 @@ class FakeServerPlan:
 class FakeBackend:
     plan = FakeServerPlan()
     is_running = True
+    ready = True
 
 
 class FakeRouter:
@@ -1152,3 +1153,30 @@ def test_inflight_decremented_when_load_fails(monkeypatch):
     assert response.status_code == 503
     _wait_drained(app.state.router)
     assert app.state.router.inflight == 0
+
+
+class ColdStartBackend(FakeBackend):
+    """Process alive, health check not yet passed — a cold start in progress."""
+
+    ready = False
+
+
+def test_health_does_not_report_cold_start_as_loaded(monkeypatch):
+    """A subprocess that exists but has not passed its health check is not
+    'loaded': during a cold start or a crash-respawn the port is not serving,
+    and dashboards or scripts gating on this field would act on a lie."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    # Explicit token-less config: the autouse isolated-config fixture generates
+    # an admin token, which would 401 the /admin/status call below.
+    app = create_app(Config(server=ServerConfig(admin_token=None)))
+
+    with TestClient(app) as client:
+        app.state.router._servers["qwen"] = ColdStartBackend()
+        health = client.get("/health").json()
+        assert health["loaded_models"] == [], "cold-starting model reported as loaded"
+        status = client.get("/admin/status").json()
+        entry = next(m for m in status["models"] if m["name"] == "qwen")
+        assert entry["loaded"] is False
