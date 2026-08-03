@@ -23,8 +23,6 @@ from __future__ import annotations
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-
-from arc_llama.server import create_app
 from test_server import FakeRouter, FakeUpstreamManager
 
 
@@ -122,10 +120,12 @@ def test_inflight_returns_to_zero_when_upstream_dies_mid_stream(app):
     _Client.stream_factory = staticmethod(lambda: _Stream(fail_after=1))
     with TestClient(app) as c:
         rt = app.state.router
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.ReadError):
             with _post(c) as r:
                 b"".join(r.iter_bytes())
-        assert rt.inflight == 0, "in-flight counter leaked; auto-tune is now disabled for the process"
+        assert rt.inflight == 0, (
+            "in-flight counter leaked; auto-tune is now disabled for the process"
+        )
 
 
 def test_inflight_returns_to_zero_when_client_disconnects_early(app):
@@ -142,7 +142,7 @@ def test_upstream_and_client_are_closed_when_upstream_dies(app):
     strand the connection pool either."""
     _Client.stream_factory = staticmethod(lambda: _Stream(fail_after=1))
     with TestClient(app) as c:
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.ReadError):
             with _post(c) as r:
                 b"".join(r.iter_bytes())
     assert _Client.instances, "no client was constructed"
@@ -159,7 +159,7 @@ def test_client_is_closed_when_send_fails_before_any_response(app):
     _Client.send_raises = httpx.ConnectError("refused")
     with TestClient(app) as c:
         rt = app.state.router
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.ConnectError):
             with _post(c) as r:
                 b"".join(r.iter_bytes())
         assert rt.inflight == 0
@@ -213,7 +213,7 @@ def test_many_failed_streams_do_not_accumulate(app):
     with TestClient(app) as c:
         rt = app.state.router
         for _ in range(5):
-            with pytest.raises(Exception):
+            with pytest.raises(httpx.ReadError):
                 with _post(c) as r:
                     b"".join(r.iter_bytes())
         assert rt.inflight == 0
@@ -246,7 +246,7 @@ def test_autotune_still_runs_after_a_failed_stream(app, monkeypatch):
     _Client.stream_factory = staticmethod(lambda: _Stream(fail_after=1))
     with TestClient(app) as c:
         rt = app.state.router
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.ReadError):
             with _post(c) as r:
                 b"".join(r.iter_bytes())
         # This is the exact condition autotune._tick() gates every sweep on.

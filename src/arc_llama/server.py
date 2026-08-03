@@ -14,6 +14,7 @@ Also exposes a small admin surface used by the bundled web UI and the TUI:
 The web UI itself is a single static page mounted at `/` when the static dir
 ships with the install.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,9 +50,14 @@ log = logging.getLogger("arc_llama.server")
 
 def _strip_response_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
-        k: v for k, v in headers.items()
-        if k.lower() not in (
-            "transfer-encoding", "content-encoding", "content-length", "connection",
+        k: v
+        for k, v in headers.items()
+        if k.lower()
+        not in (
+            "transfer-encoding",
+            "content-encoding",
+            "content-length",
+            "connection",
         )
     }
 
@@ -131,7 +137,11 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         """Liveness probe for the arc-llama router itself."""
         rt: Router = request.app.state.router
         uptime = time.time() - request.app.state.started_at
-        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        loaded = [
+            m.name
+            for m in rt.all_models()
+            if rt._servers.get(m.name) and rt._servers[m.name].is_running
+        ]
         return {
             "status": "ok",
             "uptime_seconds": round(uptime, 2),
@@ -169,7 +179,11 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         rt: Router = request.app.state.router
         c: Config = request.app.state.cfg
         uptime = time.time() - request.app.state.started_at
-        loaded = [m.name for m in rt.all_models() if rt._servers.get(m.name) and rt._servers[m.name].is_running]
+        loaded = [
+            m.name
+            for m in rt.all_models()
+            if rt._servers.get(m.name) and rt._servers[m.name].is_running
+        ]
         return {
             "uptime_seconds": round(uptime, 2),
             "loads": rt.metrics["loads"],
@@ -198,44 +212,50 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         # Local models
         for m in rt.all_models():
             srv = rt._servers.get(m.name)
-            data.append({
-                "id": m.name,
-                "object": "model",
-                "owned_by": "arc-llama",
-                "created": 0,
-                "metadata": {
-                    "display_name": m.display_name,
-                    "path": m.path,
-                    "gpu_pci_slot": m.gpu_pci_slot,
-                    "loaded": bool(srv and srv.is_running),
-                    "aliases": list(m.aliases),
-                },
-            })
+            data.append(
+                {
+                    "id": m.name,
+                    "object": "model",
+                    "owned_by": "arc-llama",
+                    "created": 0,
+                    "metadata": {
+                        "display_name": m.display_name,
+                        "path": m.path,
+                        "gpu_pci_slot": m.gpu_pci_slot,
+                        "loaded": bool(srv and srv.is_running),
+                        "aliases": list(m.aliases),
+                    },
+                }
+            )
             for alias in m.aliases:
                 if alias != m.name:
-                    data.append({
-                        "id": alias,
-                        "object": "model",
-                        "owned_by": "arc-llama-alias",
-                        "created": 0,
-                        "metadata": {"canonical": m.name},
-                    })
+                    data.append(
+                        {
+                            "id": alias,
+                            "object": "model",
+                            "owned_by": "arc-llama-alias",
+                            "created": 0,
+                            "metadata": {"canonical": m.name},
+                        }
+                    )
         # Upstream models
         try:
             upstream_models = await mgr.models()
         except Exception:
             upstream_models = []
         for u in upstream_models:
-            data.append({
-                "id": u.id,
-                "object": "model",
-                "owned_by": f"upstream:{u.upstream_name}",
-                "created": 0,
-                "metadata": {
-                    "upstream": u.upstream_name,
-                    **u.metadata,
-                },
-            })
+            data.append(
+                {
+                    "id": u.id,
+                    "object": "model",
+                    "owned_by": f"upstream:{u.upstream_name}",
+                    "created": 0,
+                    "metadata": {
+                        "upstream": u.upstream_name,
+                        **u.metadata,
+                    },
+                }
+            )
         return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
@@ -402,7 +422,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
 
         entry = request.app.state.pending_confirmations.get(run_id)
         if not entry:
-            raise HTTPException(status_code=404, detail="Run not found or not awaiting confirmation")
+            raise HTTPException(
+                status_code=404, detail="Run not found or not awaiting confirmation"
+            )
 
         event, result = entry
         result["approved"] = bool(body.get("approved", False))
@@ -424,7 +446,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
 
         entry = request.app.state.pending_plan_approvals.get(run_id)
         if not entry:
-            raise HTTPException(status_code=404, detail="Run not found or not awaiting plan approval")
+            raise HTTPException(
+                status_code=404, detail="Run not found or not awaiting plan approval"
+            )
 
         event, result = entry
         result["approved"] = bool(body.get("approved", False))
@@ -612,9 +636,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
     # ------------------------------------------------------------------
 
     @app.get("/admin/status")
-    async def admin_status(
-        request: Request, _auth: None = Depends(_require_admin)
-    ) -> dict:
+    async def admin_status(request: Request, _auth: None = Depends(_require_admin)) -> dict:
         rt: Router = request.app.state.router
         c: Config = request.app.state.cfg
         models = []
@@ -622,35 +644,40 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             srv = rt._servers.get(m.name)
             r = m.recipe or {}
             running = bool(srv and srv.is_running)
-            models.append({
-                "name": m.name,
-                "display_name": m.display_name,
-                "path": m.path,
-                "gpu_pci_slot": m.gpu_pci_slot,
-                "port": m.port,
-                "loaded": running,
-                "pid": getattr(getattr(srv, "process", None), "pid", None) if running else None,
-                "ctx": r.get("ctx"),
-                "cache_type_k": r.get("cache_type_k"),
-                "cache_type_v": r.get("cache_type_v"),
-                "flash_attn": r.get("flash_attn"),
-                "ubatch_size": r.get("ubatch_size"),
-                "batch_size": r.get("batch_size"),
-                "kv_class": m.kv_class,
-                "aliases": list(m.aliases),
-                "tune_state": m.tune_state,
-                "tuned_at": m.tuned_at,
-                "tune_error": m.tune_error,
-                "tune_fingerprint": m.tune_fingerprint,
-            })
-        gpus = [{
-            "pci_slot": g.pci_slot,
-            "sycl_index": g.sycl_index,
-            "arch": g.arch,
-            "vram_mb": g.vram_mb,
-            "name": g.name,
-            "enabled": g.enabled,
-        } for g in c.gpus]
+            models.append(
+                {
+                    "name": m.name,
+                    "display_name": m.display_name,
+                    "path": m.path,
+                    "gpu_pci_slot": m.gpu_pci_slot,
+                    "port": m.port,
+                    "loaded": running,
+                    "pid": getattr(getattr(srv, "process", None), "pid", None) if running else None,
+                    "ctx": r.get("ctx"),
+                    "cache_type_k": r.get("cache_type_k"),
+                    "cache_type_v": r.get("cache_type_v"),
+                    "flash_attn": r.get("flash_attn"),
+                    "ubatch_size": r.get("ubatch_size"),
+                    "batch_size": r.get("batch_size"),
+                    "kv_class": m.kv_class,
+                    "aliases": list(m.aliases),
+                    "tune_state": m.tune_state,
+                    "tuned_at": m.tuned_at,
+                    "tune_error": m.tune_error,
+                    "tune_fingerprint": m.tune_fingerprint,
+                }
+            )
+        gpus = [
+            {
+                "pci_slot": g.pci_slot,
+                "sycl_index": g.sycl_index,
+                "arch": g.arch,
+                "vram_mb": g.vram_mb,
+                "name": g.name,
+                "enabled": g.enabled,
+            }
+            for g in c.gpus
+        ]
         mgr: UpstreamManager = request.app.state.upstream_mgr
         return {
             "server": {
@@ -671,7 +698,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
         if mgr.find_model(name) is not None:
-            raise HTTPException(status_code=400, detail=f"Upstream model cannot be loaded locally: {name!r}")
+            raise HTTPException(
+                status_code=400, detail=f"Upstream model cannot be loaded locally: {name!r}"
+            )
         try:
             model, srv = await rt.ensure_active(name)
         except KeyError:
@@ -687,16 +716,16 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
         if mgr.find_model(name) is not None:
-            raise HTTPException(status_code=400, detail=f"Upstream model cannot be stopped locally: {name!r}")
+            raise HTTPException(
+                status_code=400, detail=f"Upstream model cannot be stopped locally: {name!r}"
+            )
         if name not in {m.name for m in rt.all_models()}:
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
         was_running = await rt.stop_one(name)
         return {"name": name, "was_running": was_running, "loaded": False}
 
     @app.post("/admin/stop-all")
-    async def admin_stop_all(
-        request: Request, _auth: None = Depends(_require_admin)
-    ) -> dict:
+    async def admin_stop_all(request: Request, _auth: None = Depends(_require_admin)) -> dict:
         rt: Router = request.app.state.router
         stopped = await rt.stop_all()
         return {"stopped": stopped}
@@ -810,11 +839,14 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         from arc_llama.config import default_config_path
         from arc_llama.gguf_meta import validate_override_patterns, weight_tensor_table
         from arc_llama.recipes import FLASH_ATTN_VALUES, KVCacheType
+
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
         mgr: UpstreamManager = request.app.state.upstream_mgr
         if mgr.find_model(name) is not None:
-            raise HTTPException(status_code=400, detail=f"Upstream model cannot be edited locally: {name!r}")
+            raise HTTPException(
+                status_code=400, detail=f"Upstream model cannot be edited locally: {name!r}"
+            )
         try:
             body = await request.json()
         except Exception as e:
@@ -826,8 +858,15 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             raise HTTPException(status_code=404, detail=f"Unknown model: {name!r}")
         valid_kv = {kv.value for kv in KVCacheType}
         valid_classes = {
-            "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
-            "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
+            "default",
+            "moe_a3b",
+            "qwen3_dense",
+            "qwen3_27b_dense",
+            "qwen2_5",
+            "gemma_swa",
+            "phi4",
+            "llama3",
+            "deepseek_r1_distill",
         }
         recipe = dict(model.recipe or {})
         changed: list[str] = []
@@ -876,7 +915,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             try:
                 ub = int(body["ubatch_size"])
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="ubatch_size must be an integer") from None
+                raise HTTPException(
+                    status_code=400, detail="ubatch_size must be an integer"
+                ) from None
             if not (1 <= ub <= 4096):
                 raise HTTPException(status_code=400, detail="ubatch_size must be 1..4096")
             recipe["ubatch_size"] = ub
@@ -885,7 +926,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             try:
                 b = int(body["batch_size"])
             except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="batch_size must be an integer") from None
+                raise HTTPException(
+                    status_code=400, detail="batch_size must be an integer"
+                ) from None
             if not (1 <= b <= 8192):
                 raise HTTPException(status_code=400, detail="batch_size must be 1..8192")
             recipe["batch_size"] = b
@@ -942,11 +985,24 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             changed.append("override_tensor")
         if not changed:
             raise HTTPException(status_code=400, detail="no recognised fields to edit")
+        previous_recipe = model.recipe
         model.recipe = recipe
         try:
             c.save(config_path or default_config_path())
         except OSError as e:
+            # Previously this was logged and the edit continued, so the caller
+            # got a 200 listing the fields it "changed" while the config on
+            # disk still held the old recipe. The running server was then
+            # rebuilt to match the unsaved version, so memory and disk
+            # disagreed until the next restart quietly reverted the edit. Undo
+            # and fail loudly instead: a rejected edit is recoverable, an edit
+            # that silently un-applies later is not.
+            model.recipe = previous_recipe
             log.warning("edit %s: persist failed: %s", name, e)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not persist config; edit rolled back: {e}",
+            ) from e
         rebuilt, was_running = await rt.rebuild_model(name)
         return {
             "name": name,
@@ -958,9 +1014,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         }
 
     @app.post("/admin/scan")
-    async def admin_scan(
-        request: Request, _auth: None = Depends(_require_admin)
-    ) -> dict:
+    async def admin_scan(request: Request, _auth: None = Depends(_require_admin)) -> dict:
         """Re-walk scan paths for new GGUFs and auto-register them.
 
         Mutates the in-memory Config and persists it to disk so subsequent
@@ -969,6 +1023,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
         """
         from arc_llama.config import default_config_path
         from arc_llama.models import discover_ggufs, register_discovered
+
         c: Config = request.app.state.cfg
         rt: Router = request.app.state.router
         try:
@@ -1033,8 +1088,10 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             raise HTTPException(status_code=502, detail=f"Upstream error: {e}") from e
         want_stream = streaming_ok and bool(body.get("stream"))
         if want_stream:
+
             async def close_upstream() -> None:
                 await upstream_resp.aclose()
+
             return StreamingResponse(
                 upstream_resp.aiter_raw(),
                 status_code=upstream_resp.status_code,
@@ -1090,7 +1147,10 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             client = httpx.AsyncClient(timeout=None)
             try:
                 req = client.build_request(
-                    "POST", target_url, content=body_bytes, headers=fwd_headers,
+                    "POST",
+                    target_url,
+                    content=body_bytes,
+                    headers=fwd_headers,
                 )
                 upstream = await client.send(req, stream=True)
             except BaseException:
@@ -1184,4 +1244,3 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
         # close_upstream above, which runs after the body is consumed.
         if not streaming_response_started:
             rt.inflight -= 1
-
