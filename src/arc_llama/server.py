@@ -1117,6 +1117,11 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     # under the user.
     rt.inflight += 1
     streaming_response_started = False
+    # Set once the request has resolved to a local model, so the router can
+    # answer "is this specific model still serving?" — which _evict_for needs
+    # to drain an incumbent instead of killing its generation mid-stream. The
+    # global counter cannot answer that: the evicting request holds it too.
+    acquired_model: str | None = None
     try:
         try:
             model, srv = await rt.ensure_active(model_query)
@@ -1124,6 +1129,8 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_query!r}") from None
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
+        rt.acquire_model(model.name)
+        acquired_model = model.name
         # Tell the background tuner this model was actually used by a real request.
         # Upstream models do not reach this point, so only local models can become
         # auto-tune candidates.
@@ -1194,6 +1201,8 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
                     # rather than letting the counter go negative, which would
                     # wedge _deferred_restore's "wait for zero" loop.
                     log.warning("streaming proxy: inflight already 0 at release; not decrementing")
+                if acquired_model is not None:
+                    rt.release_model(acquired_model)
                 rt.last_activity = time.time()
 
                 try:
@@ -1241,6 +1250,8 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     finally:
         # Every non-streaming exit — success, failed load, forward error —
         # decrements here. The streaming path hands the decrement to
-        # close_upstream above, which runs after the body is consumed.
+        # _release above, which runs after the body is consumed.
         if not streaming_response_started:
             rt.inflight -= 1
+            if acquired_model is not None:
+                rt.release_model(acquired_model)

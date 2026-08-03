@@ -31,8 +31,21 @@ class FakeRouter:
     last_activity = 0.0
     inflight = 0
 
+    # Per-model in-flight accounting, mirroring Router. server.py calls these
+    # on every proxied request that resolves to a local model.
+    def acquire_model(self, name):
+        self.model_inflight[name] = self.model_inflight.get(name, 0) + 1
+
+    def release_model(self, name):
+        current = self.model_inflight.get(name, 0)
+        if current <= 1:
+            self.model_inflight.pop(name, None)
+        else:
+            self.model_inflight[name] = current - 1
+
     def __init__(self, cfg, log_dir=None):
         self.cfg = cfg
+        self.model_inflight = {}
         self.model = ModelConfig(
             name="qwen",
             path="/models/qwen.gguf",
@@ -192,11 +205,19 @@ class FakeUpstreamManagerWithModels:
         return resp
 
     def upstreams_status(self):
-        return [{"name": "ollama", "url": "http://127.0.0.1:11434", "model_count": 1, "last_fetch": 123.0}]
+        return [
+            {
+                "name": "ollama",
+                "url": "http://127.0.0.1:11434",
+                "model_count": 1,
+                "last_fetch": 123.0,
+            }
+        ]
 
 
 class FakeAsyncClientUpstream:
     """httpx.AsyncClient that simulates upstream proxy responses."""
+
     def __init__(self, timeout=None):
         self.timeout = timeout
 
@@ -390,7 +411,11 @@ def test_upstream_streaming_proxy_forwards_sse_and_closes_upstream(monkeypatch):
         with client.stream(
             "POST",
             "/v1/chat/completions",
-            json={"model": "llama3.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            json={
+                "model": "llama3.1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
         ) as response:
             body = b"".join(response.iter_bytes())
 
@@ -542,12 +567,14 @@ def test_admin_status_requires_token_when_configured(monkeypatch):
 
     with TestClient(app) as client:
         assert client.get("/admin/status").status_code == 401
-        assert client.get(
-            "/admin/status", headers={"Authorization": "Bearer wrong"}
-        ).status_code == 403
-        assert client.get(
-            "/admin/status", headers={"Authorization": "Bearer secret"}
-        ).status_code == 200
+        assert (
+            client.get("/admin/status", headers={"Authorization": "Bearer wrong"}).status_code
+            == 403
+        )
+        assert (
+            client.get("/admin/status", headers={"Authorization": "Bearer secret"}).status_code
+            == 200
+        )
 
 
 def test_admin_load_requires_token_when_configured(monkeypatch):
@@ -555,27 +582,35 @@ def test_admin_load_requires_token_when_configured(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/admin/load/qwen").status_code == 401
-        assert client.post(
-            "/admin/load/qwen", headers={"Authorization": "Bearer secret"}
-        ).status_code == 200
+        assert (
+            client.post("/admin/load/qwen", headers={"Authorization": "Bearer secret"}).status_code
+            == 200
+        )
 
 
 def test_agent_auto_confirm_requires_admin_token(monkeypatch):
     app = _app_with_admin_token(monkeypatch, "secret")
 
     with TestClient(app) as client:
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": True,
-        })
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": True,
+            },
+        )
         assert r.status_code == 401
 
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": True,
-        }, headers={"Authorization": "Bearer secret"})
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": True,
+            },
+            headers={"Authorization": "Bearer secret"},
+        )
         assert r.status_code == 200
 
 
@@ -583,11 +618,14 @@ def test_agent_without_auto_confirm_allows_unauthenticated_request(monkeypatch):
     app = _app_with_admin_token(monkeypatch, "secret")
 
     with TestClient(app) as client:
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": False,
-        })
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": False,
+            },
+        )
         assert r.status_code == 200
 
 
@@ -596,11 +634,14 @@ def test_agent_confirm_endpoint_requires_admin_token(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/v1/agent/run-1/confirm", json={"approved": True}).status_code == 401
-        assert client.post(
-            "/v1/agent/run-1/confirm",
-            json={"approved": True},
-            headers={"Authorization": "Bearer secret"},
-        ).status_code == 404  # run not found, but auth passed
+        assert (
+            client.post(
+                "/v1/agent/run-1/confirm",
+                json={"approved": True},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 404
+        )  # run not found, but auth passed
 
 
 def test_agent_plan_endpoint_requires_admin_token(monkeypatch):
@@ -608,16 +649,20 @@ def test_agent_plan_endpoint_requires_admin_token(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/v1/agent/run-1/plan", json={"approved": True}).status_code == 401
-        assert client.post(
-            "/v1/agent/run-1/plan",
-            json={"approved": True},
-            headers={"Authorization": "Bearer secret"},
-        ).status_code == 404  # run not found, but auth passed
+        assert (
+            client.post(
+                "/v1/agent/run-1/plan",
+                json={"approved": True},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 404
+        )  # run not found, but auth passed
 
 
 # ---------------------------------------------------------------------------
 # /admin/models/{name}/edit — perf recipe fields
 # ---------------------------------------------------------------------------
+
 
 class FakeRouterWithRebuild(FakeRouter):
     def _build_servers(self):
@@ -637,10 +682,15 @@ def _edit_app(monkeypatch, tmp_path):
     cfg = Config(
         server=ServerConfig(admin_token=None),
         gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
-        models=[ModelConfig(
-            name="qwen", path="/models/qwen.gguf", port=18080,
-            gpu_pci_slot="0000:03:00.0", recipe={"ctx": 8192},
-        )],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path="/models/qwen.gguf",
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+                recipe={"ctx": 8192},
+            )
+        ],
     )
     return create_app(cfg), cfg
 
@@ -698,10 +748,15 @@ def test_admin_edit_persists_to_custom_config_path(monkeypatch, tmp_path):
     cfg = Config(
         server=ServerConfig(admin_token=None),
         gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
-        models=[ModelConfig(
-            name="qwen", path="/models/qwen.gguf", port=18080,
-            gpu_pci_slot="0000:03:00.0", recipe={"ctx": 8192},
-        )],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path="/models/qwen.gguf",
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+                recipe={"ctx": 8192},
+            )
+        ],
         tune=TuneConfig(auto=False),
     )
     app = create_app(cfg, config_path=custom_path)
@@ -737,7 +792,9 @@ def test_admin_scan_persists_to_custom_config_path(monkeypatch, tmp_path):
     app = create_app(cfg, config_path=custom_path)
 
     fake_model = ModelConfig(
-        name="new", path=str(tmp_path / "new.gguf"), port=18081,
+        name="new",
+        path=str(tmp_path / "new.gguf"),
+        port=18081,
         gpu_pci_slot="0000:03:00.0",
     )
 
@@ -1046,7 +1103,11 @@ def test_inflight_covers_streaming_generation(monkeypatch):
             with client.stream(
                 "POST",
                 "/v1/chat/completions",
-                json={"model": "qwen", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": "qwen",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
             ) as r:
                 result["status"] = r.status_code
                 result["body"] = b"".join(r.iter_bytes())

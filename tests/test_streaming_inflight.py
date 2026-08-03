@@ -251,3 +251,19 @@ def test_autotune_still_runs_after_a_failed_stream(app, monkeypatch):
                 b"".join(r.iter_bytes())
         # This is the exact condition autotune._tick() gates every sweep on.
         assert not rt.inflight > 0, "autotune._tick() would return early forever"
+
+
+def test_per_model_count_settles_after_streams(app):
+    """The per-model counter gates eviction drains, so it must settle to zero
+    on the same paths the global counter does — including a failed stream."""
+    with TestClient(app) as c:
+        rt = app.state.router
+        with _post(c) as r:
+            b"".join(r.iter_bytes())
+        assert rt.model_inflight == {}
+
+        _Client.stream_factory = staticmethod(lambda: _Stream(fail_after=1))
+        with pytest.raises(httpx.ReadError):
+            with _post(c) as r:
+                b"".join(r.iter_bytes())
+        assert rt.model_inflight == {}, "failed stream leaked the per-model count"

@@ -11,6 +11,7 @@ one is currently allowed to hold its GPU's VRAM. Two policies are supported:
     the *same* GPU contend. Models still get loaded on demand and stay up for
     follow-up requests.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -104,7 +105,8 @@ def _estimate_model_vram_mb(
                 "VRAM estimate for %s unavailable: expert tensor bytes for "
                 "--n-cpu-moe %d could not be determined; skipping the fit "
                 "guard rather than counting full weights",
-                model.name, eff_moe,
+                model.name,
+                eff_moe,
             )
             return None
     if weight_bytes is None:
@@ -116,7 +118,8 @@ def _estimate_model_vram_mb(
                 weight_bytes = 0
             log.debug(
                 "VRAM estimate for %s falling back to file size: %.0f MiB",
-                model.name, weight_bytes / (1_048_576),
+                model.name,
+                weight_bytes / (1_048_576),
             )
     weight_mb = weight_bytes // (1_048_576)
     eff_ctx = ctx if ctx is not None else int(recipe.get("ctx", 8192))
@@ -193,7 +196,26 @@ class Router:
         # incremented on request entry, decremented only when the forwarded
         # response (streaming included) has been fully produced.
         self.inflight: int = 0
+        # Same window, attributed per model once the request has resolved one.
+        # The global counter cannot answer "is THIS model still serving?": the
+        # evicting request itself holds it above zero, so waiting on it before
+        # an eviction would deadlock. Keyed by name so it survives rebuilds.
+        self.model_inflight: dict[str, int] = {}
         self._build_servers()
+
+    def acquire_model(self, name: str) -> None:
+        """Count a request as actively using *name*. Called by _proxy_post
+        once the request has resolved to a local model."""
+        self.model_inflight[name] = self.model_inflight.get(name, 0) + 1
+
+    def release_model(self, name: str) -> None:
+        current = self.model_inflight.get(name, 0)
+        if current <= 1:
+            self.model_inflight.pop(name, None)
+            if current < 1:
+                log.warning("release_model(%s) with no matching acquire", name)
+        else:
+            self.model_inflight[name] = current - 1
 
     def _build_servers(self) -> None:
         """(Re)build the per-model LlamaServer registry from cfg.
@@ -209,7 +231,8 @@ class Router:
             if gpu is None:
                 log.warning(
                     "model %s references unknown GPU %s; skipping",
-                    m.name, m.gpu_pci_slot,
+                    m.name,
+                    m.gpu_pci_slot,
                 )
                 continue
             plan = build_plan(self.cfg, m, gpu, host=self.cfg.server.host)
@@ -394,8 +417,20 @@ class Router:
                 f"(estimated total with co-residents: {used_mb} MiB)"
             )
 
-    async def _evict_for(self, target: ModelConfig, target_gpu: GPUConfig) -> None:
-        """Stop the right neighbours so the target can have its GPU."""
+    async def _evict_for(
+        self, target: ModelConfig, target_gpu: GPUConfig, drain_seconds: float = 30.0
+    ) -> None:
+        """Stop the right neighbours so the target can have its GPU.
+
+        An incumbent that is still serving requests gets a bounded drain
+        first: killing llama-server mid-generation errors the streaming
+        client for no reason the user can see. After ``drain_seconds`` the
+        eviction proceeds anyway — the new request asked for this GPU, and
+        blocking it behind an arbitrarily long generation would trade one
+        stall for another. New requests for the incumbent can keep arriving
+        through the lockless fast path while we wait, which is exactly why
+        the drain is bounded rather than a wait-for-zero.
+        """
         single = self.cfg.server.single_resident
         for name, srv in self._servers.items():
             if name == target.name:
@@ -407,6 +442,18 @@ class Router:
                 await srv.astop()
                 continue
             if single or other_model.gpu_pci_slot == target_gpu.pci_slot:
+                deadline = time.monotonic() + drain_seconds
+                while self.model_inflight.get(name, 0) > 0 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                still = self.model_inflight.get(name, 0)
+                if still:
+                    log.warning(
+                        "evicting %s with %d request(s) still in flight after "
+                        "%.0fs drain; their clients will see errors",
+                        name,
+                        still,
+                        drain_seconds,
+                    )
                 log.info("evicting %s before starting %s", name, target.name)
                 await srv.astop()
 
