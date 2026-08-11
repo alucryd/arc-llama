@@ -113,16 +113,23 @@ class UpstreamManager:
         body: bytes,
         headers: dict[str, str],
         streaming_ok: bool = True,
-    ) -> httpx.Response:
-        """Forward a request to the upstream and return the raw response."""
+    ) -> tuple[httpx.AsyncClient, httpx.Response]:
+        """Forward a request to the upstream and return the raw response.
+
+        Returns the client alongside the response: the caller owns both and
+        must close them (response first, then client) once the body has been
+        consumed or abandoned. Returning the response alone leaked the
+        client's connection pool on every proxied call — nothing after the
+        return had a reference to close.
+        """
         target_url = f"{upstream.upstream_url}{path}"
         client = httpx.AsyncClient(timeout=None)
         try:
             req = client.build_request("POST", target_url, content=body, headers=headers)
             if streaming_ok:
-                return await client.send(req, stream=True)
+                return client, await client.send(req, stream=True)
             else:
-                return await client.send(req, stream=False)
+                return client, await client.send(req, stream=False)
         except Exception:
             await client.aclose()
             raise

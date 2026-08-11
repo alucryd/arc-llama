@@ -227,6 +227,89 @@ def _restore_edits(original: dict[str, Any], touched: set[str]) -> dict[str, Any
     return {k: original.get(k, defaults.get(k)) for k in touched}
 
 
+def _apply_state_to_recipe(model: ModelConfig, state: dict[str, Any]) -> None:
+    """Write a sweep state directly into the model's in-memory recipe.
+
+    Mirrors the edit endpoint's field rules (None clears, n_cpu_moe and
+    override_tensor are mutually exclusive, n_cpu_moe=0 clears) so the
+    last-resort restore path below persists exactly what the endpoint would
+    have. Only used when the endpoint itself cannot be reached — the values
+    here were already validated when the sweep applied them earlier.
+    """
+    recipe = dict(model.recipe or {})
+    for key, value in state.items():
+        if value is None:
+            recipe.pop(key, None)
+        elif key == "n_cpu_moe":
+            if int(value) == 0:
+                recipe.pop("n_cpu_moe", None)
+            else:
+                recipe["n_cpu_moe"] = int(value)
+                recipe.pop("override_tensor", None)
+        elif key == "override_tensor":
+            recipe["override_tensor"] = list(value)
+            recipe.pop("n_cpu_moe", None)
+        else:
+            recipe[key] = value
+    model.recipe = recipe
+
+
+async def _restore_final_state(
+    client: httpx.AsyncClient,
+    model_name: str,
+    final_state: dict[str, Any],
+    cfg: Config | None,
+) -> str | None:
+    """Apply the end-of-sweep recipe, retrying, with a direct-write fallback.
+
+    The finally block that calls this is the only thing standing between the
+    user and a config file that still holds the last *candidate* the sweep
+    measured — a recipe that may OOM or fail to load on the next request. A
+    single failed POST must therefore not be the end of the story: retry the
+    endpoint a few times, and if it stays broken, write the intended recipe
+    to the local config directly (in the background autotuner this cfg IS the
+    server's live Config; from the CLI it at least repairs the on-disk file
+    the next server start will read). Returns None on success, else the
+    error string from the last endpoint attempt.
+    """
+    err: str | None = None
+    for attempt in range(3):
+        err = await _apply_edits(client, model_name, final_state)
+        if err is None:
+            return None
+        if attempt < 2:
+            await asyncio.sleep(0.5 * (attempt + 1))
+    log.error(
+        "tune %s: final recipe restore failed after 3 attempts: %s",
+        model_name,
+        err,
+    )
+    if cfg is not None:
+        model = cfg.find_model(model_name)
+        if model is not None:
+            try:
+                from arc_llama.config import default_config_path
+
+                _apply_state_to_recipe(model, final_state)
+                cfg.save(default_config_path())
+                log.warning(
+                    "tune %s: restored the final recipe via a direct config "
+                    "write after the edit endpoint failed",
+                    model_name,
+                )
+                return None
+            except Exception as e:  # noqa: BLE001
+                log.critical(
+                    "tune %s: direct config fallback also failed: %s. The "
+                    "persisted recipe still holds the last sweep candidate, "
+                    "which may not load. Intended recipe: %s",
+                    model_name,
+                    e,
+                    final_state,
+                )
+    return err
+
+
 # ---------------------------------------------------------------------------
 # MoE expert offload as a measured axis
 # ---------------------------------------------------------------------------
@@ -523,6 +606,19 @@ async def tune_model(
                 prompt_tokens=pt, gen_tokens=gen_tokens, error=err,
             )
             return res, None, None
+        if should_abort and should_abort():
+            # The edit above awaited, which is exactly the window in which a
+            # real request registers (the caller's own abort check ran in the
+            # same synchronous segment as this function's entry, so checking
+            # earlier here could never observe it). Bail before the benchmark:
+            # its load=True would evict the user's just-started model.
+            report.aborted = True
+            res = BenchmarkResult(
+                model=model_name, ctx=0, cache_type_k="?", cache_type_v="?",
+                prompt_tokens=pt, gen_tokens=gen_tokens,
+                error="aborted before measurement",
+            )
+            return res, None, "aborted before measurement"
         res = await benchmark_model(
             server_url, model_name,
             prompt_tokens=pt, gen_tokens=gen_tokens,
@@ -922,7 +1018,7 @@ async def tune_model(
                 # requests have drained. The restore itself is not skipped.
                 await on_deferred_restore(final_state)
             else:
-                err = await _apply_edits(client, model_name, final_state)
+                err = await _restore_final_state(client, model_name, final_state, cfg)
                 if err and report.error is None:
                     report.error = f"failed to write final recipe: {err}"
                 if not report.error:

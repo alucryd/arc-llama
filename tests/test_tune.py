@@ -671,3 +671,126 @@ class TestOverrideTensorViability:
         assert report.error is None
         assert report.best_edits.get("n_cpu_moe") == 5
         assert "override_tensor" not in report.best_edits
+
+
+# ---------------------------------------------------------------------------
+# #30 / #37 — abort re-check inside measure, restore retry + fallback
+# ---------------------------------------------------------------------------
+
+async def test_measure_rechecks_abort_after_the_edit_await(cfg, monkeypatch):
+    """#30: a real request registers while the candidate edit POST is in
+    flight — after the sweep-level abort check has already run. measure()
+    must re-check after that await and skip the benchmark, whose load=True
+    would evict the user's just-started model."""
+    fake = FakeMeasurements({}, cfg)
+    bench_calls = 0
+    apply_calls = 0
+    abort_now = False
+
+    async def apply(client, name, edits):
+        nonlocal apply_calls, abort_now
+        apply_calls += 1
+        if apply_calls == 2:
+            # Lands mid-sweep: baseline applied+measured, first candidate edit
+            # is in flight, and the user's request has just registered.
+            abort_now = True
+        return await fake.apply(client, name, edits)
+
+    async def bench(server_url, model_name, **kw):
+        nonlocal bench_calls
+        bench_calls += 1
+        return await fake.bench(server_url, model_name, **kw)
+
+    monkeypatch.setattr("arc_llama.tune._apply_edits", apply)
+    monkeypatch.setattr("arc_llama.tune.benchmark_model", bench)
+
+    report = await tune_model(
+        "http://127.0.0.1:11437", "m", cfg=cfg,
+        should_abort=lambda: abort_now,
+    )
+
+    assert report.aborted
+    assert bench_calls == 1, "a candidate was benchmarked after the abort landed"
+    aborted = [s for s in report.steps if s.skipped_reason == "aborted before measurement"]
+    assert aborted, "the aborted candidate was not recorded"
+
+
+async def test_restore_final_state_retries_then_succeeds(cfg, monkeypatch):
+    """#37: a flaky edit endpoint must not leave the last candidate persisted
+    when a retry would have worked."""
+    from arc_llama.tune import _restore_final_state
+
+    calls = 0
+
+    async def flaky(client, name, edits):
+        nonlocal calls
+        calls += 1
+        return "boom" if calls < 3 else None
+
+    monkeypatch.setattr("arc_llama.tune._apply_edits", flaky)
+    err = await _restore_final_state(None, "m", {"cache_type_k": "f16"}, cfg)
+    assert err is None
+    assert calls == 3
+
+
+async def test_restore_final_state_direct_write_fallback(cfg, monkeypatch):
+    """#37: endpoint permanently down → the intended recipe is written to the
+    local config directly rather than leaving the last candidate on disk.
+    XDG_CONFIG_HOME is redirected to tmp by conftest."""
+    from arc_llama.config import default_config_path, load_config
+    from arc_llama.tune import _restore_final_state
+
+    async def dead(client, name, edits):
+        return "connection refused"
+
+    monkeypatch.setattr("arc_llama.tune._apply_edits", dead)
+    # What the last candidate edit left behind.
+    cfg.models[0].recipe = {"cache_type_k": "q8_0", "n_cpu_moe": 4}
+
+    err = await _restore_final_state(
+        None, "m", {"cache_type_k": "f16", "n_cpu_moe": None}, cfg
+    )
+
+    assert err is None
+    assert cfg.models[0].recipe.get("cache_type_k") == "f16"
+    assert "n_cpu_moe" not in cfg.models[0].recipe
+    on_disk = load_config(default_config_path())
+    restored = on_disk.find_model("m")
+    assert restored is not None
+    assert restored.recipe.get("cache_type_k") == "f16"
+    assert "n_cpu_moe" not in restored.recipe
+
+
+async def test_restore_final_state_reports_error_when_everything_fails(cfg, monkeypatch):
+    """#37: endpoint down AND local write failing → the caller gets the error
+    (and a critical log), never a silent bad recipe."""
+    from arc_llama.tune import _restore_final_state
+
+    async def dead(client, name, edits):
+        return "connection refused"
+
+    def bad_save(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("arc_llama.tune._apply_edits", dead)
+    monkeypatch.setattr(type(cfg), "save", bad_save)
+
+    err = await _restore_final_state(None, "m", {"cache_type_k": "f16"}, cfg)
+    assert err == "connection refused"
+
+
+async def test_apply_state_to_recipe_mirrors_endpoint_rules():
+    """None clears, n_cpu_moe=0 clears, n_cpu_moe and override_tensor exclude
+    each other — the fallback must persist exactly what the endpoint would."""
+    from arc_llama.tune import _apply_state_to_recipe
+
+    m = ModelConfig(name="m", path="/m.gguf", port=1, gpu_pci_slot="g",
+                    recipe={"cache_type_k": "q8_0", "n_cpu_moe": 4})
+    _apply_state_to_recipe(m, {"override_tensor": ["p"]})
+    assert m.recipe == {"cache_type_k": "q8_0", "override_tensor": ["p"]}
+    _apply_state_to_recipe(m, {"n_cpu_moe": 2})
+    assert m.recipe == {"cache_type_k": "q8_0", "n_cpu_moe": 2}
+    _apply_state_to_recipe(m, {"n_cpu_moe": 0})
+    assert m.recipe == {"cache_type_k": "q8_0"}
+    _apply_state_to_recipe(m, {"flash_attn": None, "ubatch_size": 1024})
+    assert m.recipe == {"cache_type_k": "q8_0", "ubatch_size": 1024}

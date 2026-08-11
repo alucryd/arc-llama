@@ -67,14 +67,18 @@ class FakeRouter:
     def all_models(self):
         return [self.model]
 
-    async def ensure_active(self, query):
+    async def ensure_active(self, query, *, acquire: bool = False):
         if query not in {"qwen", "qwen.gguf"}:
             raise KeyError(query)
         # Use a model from cfg if it exists there, so the request path sees
         # the same object the Autotuner is watching.
         for m in self.cfg.models:
             if m.name == "qwen":
+                if acquire:
+                    self.acquire_model(m.name)
                 return m, FakeBackend()
+        if acquire:
+            self.acquire_model(self.model.name)
         return self.model, FakeBackend()
 
     async def shutdown(self):
@@ -203,7 +207,7 @@ class FakeUpstreamManagerWithModels:
 
     async def proxy(self, upstream, path, body, headers, streaming_ok=True):
         resp = FakeUpstreamResponse()
-        return resp
+        return FakeAsyncClientUpstream(), resp
 
     def upstreams_status(self):
         return [
@@ -221,12 +225,13 @@ class FakeAsyncClientUpstream:
 
     def __init__(self, timeout=None):
         self.timeout = timeout
+        self.closed = False
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
-        pass
+        await self.aclose()
 
     def build_request(self, method, url, content=None, headers=None):
         return {"method": method, "url": url, "content": content, "headers": headers}
@@ -236,7 +241,7 @@ class FakeAsyncClientUpstream:
         return resp
 
     async def aclose(self):
-        pass
+        self.closed = True
 
 
 class FakeUpstreamStreamResponse:
@@ -262,6 +267,7 @@ class FakeUpstreamManagerStreaming:
         self._upstreams = upstreams or []
         self._models = [FakeUpstreamModel("llama3.1", "ollama", "http://127.0.0.1:11434")]
         self.last_stream = None
+        self.last_client = None
         self.last_streaming_ok = None
 
     async def models(self):
@@ -276,7 +282,8 @@ class FakeUpstreamManagerStreaming:
     async def proxy(self, upstream, path, body, headers, streaming_ok=True):
         self.last_streaming_ok = streaming_ok
         self.last_stream = FakeUpstreamStreamResponse()
-        return self.last_stream
+        self.last_client = FakeAsyncClientUpstream()
+        return self.last_client, self.last_stream
 
     def upstreams_status(self):
         return []
@@ -912,7 +919,7 @@ def test_custom_config_path_used_by_autotune_save(monkeypatch, tmp_path):
 
     import arc_llama.autotune as autotune_mod
 
-    def fake_start_autotuner(cfg, router, *, version, on_save=None):
+    async def fake_start_autotuner(cfg, router, *, version, on_save=None):
         saved.append(on_save)
         return FakeTuner(on_save)
 
@@ -1136,7 +1143,7 @@ def test_inflight_decremented_when_load_fails(monkeypatch):
     import arc_llama.server as server_mod
 
     class FailingRouter(FakeRouter):
-        async def ensure_active(self, query):
+        async def ensure_active(self, query, *, acquire: bool = False):
             raise RuntimeError("llama-server did not become healthy")
 
     monkeypatch.setattr(server_mod, "Router", FailingRouter)

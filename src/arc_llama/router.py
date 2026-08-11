@@ -201,6 +201,12 @@ class Router:
         # evicting request itself holds it above zero, so waiting on it before
         # an eviction would deadlock. Keyed by name so it survives rebuilds.
         self.model_inflight: dict[str, int] = {}
+        # Models whose llama-server is being torn down right now. Set
+        # synchronously before astop() begins, while the deciding read of
+        # model_inflight is still in the same event-loop segment, so the
+        # lock-free fast path in ensure_active can never hand out a server
+        # that is already on its way down.
+        self._stopping: set[str] = set()
         self._build_servers()
 
     def acquire_model(self, name: str) -> None:
@@ -257,6 +263,18 @@ class Router:
     def all_models(self) -> list[ModelConfig]:
         return list(self.cfg.models)
 
+    def running_models(self) -> list[str]:
+        """Names of models whose llama-server process is alive (snapshot).
+
+        Safe to call without the swap lock: the comprehension contains no
+        await and the event loop is single-threaded, so _servers cannot
+        change shape while it runs, and is_running is a live subprocess
+        probe rather than a cached flag. Anything that changes immediately
+        after the return is a policy question for the caller (drain/abort
+        hooks), not a stale read.
+        """
+        return [n for n, s in self._servers.items() if s is not None and s.is_running]
+
     def backend_url_for(self, model_name: str) -> str | None:
         srv = self._servers.get(model_name)
         return srv.plan.backend_url if srv else None
@@ -265,14 +283,25 @@ class Router:
     # Swap
     # ------------------------------------------------------------------
 
-    async def ensure_active(self, query: str) -> tuple[ModelConfig, LlamaServer]:
+    async def ensure_active(
+        self, query: str, *, acquire: bool = False
+    ) -> tuple[ModelConfig, LlamaServer]:
         """Make sure the requested model is the resident one (per policy) and
         return its (config, LlamaServer). Caller forwards the request to
         `srv.plan.backend_url`.
 
+        With ``acquire=True`` the returned model is also counted in
+        ``model_inflight`` — atomically with the readiness check, because the
+        check and the counter bump happen in one synchronous event-loop
+        segment. Callers that forward a real request must pass acquire=True
+        and later call ``release_model``; without the atomic bump, an
+        eviction drain could read a zero count for a model whose request was
+        resolved but not yet counted, and stop it out from under the forward.
+
         Fast-path: if the model is already running *and ready* (its cached
-        health state, set by wait_ready — no per-request probing) and no
-        eviction is needed, return immediately without acquiring the swap lock.
+        health state, set by wait_ready — no per-request probing), not being
+        torn down, and no eviction is needed, return immediately without
+        acquiring the swap lock.
 
         A request that finds the subprocess alive but not yet ready (a cold
         start takes tens of seconds to bind the port) waits on the shared load
@@ -291,14 +320,19 @@ class Router:
         # Fast-path: already running AND ready → no lock, no eviction, no start.
         # is_running alone is not sufficient: the subprocess is alive for the
         # whole cold start, but the port only accepts connections once
-        # wait_ready has passed, which is what `ready` caches.
+        # wait_ready has passed, which is what `ready` caches. The _stopping
+        # check closes the remaining window: an evictor marks the model before
+        # the first await of its teardown, so a server on its way down is
+        # never handed out from here.
         fast = self.resolve(query)
         if fast is not None:
             target_model, target_gpu, target_srv = fast
             if target_srv.is_running:
-                if target_srv.ready:
+                if target_srv.ready and target_model.name not in self._stopping:
                     # Verify policy: if single-resident, we are the one; if multi,
                     # same-GPU contention would have been resolved when we started.
+                    if acquire:
+                        self.acquire_model(target_model.name)
                     return target_model, target_srv
                 # Alive but not healthy yet: a load is in progress. Wait on the
                 # starter's shared future (bounded by the starter's wait_ready
@@ -307,7 +341,21 @@ class Router:
                 # future the starter and other waiters still rely on.
                 loading = self._loading_futures.get(target_model.name)
                 if loading is not None:
-                    return await asyncio.shield(loading)
+                    loaded_model, loaded_srv = await asyncio.shield(loading)
+                    # Re-validate after the await: the model may have been
+                    # evicted between the load completing and this waiter
+                    # being scheduled. The re-check plus the acquire is again
+                    # one synchronous segment, so the result cannot race a
+                    # drain's counter read.
+                    if (
+                        loaded_srv.is_running
+                        and loaded_srv.ready
+                        and loaded_model.name not in self._stopping
+                    ):
+                        if acquire:
+                            self.acquire_model(loaded_model.name)
+                        return loaded_model, loaded_srv
+                    # Stale — fall through to the slow path and re-resolve.
                 # Running-but-not-ready with no load we can join (should not
                 # happen — every start registers a future before spawning).
                 # Fall through to the slow path and let it re-wait or restart.
@@ -323,11 +371,21 @@ class Router:
             # If someone else is already loading this model, wait on them.
             existing_future = self._loading_futures.get(target_model.name)
             if existing_future is not None:
-                return await asyncio.shield(existing_future)
+                loaded_model, loaded_srv = await asyncio.shield(existing_future)
+                if loaded_srv.is_running and loaded_srv.ready:
+                    if acquire:
+                        self.acquire_model(loaded_model.name)
+                    return loaded_model, loaded_srv
 
             await self._evict_for(target_model, target_gpu)
 
-            if target_srv.is_running and target_srv.ready:
+            if (
+                target_srv.is_running
+                and target_srv.ready
+                and target_model.name not in self._stopping
+            ):
+                if acquire:
+                    self.acquire_model(target_model.name)
                 return target_model, target_srv
 
             # estimate_weight_vram_bytes reads GGUF metadata synchronously;
@@ -360,6 +418,8 @@ class Router:
                 self.metrics["last_error"] = None
                 result = (target_model, target_srv)
                 future.set_result(result)
+                if acquire:
+                    self.acquire_model(target_model.name)
                 return result
             except Exception as exc:
                 if not future.done():
@@ -439,12 +499,21 @@ class Router:
                 continue
             other_model = next((m for m in self.cfg.models if m.name == name), None)
             if other_model is None:
-                await srv.astop()
+                self._stopping.add(name)
+                try:
+                    await srv.astop()
+                finally:
+                    self._stopping.discard(name)
                 continue
             if single or other_model.gpu_pci_slot == target_gpu.pci_slot:
                 deadline = time.monotonic() + drain_seconds
                 while self.model_inflight.get(name, 0) > 0 and time.monotonic() < deadline:
                     await asyncio.sleep(0.1)
+                # From the final counter read to the _stopping mark there is
+                # no await, so a lock-free fast-path acquire either landed
+                # before the read (count > 0, we keep draining) or after the
+                # mark (sees _stopping and takes the slow path). It can never
+                # slip between them and receive a server that is going down.
                 still = self.model_inflight.get(name, 0)
                 if still:
                     log.warning(
@@ -455,7 +524,11 @@ class Router:
                         drain_seconds,
                     )
                 log.info("evicting %s before starting %s", name, target.name)
-                await srv.astop()
+                self._stopping.add(name)
+                try:
+                    await srv.astop()
+                finally:
+                    self._stopping.discard(name)
 
     async def stop_one(self, name: str) -> bool:
         """Stop a single model's llama-server. Returns True if it was running."""
@@ -478,18 +551,43 @@ class Router:
             self.metrics["stops"] += stopped
             return stopped
 
-    async def rebuild_model(self, name: str) -> tuple[bool, bool]:
+    async def rebuild_model(self, name: str, drain_seconds: float = 30.0) -> tuple[bool, bool]:
         """Drop and rebuild the LlamaServer for one model after a config edit.
 
         If the model is currently loaded, it's stopped first — the recipe is
         consumed at process start, so an in-flight server can't pick up new
-        flags. Returns (rebuilt, was_running).
+        flags. A request that acquired the model through the lock-free fast
+        path an instant before we took the lock (the deferred autotune
+        restore racing a real request is the case that motivated this) gets
+        the same bounded drain an eviction gets, instead of having its
+        generation killed mid-stream. Returns (rebuilt, was_running).
         """
         async with self._lock:
-            old = self._servers.pop(name, None)
+            old = self._servers.get(name)
             was_running = bool(old and old.is_running)
             if old is not None and old.is_running:
-                await old.astop()
+                deadline = time.monotonic() + drain_seconds
+                while self.model_inflight.get(name, 0) > 0 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                still = self.model_inflight.get(name, 0)
+                if still:
+                    log.warning(
+                        "rebuild %s: stopping with %d request(s) still in "
+                        "flight after %.0fs drain; their clients will see errors",
+                        name,
+                        still,
+                        drain_seconds,
+                    )
+                # Same synchronous segment as the final counter read: a
+                # fast-path acquire either preceded it (we drained) or
+                # follows the mark (takes the slow path and waits on the
+                # lock we hold).
+                self._stopping.add(name)
+                try:
+                    await old.astop()
+                finally:
+                    self._stopping.discard(name)
+            self._servers.pop(name, None)
             cfg_model = next((m for m in self.cfg.models if m.name == name), None)
             if cfg_model is None:
                 return False, was_running

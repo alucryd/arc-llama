@@ -119,7 +119,9 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             def _save_cfg() -> None:
                 cfg.save(save_path)
 
-            tuner = start_autotuner(cfg, app.state.router, version=__version__, on_save=_save_cfg)
+            tuner = await start_autotuner(
+                cfg, app.state.router, version=__version__, on_save=_save_cfg
+            )
             app.state.tuner = tuner
         try:
             await app.state.mcp_manager.start()
@@ -1093,7 +1095,7 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     upstream_model = mgr.find_model(model_query)
     if upstream_model is not None:
         try:
-            upstream_resp = await mgr.proxy(
+            upstream_client, upstream_resp = await mgr.proxy(
                 upstream_model,
                 target_path,
                 body_bytes,
@@ -1104,19 +1106,51 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
             raise HTTPException(status_code=502, detail=f"Upstream error: {e}") from e
         want_stream = streaming_ok and bool(body.get("stream"))
         if want_stream:
+            released = False
 
             async def close_upstream() -> None:
-                await upstream_resp.aclose()
+                """Close response then client, exactly once.
+
+                The BackgroundTask alone was not enough: Starlette only runs
+                it when streaming the body returned normally, so an upstream
+                that dies mid-generation skipped it and leaked both the
+                response's connection and the client's pool. The generator's
+                finally covers that path; the task settles a late finalize.
+                """
+                nonlocal released
+                if released:
+                    return
+                released = True
+                try:
+                    await upstream_resp.aclose()
+                except Exception:
+                    log.debug("upstream proxy: response close failed", exc_info=True)
+                try:
+                    await upstream_client.aclose()
+                except Exception:
+                    log.debug("upstream proxy: client close failed", exc_info=True)
+
+            async def upstream_body_iter():
+                try:
+                    async for chunk in upstream_resp.aiter_raw():
+                        yield chunk
+                finally:
+                    await close_upstream()
 
             return StreamingResponse(
-                upstream_resp.aiter_raw(),
+                upstream_body_iter(),
                 status_code=upstream_resp.status_code,
                 headers=_strip_response_headers(dict(upstream_resp.headers)),
                 media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
                 background=BackgroundTask(close_upstream),
             )
-        content = await upstream_resp.aread()
-        await upstream_resp.aclose()
+        try:
+            content = await upstream_resp.aread()
+        finally:
+            try:
+                await upstream_resp.aclose()
+            finally:
+                await upstream_client.aclose()
         return Response(
             content=content,
             status_code=upstream_resp.status_code,
@@ -1134,18 +1168,19 @@ async def _proxy_post(request: Request, target_path: str, streaming_ok: bool = T
     rt.inflight += 1
     streaming_response_started = False
     # Set once the request has resolved to a local model, so the router can
-    # answer "is this specific model still serving?" — which _evict_for needs
-    # to drain an incumbent instead of killing its generation mid-stream. The
-    # global counter cannot answer that: the evicting request holds it too.
+    # answer "is this specific model still serving?" — which _evict_for and
+    # rebuild_model need to drain an incumbent instead of killing its
+    # generation mid-stream. The global counter cannot answer that: the
+    # evicting request holds it too. The acquisition itself happens inside
+    # ensure_active, atomically with the readiness check.
     acquired_model: str | None = None
     try:
         try:
-            model, srv = await rt.ensure_active(model_query)
+            model, srv = await rt.ensure_active(model_query, acquire=True)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_query!r}") from None
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
-        rt.acquire_model(model.name)
         acquired_model = model.name
         # Tell the background tuner this model was actually used by a real request.
         # Upstream models do not reach this point, so only local models can become

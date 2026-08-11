@@ -74,6 +74,9 @@ def router(cfg: Config):
         def all_models(self):
             return cfg.models
 
+        def running_models(self):
+            return [n for n, s in self._servers.items() if s is not None and s.is_running]
+
     return FakeRouter()
 
 
@@ -274,6 +277,9 @@ class FakeRouter:
     def all_models(self):
         return self.cfg.models
 
+    def running_models(self):
+        return [n for n, s in self._servers.items() if s is not None and s.is_running]
+
     def _servers_for(self, name: str) -> Any:
         class Srv:
             is_running = name in self._running
@@ -324,7 +330,7 @@ async def test_idle_gate_recent_activity_produces_no_sweep(cfg: Config) -> None:
     router.last_activity = 99.0
     cfg.tune.idle_seconds = 120
     tuner = _make_tuner(cfg, router)
-    tuner.start()
+    await tuner.start()
     await asyncio.sleep(0.1)
     await tuner.stop()
     assert not calls
@@ -341,7 +347,7 @@ async def test_idle_gate_inflight_produces_no_sweep(cfg: Config) -> None:
     router.inflight = 1
     cfg.tune.idle_seconds = 0
     tuner = _make_tuner(cfg, router)
-    tuner.start()
+    await tuner.start()
     await asyncio.sleep(0.1)
     await tuner.stop()
     assert not calls
@@ -351,7 +357,7 @@ async def test_auto_false_starts_no_task(cfg: Config) -> None:
     cfg.tune.auto = False
     router = FakeRouter(cfg)
     tuner = _make_tuner(cfg, router)
-    tuner.start()
+    await tuner.start()
     assert not tuner.is_running
 
 
@@ -578,7 +584,7 @@ async def test_stop_terminates_the_loop_on_every_python(cfg: Config) -> None:
     # A long interval parks the loop inside the wait, which is where stop()
     # finds it in practice.
     tuner = Autotuner(cfg, router, version="0.6.0", loop_interval=60)
-    tuner.start()
+    await tuner.start()
     await asyncio.sleep(0.1)
     task = tuner._task
     assert task is not None and not task.done()
@@ -647,3 +653,42 @@ async def test_deferred_restore_does_not_consume_abort_signal(cfg: Config) -> No
         "the deferred restore consumed an abort signal it does not own"
     )
     assert applied, "restore never applied after the drain"
+
+
+# ---------------------------------------------------------------------------
+# #34 — start()/stop() serialization
+# ---------------------------------------------------------------------------
+
+
+async def test_start_is_noop_while_running(cfg: Config) -> None:
+    router = FakeRouter(cfg)
+    tuner = _make_tuner(cfg, router)
+    await tuner.start()
+    first = tuner._task
+    await tuner.start()
+    assert tuner._task is first
+    await tuner.stop()
+
+
+async def test_start_racing_stop_leaves_a_live_loop(cfg: Config) -> None:
+    """#34: start() while stop() is still reaping the old task used to see
+    the not-yet-done task, no-op, and leave the tuner permanently dead with
+    _stopping set. Both take the lock now; start runs after stop finishes
+    and must come up clean. The lock is pre-held so the ordering is
+    deterministic: stop queues first, start behind it."""
+    router = FakeRouter(cfg)
+    tuner = Autotuner(cfg, router, version="0.6.0", loop_interval=60)
+    await tuner.start()
+    assert tuner.is_running
+
+    await tuner._lock.acquire()
+    stopper = asyncio.ensure_future(tuner.stop())
+    starter = asyncio.ensure_future(tuner.start())
+    await asyncio.sleep(0)  # both queued on the lock, stop first
+    tuner._lock.release()
+    await asyncio.gather(stopper, starter)
+
+    assert tuner.is_running, "start behind an in-flight stop left no loop running"
+    assert not tuner._stopping
+    await tuner.stop()
+    assert not tuner.is_running
