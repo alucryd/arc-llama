@@ -267,8 +267,7 @@ def mock_recipe_and_mtp():
     """Patch default_recipe and has_mtp_heads for add_local_model/register_discovered."""
     from arc_llama.recipes import KVCacheType, LaunchRecipe
 
-    def _recipe(*, arch, vram_mb, model_file_mb, kv_class, backend=None,
-                trained_ctx=None):
+    def _recipe(*, arch, vram_mb, model_file_mb, kv_class, backend=None, trained_ctx=None):
         return LaunchRecipe(
             n_gpu_layers=999,
             ctx=8192,
@@ -852,9 +851,7 @@ def test_add_local_model_wires_sidecar_draft(tmp_path):
         patch("arc_llama.models.has_mtp_heads", return_value=False),
         patch("arc_llama.models.is_moe", return_value=False),
     ):
-        mc = add_local_model(
-            cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0"
-        )
+        mc = add_local_model(cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0")
     assert mc.recipe["spec_type"] == "draft-mtp"
     assert Path(mc.recipe["spec_draft_model"]).resolve() == draft.resolve()
     assert mc.recipe["spec_draft_ngl"] == 999
@@ -868,9 +865,7 @@ def test_add_local_model_no_spec_without_draft(tmp_path):
         patch("arc_llama.models.has_mtp_heads", return_value=False),
         patch("arc_llama.models.is_moe", return_value=False),
     ):
-        mc = add_local_model(
-            cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0"
-        )
+        mc = add_local_model(cfg, name="gemma-qat", path=str(main), gpu_pci_slot="0000:03:00.0")
     assert "spec_type" not in mc.recipe
     assert "spec_draft_model" not in mc.recipe
 
@@ -889,3 +884,65 @@ def test_register_discovered_skips_draft_and_wires_parent(tmp_path):
     mc = added[0]
     assert Path(mc.path).resolve() == main.resolve()
     assert Path(mc.recipe["spec_draft_model"]).resolve() == draft.resolve()
+
+
+def test_add_local_model_skips_mtp_for_hybrid_ssm(tmp_path):
+    """qwen35* hybrids carry MTP heads but are documented as slow with SYCL
+    MTP on Xe2 (see is_hybrid_ssm) — discovery must not auto-enable a known
+    regression."""
+    cfg = _make_config_with_gpu(tmp_path)
+    model_file = tmp_path / "model.gguf"
+    model_file.write_bytes(b"fake")
+
+    with (
+        patch("arc_llama.models.default_recipe") as mock_recipe,
+        patch("arc_llama.models.has_mtp_heads", return_value=True),
+        patch("arc_llama.models.is_hybrid_ssm", return_value=True),
+    ):
+        from arc_llama.recipes import KVCacheType, LaunchRecipe
+
+        mock_recipe.return_value = LaunchRecipe(
+            n_gpu_layers=999,
+            ctx=8192,
+            parallel=1,
+            cache_type_k=KVCacheType.Q8_0,
+            cache_type_v=KVCacheType.Q8_0,
+        )
+        mc = add_local_model(
+            cfg,
+            name="hybrid-model",
+            path=str(model_file),
+            gpu_pci_slot="0000:03:00.0",
+        )
+
+    recipe = mc.recipe or {}
+    assert recipe.get("spec_type") != "draft-mtp", (
+        "auto-enabled draft-mtp on a hybrid SSM model the project itself "
+        "documents as regressing with it"
+    )
+
+
+def test_register_discovered_skips_mtp_for_hybrid_ssm(tmp_path):
+    cfg = _make_config_with_gpu(tmp_path)
+    found = tmp_path / "found.gguf"
+    found.write_bytes(b"fake")
+
+    with (
+        patch("arc_llama.models.default_recipe") as mock_recipe,
+        patch("arc_llama.models.has_mtp_heads", return_value=True),
+        patch("arc_llama.models.is_hybrid_ssm", return_value=True),
+    ):
+        from arc_llama.recipes import KVCacheType, LaunchRecipe
+
+        mock_recipe.return_value = LaunchRecipe(
+            n_gpu_layers=999,
+            ctx=8192,
+            parallel=1,
+            cache_type_k=KVCacheType.Q8_0,
+            cache_type_v=KVCacheType.Q8_0,
+        )
+        added = register_discovered(cfg, [found])
+
+    assert added, "model was not registered at all"
+    recipe = added[0].recipe or {}
+    assert recipe.get("spec_type") != "draft-mtp"

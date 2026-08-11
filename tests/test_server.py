@@ -25,14 +25,28 @@ class FakeServerPlan:
 class FakeBackend:
     plan = FakeServerPlan()
     is_running = True
+    ready = True
 
 
 class FakeRouter:
     last_activity = 0.0
     inflight = 0
 
+    # Per-model in-flight accounting, mirroring Router. server.py calls these
+    # on every proxied request that resolves to a local model.
+    def acquire_model(self, name):
+        self.model_inflight[name] = self.model_inflight.get(name, 0) + 1
+
+    def release_model(self, name):
+        current = self.model_inflight.get(name, 0)
+        if current <= 1:
+            self.model_inflight.pop(name, None)
+        else:
+            self.model_inflight[name] = current - 1
+
     def __init__(self, cfg, log_dir=None):
         self.cfg = cfg
+        self.model_inflight = {}
         self.model = ModelConfig(
             name="qwen",
             path="/models/qwen.gguf",
@@ -53,14 +67,18 @@ class FakeRouter:
     def all_models(self):
         return [self.model]
 
-    async def ensure_active(self, query):
+    async def ensure_active(self, query, *, acquire: bool = False):
         if query not in {"qwen", "qwen.gguf"}:
             raise KeyError(query)
         # Use a model from cfg if it exists there, so the request path sees
         # the same object the Autotuner is watching.
         for m in self.cfg.models:
             if m.name == "qwen":
+                if acquire:
+                    self.acquire_model(m.name)
                 return m, FakeBackend()
+        if acquire:
+            self.acquire_model(self.model.name)
         return self.model, FakeBackend()
 
     async def shutdown(self):
@@ -189,22 +207,31 @@ class FakeUpstreamManagerWithModels:
 
     async def proxy(self, upstream, path, body, headers, streaming_ok=True):
         resp = FakeUpstreamResponse()
-        return resp
+        return FakeAsyncClientUpstream(), resp
 
     def upstreams_status(self):
-        return [{"name": "ollama", "url": "http://127.0.0.1:11434", "model_count": 1, "last_fetch": 123.0}]
+        return [
+            {
+                "name": "ollama",
+                "url": "http://127.0.0.1:11434",
+                "model_count": 1,
+                "last_fetch": 123.0,
+            }
+        ]
 
 
 class FakeAsyncClientUpstream:
     """httpx.AsyncClient that simulates upstream proxy responses."""
+
     def __init__(self, timeout=None):
         self.timeout = timeout
+        self.closed = False
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *args):
-        pass
+        await self.aclose()
 
     def build_request(self, method, url, content=None, headers=None):
         return {"method": method, "url": url, "content": content, "headers": headers}
@@ -214,7 +241,7 @@ class FakeAsyncClientUpstream:
         return resp
 
     async def aclose(self):
-        pass
+        self.closed = True
 
 
 class FakeUpstreamStreamResponse:
@@ -240,6 +267,7 @@ class FakeUpstreamManagerStreaming:
         self._upstreams = upstreams or []
         self._models = [FakeUpstreamModel("llama3.1", "ollama", "http://127.0.0.1:11434")]
         self.last_stream = None
+        self.last_client = None
         self.last_streaming_ok = None
 
     async def models(self):
@@ -254,7 +282,8 @@ class FakeUpstreamManagerStreaming:
     async def proxy(self, upstream, path, body, headers, streaming_ok=True):
         self.last_streaming_ok = streaming_ok
         self.last_stream = FakeUpstreamStreamResponse()
-        return self.last_stream
+        self.last_client = FakeAsyncClientUpstream()
+        return self.last_client, self.last_stream
 
     def upstreams_status(self):
         return []
@@ -390,7 +419,11 @@ def test_upstream_streaming_proxy_forwards_sse_and_closes_upstream(monkeypatch):
         with client.stream(
             "POST",
             "/v1/chat/completions",
-            json={"model": "llama3.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            json={
+                "model": "llama3.1",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
         ) as response:
             body = b"".join(response.iter_bytes())
 
@@ -542,12 +575,14 @@ def test_admin_status_requires_token_when_configured(monkeypatch):
 
     with TestClient(app) as client:
         assert client.get("/admin/status").status_code == 401
-        assert client.get(
-            "/admin/status", headers={"Authorization": "Bearer wrong"}
-        ).status_code == 403
-        assert client.get(
-            "/admin/status", headers={"Authorization": "Bearer secret"}
-        ).status_code == 200
+        assert (
+            client.get("/admin/status", headers={"Authorization": "Bearer wrong"}).status_code
+            == 403
+        )
+        assert (
+            client.get("/admin/status", headers={"Authorization": "Bearer secret"}).status_code
+            == 200
+        )
 
 
 def test_admin_load_requires_token_when_configured(monkeypatch):
@@ -555,27 +590,35 @@ def test_admin_load_requires_token_when_configured(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/admin/load/qwen").status_code == 401
-        assert client.post(
-            "/admin/load/qwen", headers={"Authorization": "Bearer secret"}
-        ).status_code == 200
+        assert (
+            client.post("/admin/load/qwen", headers={"Authorization": "Bearer secret"}).status_code
+            == 200
+        )
 
 
 def test_agent_auto_confirm_requires_admin_token(monkeypatch):
     app = _app_with_admin_token(monkeypatch, "secret")
 
     with TestClient(app) as client:
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": True,
-        })
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": True,
+            },
+        )
         assert r.status_code == 401
 
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": True,
-        }, headers={"Authorization": "Bearer secret"})
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": True,
+            },
+            headers={"Authorization": "Bearer secret"},
+        )
         assert r.status_code == 200
 
 
@@ -583,11 +626,14 @@ def test_agent_without_auto_confirm_allows_unauthenticated_request(monkeypatch):
     app = _app_with_admin_token(monkeypatch, "secret")
 
     with TestClient(app) as client:
-        r = client.post("/v1/agent", json={
-            "model": "qwen",
-            "task": "hello",
-            "auto_confirm": False,
-        })
+        r = client.post(
+            "/v1/agent",
+            json={
+                "model": "qwen",
+                "task": "hello",
+                "auto_confirm": False,
+            },
+        )
         assert r.status_code == 200
 
 
@@ -596,11 +642,14 @@ def test_agent_confirm_endpoint_requires_admin_token(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/v1/agent/run-1/confirm", json={"approved": True}).status_code == 401
-        assert client.post(
-            "/v1/agent/run-1/confirm",
-            json={"approved": True},
-            headers={"Authorization": "Bearer secret"},
-        ).status_code == 404  # run not found, but auth passed
+        assert (
+            client.post(
+                "/v1/agent/run-1/confirm",
+                json={"approved": True},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 404
+        )  # run not found, but auth passed
 
 
 def test_agent_plan_endpoint_requires_admin_token(monkeypatch):
@@ -608,16 +657,20 @@ def test_agent_plan_endpoint_requires_admin_token(monkeypatch):
 
     with TestClient(app) as client:
         assert client.post("/v1/agent/run-1/plan", json={"approved": True}).status_code == 401
-        assert client.post(
-            "/v1/agent/run-1/plan",
-            json={"approved": True},
-            headers={"Authorization": "Bearer secret"},
-        ).status_code == 404  # run not found, but auth passed
+        assert (
+            client.post(
+                "/v1/agent/run-1/plan",
+                json={"approved": True},
+                headers={"Authorization": "Bearer secret"},
+            ).status_code
+            == 404
+        )  # run not found, but auth passed
 
 
 # ---------------------------------------------------------------------------
 # /admin/models/{name}/edit — perf recipe fields
 # ---------------------------------------------------------------------------
+
 
 class FakeRouterWithRebuild(FakeRouter):
     def _build_servers(self):
@@ -637,10 +690,15 @@ def _edit_app(monkeypatch, tmp_path):
     cfg = Config(
         server=ServerConfig(admin_token=None),
         gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
-        models=[ModelConfig(
-            name="qwen", path="/models/qwen.gguf", port=18080,
-            gpu_pci_slot="0000:03:00.0", recipe={"ctx": 8192},
-        )],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path="/models/qwen.gguf",
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+                recipe={"ctx": 8192},
+            )
+        ],
     )
     return create_app(cfg), cfg
 
@@ -698,10 +756,15 @@ def test_admin_edit_persists_to_custom_config_path(monkeypatch, tmp_path):
     cfg = Config(
         server=ServerConfig(admin_token=None),
         gpus=[GPUConfig(pci_slot="0000:03:00.0", sycl_index=0, arch="battlemage", vram_mb=24576)],
-        models=[ModelConfig(
-            name="qwen", path="/models/qwen.gguf", port=18080,
-            gpu_pci_slot="0000:03:00.0", recipe={"ctx": 8192},
-        )],
+        models=[
+            ModelConfig(
+                name="qwen",
+                path="/models/qwen.gguf",
+                port=18080,
+                gpu_pci_slot="0000:03:00.0",
+                recipe={"ctx": 8192},
+            )
+        ],
         tune=TuneConfig(auto=False),
     )
     app = create_app(cfg, config_path=custom_path)
@@ -737,7 +800,9 @@ def test_admin_scan_persists_to_custom_config_path(monkeypatch, tmp_path):
     app = create_app(cfg, config_path=custom_path)
 
     fake_model = ModelConfig(
-        name="new", path=str(tmp_path / "new.gguf"), port=18081,
+        name="new",
+        path=str(tmp_path / "new.gguf"),
+        port=18081,
         gpu_pci_slot="0000:03:00.0",
     )
 
@@ -854,7 +919,7 @@ def test_custom_config_path_used_by_autotune_save(monkeypatch, tmp_path):
 
     import arc_llama.autotune as autotune_mod
 
-    def fake_start_autotuner(cfg, router, *, version, on_save=None):
+    async def fake_start_autotuner(cfg, router, *, version, on_save=None):
         saved.append(on_save)
         return FakeTuner(on_save)
 
@@ -1046,7 +1111,11 @@ def test_inflight_covers_streaming_generation(monkeypatch):
             with client.stream(
                 "POST",
                 "/v1/chat/completions",
-                json={"model": "qwen", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                json={
+                    "model": "qwen",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
             ) as r:
                 result["status"] = r.status_code
                 result["body"] = b"".join(r.iter_bytes())
@@ -1074,7 +1143,7 @@ def test_inflight_decremented_when_load_fails(monkeypatch):
     import arc_llama.server as server_mod
 
     class FailingRouter(FakeRouter):
-        async def ensure_active(self, query):
+        async def ensure_active(self, query, *, acquire: bool = False):
             raise RuntimeError("llama-server did not become healthy")
 
     monkeypatch.setattr(server_mod, "Router", FailingRouter)
@@ -1091,3 +1160,30 @@ def test_inflight_decremented_when_load_fails(monkeypatch):
     assert response.status_code == 503
     _wait_drained(app.state.router)
     assert app.state.router.inflight == 0
+
+
+class ColdStartBackend(FakeBackend):
+    """Process alive, health check not yet passed — a cold start in progress."""
+
+    ready = False
+
+
+def test_health_does_not_report_cold_start_as_loaded(monkeypatch):
+    """A subprocess that exists but has not passed its health check is not
+    'loaded': during a cold start or a crash-respawn the port is not serving,
+    and dashboards or scripts gating on this field would act on a lie."""
+    import arc_llama.server as server_mod
+
+    monkeypatch.setattr(server_mod, "Router", FakeRouter)
+    monkeypatch.setattr(server_mod, "UpstreamManager", FakeUpstreamManager)
+    # Explicit token-less config: the autouse isolated-config fixture generates
+    # an admin token, which would 401 the /admin/status call below.
+    app = create_app(Config(server=ServerConfig(admin_token=None)))
+
+    with TestClient(app) as client:
+        app.state.router._servers["qwen"] = ColdStartBackend()
+        health = client.get("/health").json()
+        assert health["loaded_models"] == [], "cold-starting model reported as loaded"
+        status = client.get("/admin/status").json()
+        entry = next(m for m in status["models"] if m["name"] == "qwen")
+        assert entry["loaded"] is False

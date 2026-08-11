@@ -36,6 +36,7 @@ parallel         = 1
 extra_flags      = ["--reasoning", "off"]
 ```
 """
+
 from __future__ import annotations
 
 import logging
@@ -50,9 +51,11 @@ import tomli_w
 
 if sys.version_info >= (3, 11):
     import tomllib  # noqa: F401
+
     _toml_load = tomllib.load  # type: ignore[attr-defined]
 else:
     import tomli  # type: ignore[import-not-found]
+
     _toml_load = tomli.load
 
 from arc_llama.arch import Arch, Backend
@@ -69,17 +72,13 @@ def _xdg_config_home() -> Path:
 
 def _xdg_data_home() -> Path:
     if sys.platform == "win32":
-        return Path(
-            os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
-        )
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 
 
 def _xdg_state_home() -> Path:
     if sys.platform == "win32":
-        return Path(
-            os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
-        )
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
 
 
@@ -123,6 +122,7 @@ class UpstreamConfig:
     tag. When a request targets an upstream model, arc-llama proxies it to
     the upstream instead of starting a local llama-server.
     """
+
     url: str
     """Base URL of the upstream, e.g. 'http://127.0.0.1:11435' or 'http://192.168.1.50:8080'."""
     name: str = ""
@@ -240,10 +240,10 @@ class GPUConfig:
 
 @dataclass
 class ModelConfig:
-    name: str                  # short id, also URL-safe (e.g. "qwen3.6-27b")
-    path: str                  # absolute path to the GGUF
-    port: int                  # backend port for this model's llama-server
-    gpu_pci_slot: str          # which detected GPU to bind to
+    name: str  # short id, also URL-safe (e.g. "qwen3.6-27b")
+    path: str  # absolute path to the GGUF
+    port: int  # backend port for this model's llama-server
+    gpu_pci_slot: str  # which detected GPU to bind to
     display_name: str = ""
     kv_class: str = "default"  # used for VRAM estimation
     recipe: dict[str, Any] = field(default_factory=dict)
@@ -280,7 +280,9 @@ class ModelConfig:
             no_mmap=bool(r.get("no_mmap", False)),
             mlock=bool(r.get("mlock", False)),
             n_cpu_moe=r.get("n_cpu_moe"),
-            override_tensor=list(r.get("override_tensor", [])) if r.get("override_tensor") else None,
+            override_tensor=list(r.get("override_tensor", []))
+            if r.get("override_tensor")
+            else None,
             extra_flags=list(r.get("extra_flags", [])),
         )
 
@@ -323,9 +325,7 @@ class Config:
             return self.agent.profile
         return None
 
-    def active_mcp_servers(
-        self, profile_name: str | None = None
-    ) -> list[MCPServerConfig]:
+    def active_mcp_servers(self, profile_name: str | None = None) -> list[MCPServerConfig]:
         """Return MCP servers that belong to the active profile.
 
         If no profile is active, all configured servers are returned. Unknown
@@ -405,10 +405,75 @@ class Config:
         return _strip_none(d)
 
     def save(self, path: Path | None = None) -> Path:
+        """Persist the config, atomically.
+
+        Writing in place with ``open(path, "wb")`` truncates first, so any
+        failure between that and the last byte -- a full disk, a kill, an
+        exception raised while serialising -- left a truncated file behind.
+        That is not a hypothetical corner: the surviving fragment is usually
+        still *valid TOML*, so the next start loads it without complaint and
+        the user silently comes up with no models, no GPUs and no admin token.
+        A visible crash would be kinder than that.
+
+        Write to a temporary file beside the target, fsync it, then rename
+        over the original. Rename is atomic, so a reader either sees the whole
+        old file or the whole new one and never a partial write.
+
+        The file carries ``server.admin_token``, so it is created 0600 and
+        chmod'ed before the rename rather than after: it must never be
+        briefly readable by other users under its final name.
+        """
         path = path or default_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            tomli_w.dump(self.to_toml_dict(), f)
+
+        # The directory holds the admin token too, so keep it private. Belt and
+        # braces with the 0600 below: it survives the file's mode being lost.
+        if os.name != "nt":
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                logging.getLogger("arc_llama.config").debug(
+                    "could not chmod config directory", exc_info=True
+                )
+
+        # Same directory, so the rename stays on one filesystem and is atomic.
+        # The random suffix keeps two writers from picking the same scratch
+        # name; pid alone is not enough, since a single process can save from
+        # more than one thread.
+        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        try:
+            with open(tmp, "wb") as f:
+                tomli_w.dump(self.to_toml_dict(), f)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                # Windows and some filesystems have limited chmod. Not fatal.
+                logging.getLogger("arc_llama.config").debug(
+                    "could not chmod config temp file", exc_info=True
+                )
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+        # Best-effort durability for the rename itself. POSIX only: opening a
+        # directory for fsync is not permitted on Windows.
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                logging.getLogger("arc_llama.config").debug(
+                    "could not fsync config directory", exc_info=True
+                )
         return path
 
 
@@ -552,19 +617,34 @@ def _resolve_admin_token(cfg: Config, path: Path, *, persist: bool) -> None:
     if cfg.server.admin_token:
         return
     cfg.server.admin_token = secrets.token_urlsafe(32)
-    if persist:
-        try:
-            cfg.save(path)
-        except OSError as exc:
-            logging.getLogger("arc_llama.config").warning(
-                "No admin_token was configured -- generated one but could not "
-                "save it to %s: %s. The token is in-memory only for this run; "
-                "admin endpoints and auto_confirm agent runs will use a new "
-                "token after restart. Set ARC_LLAMA_ADMIN_TOKEN to use your "
-                "own token without persisting it to disk.",
-                path, exc,
-            )
-            return
+    if not persist:
+        # Callers pass persist=False when no config file exists yet. The old
+        # message claimed the token was "saved to <path>" on this branch too,
+        # sending users hunting for a file that was never written -- and hiding
+        # that the token rotates on every restart until one is configured.
+        logging.getLogger("arc_llama.config").warning(
+            "No admin_token was configured -- generated an in-memory one for "
+            "this run only (no config file exists at %s, so nothing was "
+            "saved). Admin endpoints and auto_confirm agent runs require an "
+            "'Authorization: Bearer <token>' header, and the token changes on "
+            "every restart until one is persisted. Set ARC_LLAMA_ADMIN_TOKEN "
+            "or create a config to pin it.",
+            path,
+        )
+        return
+    try:
+        cfg.save(path)
+    except OSError as exc:
+        logging.getLogger("arc_llama.config").warning(
+            "No admin_token was configured -- generated one but could not "
+            "save it to %s: %s. The token is in-memory only for this run; "
+            "admin endpoints and auto_confirm agent runs will use a new "
+            "token after restart. Set ARC_LLAMA_ADMIN_TOKEN to use your "
+            "own token without persisting it to disk.",
+            path,
+            exc,
+        )
+        return
     logging.getLogger("arc_llama.config").warning(
         "No admin_token was configured -- generated one and saved it to %s. "
         "Admin endpoints and auto_confirm agent runs now require an "
@@ -594,9 +674,16 @@ def load_config(path: Path | None = None) -> Config:
         agent=AgentConfig(**_filter_fields(AgentConfig, top.get("agent", {}))),
         gpus=[GPUConfig(**_filter_fields(GPUConfig, g)) for g in top.get("gpus", [])],
         models=[ModelConfig(**_filter_fields(ModelConfig, m)) for m in top.get("models", [])],
-        upstreams=[UpstreamConfig(**_filter_fields(UpstreamConfig, u)) for u in top.get("upstreams", [])],
-        mcp_servers=[MCPServerConfig(**_filter_fields(MCPServerConfig, s)) for s in top.get("mcp_servers", [])],
-        profiles=[ProfileConfig(**_filter_fields(ProfileConfig, p)) for p in top.get("profiles", [])],
+        upstreams=[
+            UpstreamConfig(**_filter_fields(UpstreamConfig, u)) for u in top.get("upstreams", [])
+        ],
+        mcp_servers=[
+            MCPServerConfig(**_filter_fields(MCPServerConfig, s))
+            for s in top.get("mcp_servers", [])
+        ],
+        profiles=[
+            ProfileConfig(**_filter_fields(ProfileConfig, p)) for p in top.get("profiles", [])
+        ],
     )
     _resolve_admin_token(cfg, path, persist=True)
     return cfg

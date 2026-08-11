@@ -8,6 +8,7 @@ entrypoint: walk a few directories, infer reasonable recipes from filename
 heuristics, and register everything found. Users on a fresh box should never
 need to type `arc-llama add` for a GGUF they already have on disk.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,7 +22,13 @@ from arc_llama.config import (
     Config,
     ModelConfig,
 )
-from arc_llama.gguf_meta import has_mtp_heads, is_moe, read_gguf_meta, trained_context_length
+from arc_llama.gguf_meta import (
+    has_mtp_heads,
+    is_hybrid_ssm,
+    is_moe,
+    read_gguf_meta,
+    trained_context_length,
+)
 from arc_llama.recipes import default_recipe, recipe_to_dict
 
 log = logging.getLogger("arc_llama.models")
@@ -59,18 +66,18 @@ def _suggest_moe_offload(
     n = min_moe_offload_layers(probe, vram_mb)
     return n if n and n > 0 else None
 
+
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-HF_SPEC_RE = re.compile(
-    r"^(?P<repo>[^@:\s/]+/[^@:\s/]+)(?::(?P<file>[^@\s]+))?$"
-)
+HF_SPEC_RE = re.compile(r"^(?P<repo>[^@:\s/]+/[^@:\s/]+)(?::(?P<file>[^@\s]+))?$")
 
 
 @dataclass
 class HFModelSpec:
     """Parsed user input like `unsloth/gemma-4-31B-it-GGUF:Q4_K_M`."""
+
     repo: str
     file: str | None  # exact filename; if None, we glob the repo for a match
-    quant: str | None # short hint like "Q4_K_M", used when file is None
+    quant: str | None  # short hint like "Q4_K_M", used when file is None
 
 
 def parse_hf_spec(spec: str) -> HFModelSpec:
@@ -131,9 +138,7 @@ def add_local_model(
     Picks a recipe based on the bound GPU's arch and VRAM, then applies any overrides.
     """
     if not NAME_RE.match(name):
-        raise ValueError(
-            f"Model name '{name}' must match [a-z0-9][a-z0-9._-]*"
-        )
+        raise ValueError(f"Model name '{name}' must match [a-z0-9][a-z0-9._-]*")
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Model file not found: {p}")
@@ -156,6 +161,7 @@ def add_local_model(
         raise ValueError(f"Model name '{name}' already registered.")
     # Build a recipe that fits this GPU.
     from arc_llama.arch import Arch, Backend
+
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     trained_ctx = trained_context_length(p)
@@ -172,13 +178,26 @@ def add_local_model(
     # Measured B60/Qwen3.6-27B-MTP: draft-mtp n_max 1–4 ≈ +20% gen vs none;
     # n_max 5–6 regresses. Pin n_max=3 (llama default / mid of the good band).
     if has_mtp_heads(p):
-        recipe_dict["spec_type"] = "draft-mtp"
-        recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
-        log.info(
-            "model %s has embedded MTP heads; auto-enabling spec_type=draft-mtp "
-            "spec_draft_n_max=%d (B60 measured band 1–4)",
-            name, DEFAULT_SPEC_DRAFT_N_MAX,
-        )
+        if is_hybrid_ssm(p):
+            # Hybrid SSM+attention families (qwen35*) carry MTP heads but are
+            # documented right on is_hybrid_ssm() as performing poorly with
+            # SYCL MTP speculative decoding on Xe2 — enabling it here would
+            # auto-configure a known regression. Leave spec_type unset; the
+            # user can still opt in per model.
+            log.info(
+                "model %s has MTP heads but is a hybrid SSM architecture; "
+                "NOT auto-enabling draft-mtp (known slow on Xe2)",
+                name,
+            )
+        else:
+            recipe_dict["spec_type"] = "draft-mtp"
+            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+            log.info(
+                "model %s has embedded MTP heads; auto-enabling spec_type=draft-mtp "
+                "spec_draft_n_max=%d (B60 measured band 1–4)",
+                name,
+                DEFAULT_SPEC_DRAFT_N_MAX,
+            )
     else:
         draft = find_draft_model(p)
         if draft is not None:
@@ -189,7 +208,9 @@ def add_local_model(
             log.info(
                 "model %s: found sidecar draft %s; auto-enabling draft-mtp "
                 "with --spec-draft-model (spec_draft_n_max=%d)",
-                name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+                name,
+                draft.name,
+                DEFAULT_SPEC_DRAFT_N_MAX,
             )
     # Suggest MoE expert offload when the estimated footprint needs it.
     if is_moe(p):
@@ -203,7 +224,8 @@ def add_local_model(
             recipe_dict["n_cpu_moe"] = n_cpu
             log.info(
                 "model %s is MoE; offloading expert tensors of %d layer(s) to CPU",
-                name, n_cpu,
+                name,
+                n_cpu,
             )
         else:
             log.debug(
@@ -240,7 +262,12 @@ _KV_CLASS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"qwen[\W_-]*2[.\W_-]*5", re.IGNORECASE), "qwen2_5"),
     (re.compile(r"qwen[\W_-]*3[.\W_-]*6?[\W_-]*27b(?!.*a3b)", re.IGNORECASE), "qwen3_dense"),
     (re.compile(r"qwen[\W_-]*3(?!.*a3b)(?!.*moe)", re.IGNORECASE), "qwen3_dense"),
-    (re.compile(r"(qwen[\W_-]*3.*a3b|qwen[\W_-]*3.*moe|carnice|huihui.*30b.*a3b)", re.IGNORECASE), "moe_a3b"),
+    (
+        re.compile(
+            r"(qwen[\W_-]*3.*a3b|qwen[\W_-]*3.*moe|carnice|huihui.*30b.*a3b)", re.IGNORECASE
+        ),
+        "moe_a3b",
+    ),
 ]
 
 # Common quant tier markers that look good in display names.
@@ -401,8 +428,9 @@ def short_name_from_path(path: Path, used: set[str]) -> str:
     base = re.sub(r"[._-](gguf|imatrix)$", "", base)
     if not base or not NAME_RE.match(base):
         # Last-ditch fallback — parent dir + stem.
-        base = re.sub(r"[^a-z0-9._-]+", "-",
-                      f"{path.parent.name.lower()}-{path.stem.lower()}").strip("-")
+        base = re.sub(
+            r"[^a-z0-9._-]+", "-", f"{path.parent.name.lower()}-{path.stem.lower()}"
+        ).strip("-")
     if not base:
         base = "model"
     if base not in used:
@@ -503,6 +531,7 @@ def register_discovered(
     if gpu is None:
         raise ValueError(f"Unknown GPU: {gpu_pci_slot}")
     from arc_llama.arch import Arch, Backend
+
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
     existing_paths = {Path(m.path).resolve() for m in cfg.models}
@@ -535,12 +564,23 @@ def register_discovered(
         # Auto-enable draft-mtp for discovered models that carry MTP heads.
         # n_max=3 pinned from B60 measurements (see bench_results/SUMMARY.md).
         if has_mtp_heads(rp):
-            recipe_dict["spec_type"] = "draft-mtp"
-            recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
-            log.info(
-                "discovered %s has embedded MTP heads; auto-enabling draft-mtp n_max=%d",
-                rp.name, DEFAULT_SPEC_DRAFT_N_MAX,
-            )
+            if is_hybrid_ssm(rp):
+                # Same guard as add_local_model: hybrid SSM + SYCL MTP is a
+                # documented regression on Xe2, so discovery must not
+                # auto-enable it either.
+                log.info(
+                    "discovered %s has MTP heads but is a hybrid SSM architecture; "
+                    "NOT auto-enabling draft-mtp (known slow on Xe2)",
+                    rp.name,
+                )
+            else:
+                recipe_dict["spec_type"] = "draft-mtp"
+                recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
+                log.info(
+                    "discovered %s has embedded MTP heads; auto-enabling draft-mtp n_max=%d",
+                    rp.name,
+                    DEFAULT_SPEC_DRAFT_N_MAX,
+                )
         else:
             draft = find_draft_model(rp)
             if draft is not None:
@@ -550,7 +590,9 @@ def register_discovered(
                 recipe_dict["spec_draft_n_max"] = DEFAULT_SPEC_DRAFT_N_MAX
                 log.info(
                     "discovered %s: sidecar draft %s; auto-enabling draft-mtp n_max=%d",
-                    rp.name, draft.name, DEFAULT_SPEC_DRAFT_N_MAX,
+                    rp.name,
+                    draft.name,
+                    DEFAULT_SPEC_DRAFT_N_MAX,
                 )
         # Suggest MoE expert offload when the estimated footprint needs it.
         if is_moe(rp):
@@ -564,7 +606,8 @@ def register_discovered(
                 recipe_dict["n_cpu_moe"] = n_cpu
                 log.info(
                     "discovered %s is MoE; offloading expert tensors of %d layer(s) to CPU",
-                    rp.name, n_cpu,
+                    rp.name,
+                    n_cpu,
                 )
             else:
                 log.debug(
@@ -593,7 +636,11 @@ def register_discovered(
         existing_paths.add(rp)
         log.info(
             "discovered %s → %s (kv=%s, ctx=%d, port=%d)",
-            rp.name, name, kv_class, recipe.ctx, port,
+            rp.name,
+            name,
+            kv_class,
+            recipe.ctx,
+            port,
         )
     return added
 
@@ -624,10 +671,7 @@ def download_from_hf(
     file = spec.file
     if file is None:
         api = HfApi(token=token)
-        files = [
-            f for f in api.list_repo_files(spec.repo)
-            if f.endswith(".gguf")
-        ]
+        files = [f for f in api.list_repo_files(spec.repo) if f.endswith(".gguf")]
         if spec.quant:
             ql = spec.quant.lower()
             matches = [f for f in files if ql in f.lower()]
@@ -646,9 +690,11 @@ def download_from_hf(
                 f"Repo {spec.repo} has {len(files)} GGUF files; specify one with "
                 f"`{spec.repo}:<filename>` or `{spec.repo}:Q4_K_M`."
             )
-    return Path(hf_hub_download(
-        repo_id=spec.repo,
-        filename=file,
-        local_dir=str(target_dir),
-        token=token,
-    ))
+    return Path(
+        hf_hub_download(
+            repo_id=spec.repo,
+            filename=file,
+            local_dir=str(target_dir),
+            token=token,
+        )
+    )

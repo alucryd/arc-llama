@@ -20,6 +20,7 @@ experimental and only appear when ARC_LLAMA_EXPERIMENTAL_AGENT=1 is set.
 A small static web UI is bundled and served at `/` on the same port as
 `arc-llama serve` — open it in a browser for a model-picker + load/stop view.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -142,11 +143,14 @@ def _resolve_llama_server(explicit: str | None) -> str:
 # Top-level group
 # ===========================================================================
 
+
 @click.group()
 @click.version_option(__version__)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging.")
 @click.option(
-    "-c", "--config", "config_path",
+    "-c",
+    "--config",
+    "config_path",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Path to config.toml (default: $XDG_CONFIG_HOME/arc-llama/config.toml).",
@@ -217,11 +221,15 @@ def _gather_workload_profile(
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing config.")
 @click.option(
-    "--scan/--no-scan", default=True,
+    "--scan/--no-scan",
+    default=True,
     help="After init, walk scan paths for .gguf files and auto-register them (default: on).",
 )
 @click.option(
-    "--scan-path", "scan_paths", multiple=True, type=click.Path(),
+    "--scan-path",
+    "scan_paths",
+    multiple=True,
+    type=click.Path(),
     help="Extra directory to walk for GGUFs. Repeatable.",
 )
 @click.option(
@@ -229,21 +237,21 @@ def _gather_workload_profile(
     type=click.Choice(["short", "long", "very_long", "not-sure"]),
     default=None,
     help="Typical conversation length: short (<8k), long (~32k), very_long (100k+). "
-         "'not-sure' keeps the default.",
+    "'not-sure' keeps the default.",
 )
 @click.option(
     "--workload-style",
     type=click.Choice(["agentic", "conversational", "not-sure"]),
     default=None,
     help="Mostly agentic tool-calling loops, or mostly conversational chat. "
-         "'not-sure' keeps the default.",
+    "'not-sure' keeps the default.",
 )
 @click.option(
     "--workload-priority",
     type=click.Choice(["first_token", "throughput", "not-sure"]),
     default=None,
     help="What hurts more: waiting for the first token, or the speed after it "
-         "starts. 'not-sure' keeps the default.",
+    "starts. 'not-sure' keeps the default.",
 )
 @click.pass_context
 def init(
@@ -298,9 +306,7 @@ def init(
                 f"ensure it supports the GPUs you configured.[/yellow]"
             )
         else:
-            console.print(
-                f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]"
-            )
+            console.print(f"[dim]Detected llama-server backend: {bin_backend.value}[/dim]")
 
     cfg = init_config_from_detection(
         gpus, llama_server_path=None if runtime_missing else server_path
@@ -335,6 +341,7 @@ def init(
 # doctor
 # ===========================================================================
 
+
 def _doctor_marker(ok: bool | None, severity: str = "info") -> str:
     if ok is True:
         return "[green]ok[/green]"
@@ -363,9 +370,7 @@ def doctor(ctx: click.Context) -> None:
     # Kernel + driver (Linux-only diagnostics)
     if _IS_WINDOWS:
         console.print(f"  platform:      Windows {platform.release()}")
-        console.print(
-            "  [dim]Kernel/driver checks are not available on Windows.[/dim]"
-        )
+        console.print("  [dim]Kernel/driver checks are not available on Windows.[/dim]")
     else:
         uname = platform.uname()
         console.print(f"  kernel:        {uname.release}")
@@ -396,8 +401,7 @@ def doctor(ctx: click.Context) -> None:
         for g in gpus:
             vram = f"{g.vram_gb} GB" if g.vram_gb else "VRAM unknown"
             console.print(
-                f"    - {g.name} @ {g.pci_slot}  ({g.arch.value}, "
-                f"driver={g.driver or '—'}, {vram})"
+                f"    - {g.name} @ {g.pci_slot}  ({g.arch.value}, driver={g.driver or '—'}, {vram})"
             )
             if g.notes:
                 for n in g.notes:
@@ -426,9 +430,7 @@ def doctor(ctx: click.Context) -> None:
                         "Without it llama.cpp falls back to slow paths on Arc.",
                     )
                 else:
-                    console.print(
-                        f"        ReBAR:   {_doctor_marker(None)}  largest BAR {bar_txt}"
-                    )
+                    console.print(f"        ReBAR:   {_doctor_marker(None)}  largest BAR {bar_txt}")
                     report.add("rebar", None, f"{g.pci_slot} BAR {bar_txt}")
             # Battlemage wants a recent kernel
             if g.arch == Arch.BATTLEMAGE and not _IS_WINDOWS:
@@ -505,11 +507,7 @@ def doctor(ctx: click.Context) -> None:
                 ok,
                 needed,
                 severity="warn" if not ok else "info",
-                hint=(
-                    "sudo usermod -aG render,video $USER && re-login"
-                    if not ok
-                    else ""
-                ),
+                hint=("sudo usermod -aG render,video $USER && re-login" if not ok else ""),
             )
         if not all(membership.values()):
             console.print(
@@ -543,9 +541,7 @@ def doctor(ctx: click.Context) -> None:
         if llama_server.exists():
             backends = detect_backends(llama_server)
             primary = detect_llama_server_backend(llama_server)
-            backend_list = (
-                ", ".join(sorted(b.value for b in backends)) if backends else "unknown"
-            )
+            backend_list = ", ".join(sorted(b.value for b in backends)) if backends else "unknown"
             console.print(f"    path:        {llama_server}")
             console.print(f"    backends:    {backend_list}")
             if primary is None:
@@ -605,8 +601,7 @@ def doctor(ctx: click.Context) -> None:
                 )
     else:
         console.print(
-            f"    [yellow]missing[/yellow] at {config_path} — run "
-            f"[bold]arc-llama init[/bold]."
+            f"    [yellow]missing[/yellow] at {config_path} — run [bold]arc-llama init[/bold]."
         )
         report.add(
             "config",
@@ -624,9 +619,7 @@ def doctor(ctx: click.Context) -> None:
         console.print("    [green]all checked gates look good[/green]")
     else:
         for c in fails + warns:
-            console.print(
-                f"    {_doctor_marker(c.ok, c.severity)}  {c.name}: {c.detail}"
-            )
+            console.print(f"    {_doctor_marker(c.ok, c.severity)}  {c.name}: {c.detail}")
             if c.hint:
                 console.print(f"        → {c.hint}")
     if fails:
@@ -637,6 +630,7 @@ def doctor(ctx: click.Context) -> None:
 # ===========================================================================
 # gpus
 # ===========================================================================
+
 
 @cli.command("gpus")
 def gpus_cmd() -> None:
@@ -673,16 +667,14 @@ def _print_gpu_table(gpus) -> None:
 # list
 # ===========================================================================
 
+
 @cli.command("list")
 @click.pass_context
 def list_models(ctx: click.Context) -> None:
     """List registered models and which one is currently loaded."""
     cfg = load_config(ctx.obj["config_path"])
     if not cfg.models:
-        console.print(
-            "[yellow]No models registered. "
-            "Run [bold]arc-llama add ...[/bold].[/yellow]"
-        )
+        console.print("[yellow]No models registered. Run [bold]arc-llama add ...[/bold].[/yellow]")
         return
 
     loaded: set[str] = set()
@@ -712,7 +704,7 @@ def list_models(ctx: click.Context) -> None:
     table.add_column("Path")
     for m in cfg.models:
         recipe = m.recipe or {}
-        kv = f"{recipe.get('cache_type_k','f16')}/{recipe.get('cache_type_v','f16')}"
+        kv = f"{recipe.get('cache_type_k', 'f16')}/{recipe.get('cache_type_v', 'f16')}"
         spec = recipe.get("spec_type", "—")
         if recipe.get("ubatch_size"):
             spec += f" (ub={recipe['ubatch_size']})"
@@ -741,59 +733,88 @@ def list_models(ctx: click.Context) -> None:
 # add
 # ===========================================================================
 
+
 @cli.command("add")
 @click.argument("source")
 @click.option("--name", default=None, help="Short name (default: derived from source).")
 @click.option(
-    "--gpu", "gpu_pci_slot", default=None,
+    "--gpu",
+    "gpu_pci_slot",
+    default=None,
     help="PCI slot of the GPU to bind to (default: first enabled GPU).",
 )
 @click.option(
-    "--backend", "backend", default=None,
+    "--backend",
+    "backend",
+    default=None,
     type=click.Choice([Backend.SYCL.value, Backend.VULKAN.value]),
     help="Compute backend for this GPU (default: the GPU's configured backend, usually sycl).",
 )
 @click.option(
-    "--port", type=int, default=None,
+    "--port",
+    type=int,
+    default=None,
     help="Backend port for this model's llama-server (default: auto).",
 )
 @click.option("--ctx", "ctx_override", type=int, default=None, help="Override context length.")
 @click.option(
-    "--kv", "kv_type", type=click.Choice(["f16", "q8_0", "q5_1", "q4_0"]),
+    "--kv",
+    "kv_type",
+    type=click.Choice(["f16", "q8_0", "q5_1", "q4_0"]),
     default=None,
     help="Override KV cache type (applies to both K and V).",
 )
 @click.option("--display-name", default="", help="Human-friendly name.")
 @click.option(
     "--kv-class",
-    type=click.Choice([
-        "default", "moe_a3b", "qwen3_dense", "qwen3_27b_dense",
-        "qwen2_5", "gemma_swa", "phi4", "llama3", "deepseek_r1_distill",
-    ]),
+    type=click.Choice(
+        [
+            "default",
+            "moe_a3b",
+            "qwen3_dense",
+            "qwen3_27b_dense",
+            "qwen2_5",
+            "gemma_swa",
+            "phi4",
+            "llama3",
+            "deepseek_r1_distill",
+        ]
+    ),
     default="default",
     help="KV-class hint, used for VRAM estimation.",
 )
 @click.option("--alias", "aliases", multiple=True, help="Extra match strings (repeatable).")
 @click.option(
-    "--spec-type", "spec_type", default=None,
+    "--spec-type",
+    "spec_type",
+    default=None,
     help="Speculative decoding type (e.g. draft-mtp). Auto-detected for models "
-         "with embedded MTP heads or a sidecar draft GGUF.",
+    "with embedded MTP heads or a sidecar draft GGUF.",
 )
 @click.option(
-    "--spec-draft-model", "spec_draft_model", default=None,
+    "--spec-draft-model",
+    "spec_draft_model",
+    default=None,
     help="Path to a sidecar speculative-draft GGUF (--spec-draft-model). "
-         "Auto-detected from a sibling mtp-/draft- file when present.",
+    "Auto-detected from a sibling mtp-/draft- file when present.",
 )
 @click.option(
-    "--spec-draft-ngl", "spec_draft_ngl", type=int, default=None,
+    "--spec-draft-ngl",
+    "spec_draft_ngl",
+    type=int,
+    default=None,
     help="GPU layers for the draft model (--spec-draft-ngl); default 999.",
 )
 @click.option(
-    "--ubatch-size", "ubatch_size", type=int, default=None,
+    "--ubatch-size",
+    "ubatch_size",
+    type=int,
+    default=None,
     help="Ubatch size (-ub). Left unset by default; llama.cpp picks its own.",
 )
 @click.option(
-    "--from-hf", is_flag=True,
+    "--from-hf",
+    is_flag=True,
     help="Treat SOURCE as a Hugging Face spec (`org/repo` or `org/repo:Q4_K_M`).",
 )
 @click.option("--hf-token", default=None, help="HF token for gated repos.")
@@ -915,6 +936,7 @@ def add(
 
 def _slugify_for_name(parent: str, file: str) -> str:
     import re
+
     base = parent.lower()
     base = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-")
     if not base:
@@ -929,6 +951,7 @@ def _slugify_for_name(parent: str, file: str) -> str:
 # scan
 # ===========================================================================
 
+
 def _do_scan(cfg: Config, extra_paths: list[Path]) -> list:
     found = discover_ggufs(cfg, extra_paths=extra_paths)
     if not found:
@@ -939,11 +962,14 @@ def _do_scan(cfg: Config, extra_paths: list[Path]) -> list:
 @cli.command("scan")
 @click.argument("paths", nargs=-1, type=click.Path(exists=True, file_okay=False))
 @click.option(
-    "--gpu", "gpu_pci_slot", default=None,
+    "--gpu",
+    "gpu_pci_slot",
+    default=None,
     help="Bind newly discovered models to this PCI slot (default: first enabled GPU).",
 )
 @click.option(
-    "--persist/--no-persist", default=True,
+    "--persist/--no-persist",
+    default=True,
     help="Save the resulting config to disk (default: on). Disable for a dry-run.",
 )
 @click.pass_context
@@ -963,9 +989,7 @@ def scan_cmd(
     found = discover_ggufs(cfg, extra_paths=extras)
     if not found:
         scanned = [cfg.paths.models_dir, *cfg.paths.scan_paths, *paths]
-        console.print(
-            "[yellow]No GGUFs found.[/yellow] Scanned: " + ", ".join(scanned)
-        )
+        console.print("[yellow]No GGUFs found.[/yellow] Scanned: " + ", ".join(scanned))
         return
     try:
         added = register_discovered(cfg, found, gpu_pci_slot=gpu_pci_slot)
@@ -973,15 +997,12 @@ def scan_cmd(
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
     if not added:
-        console.print(
-            f"[dim]Found {len(found)} GGUF(s); all already registered.[/dim]"
-        )
+        console.print(f"[dim]Found {len(found)} GGUF(s); all already registered.[/dim]")
         return
     if persist:
         _save_or_die(cfg, cfg_path)
     console.print(
-        f"[green]Registered {len(added)} new model(s):[/green] "
-        + ", ".join(m.name for m in added)
+        f"[green]Registered {len(added)} new model(s):[/green] " + ", ".join(m.name for m in added)
     )
     if not persist:
         console.print("[dim]--no-persist: config NOT saved.[/dim]")
@@ -990,6 +1011,7 @@ def scan_cmd(
 # ===========================================================================
 # remove
 # ===========================================================================
+
 
 @cli.command("remove")
 @click.argument("name")
@@ -1012,7 +1034,9 @@ def remove(ctx: click.Context, name: str) -> None:
 def _print_autotune_banner(cfg: Config) -> None:
     """Tell the operator whether background tuning is active and how to disable it."""
     if not getattr(cfg, "tune", None) or not cfg.tune.auto:
-        console.print("[dim]Auto-tune: off (use --auto-tune or set [tune] auto=true to enable).[/dim]")
+        console.print(
+            "[dim]Auto-tune: off (use --auto-tune or set [tune] auto=true to enable).[/dim]"
+        )
         return
     untuned_count = sum(1 for m in cfg.models if m.tune_state in ("untuned", "skipped"))
     if untuned_count:
@@ -1026,6 +1050,7 @@ def _print_autotune_banner(cfg: Config) -> None:
 
 
 # ===========================================================================
+
 
 def _print_tune_status_table(cfg: Config) -> None:
     """Print the per-model tune state for `arc-llama tune --status`."""
@@ -1042,7 +1067,9 @@ def _print_tune_status_table(cfg: Config) -> None:
         if m.tuned_at:
             from datetime import datetime, timezone
 
-            tuned_at = datetime.fromtimestamp(m.tuned_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            tuned_at = datetime.fromtimestamp(m.tuned_at, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
         table.add_row(
             m.name,
             m.tune_state,
@@ -1093,9 +1120,7 @@ def _print_serve_banner(cfg: Config) -> None:
                 elif a == Arch.ALCHEMIST:
                     aot = "acm-g10"
             if aot is not None:
-                parts.append(
-                    f"JIT cold-start ~20s (AOT: -DGGML_SYCL_DEVICE_ARCH={aot})"
-                )
+                parts.append(f"JIT cold-start ~20s (AOT: -DGGML_SYCL_DEVICE_ARCH={aot})")
             else:
                 parts.append("JIT cold-start")
         console.print("  " + " · ".join(parts))
@@ -1127,12 +1152,16 @@ def _print_serve_banner(cfg: Config) -> None:
     ),
 )
 @click.option(
-    "--scan/--no-scan", "scan", default=True,
+    "--scan/--no-scan",
+    "scan",
+    default=True,
     help="Auto-register any new GGUFs found in models_dir/scan_paths on startup "
-         "(default: on). Drop a model in and it just appears.",
+    "(default: on). Drop a model in and it just appears.",
 )
 @click.option(
-    "--auto-tune/--no-auto-tune", "auto_tune", default=None,
+    "--auto-tune/--no-auto-tune",
+    "auto_tune",
+    default=None,
     help="Enable background auto-tuning (default: from config tune.auto).",
 )
 @click.pass_context
@@ -1204,6 +1233,7 @@ def serve(
         console.print("[red]uvicorn not installed.[/red]")
         sys.exit(1)
     from arc_llama.server import create_app
+
     app = create_app(cfg, config_path=ctx.obj["config_path"])
 
     # Belt-and-suspenders for graceful shutdown: even if uvicorn's lifespan
@@ -1250,6 +1280,7 @@ def serve(
 # benchmark / tune
 # ===========================================================================
 
+
 def _server_url_from(ctx: click.Context, server_url: str | None) -> str:
     if server_url:
         return server_url.rstrip("/")
@@ -1260,32 +1291,43 @@ def _server_url_from(ctx: click.Context, server_url: str | None) -> str:
 @cli.command("benchmark")
 @click.argument("model")
 @click.option(
-    "--server", "server_url",
+    "--server",
+    "server_url",
     default=None,
     help="Base URL of a running `arc-llama serve` (default: http://HOST:PORT from config).",
 )
 @click.option(
-    "--prompt-tokens", "prompt_tokens",
-    type=int, default=benchmark_mod.DEFAULT_PROMPT_TOKENS, show_default=True,
+    "--prompt-tokens",
+    "prompt_tokens",
+    type=int,
+    default=benchmark_mod.DEFAULT_PROMPT_TOKENS,
+    show_default=True,
     help="Approximate prompt length to benchmark.",
 )
 @click.option(
-    "--gen-tokens", "gen_tokens",
-    type=int, default=benchmark_mod.DEFAULT_GEN_TOKENS, show_default=True,
+    "--gen-tokens",
+    "gen_tokens",
+    type=int,
+    default=benchmark_mod.DEFAULT_GEN_TOKENS,
+    show_default=True,
     help="Number of tokens to generate.",
 )
 @click.option(
-    "--sweep-ctx", "sweep_ctx",
+    "--sweep-ctx",
+    "sweep_ctx",
     default="",
     help="Comma-separated ctx values for a sweep (e.g. 4096,8192,16384).",
 )
 @click.option(
-    "--sweep-kv", "sweep_kv",
+    "--sweep-kv",
+    "sweep_kv",
     default="",
     help="Comma-separated KV types for a sweep (e.g. f16,q8_0,q4_0).",
 )
 @click.option(
-    "--kv", "kv_types", multiple=True,
+    "--kv",
+    "kv_types",
+    multiple=True,
     type=click.Choice(["f16", "q8_0", "q5_1", "q4_0"]),
     help="KV cache type(s) for --sweep-ctx (repeatable; default: f16 q8_0).",
 )
@@ -1325,7 +1367,8 @@ def benchmark_cmd(
         if ctx_values or kv_values:
             recipe = model_cfg.recipe or {}
             results = await benchmark_mod.benchmark_sweep(
-                url, model,
+                url,
+                model,
                 ctx_values=ctx_values or [recipe.get("ctx", 4096)],
                 kv_types=kv_values or [recipe.get("cache_type_k", "f16")],
                 prompt_tokens=prompt_tokens,
@@ -1338,7 +1381,8 @@ def benchmark_cmd(
                 benchmark_mod.print_sweep_table(results)
             return 1 if all(r.error for r in results) else 0
         result = await benchmark_mod.benchmark_model(
-            url, model,
+            url,
+            model,
             prompt_tokens=prompt_tokens,
             gen_tokens=gen_tokens,
             cfg=cfg,
@@ -1359,27 +1403,37 @@ def benchmark_cmd(
 @cli.command("tune")
 @click.argument("model", required=False)
 @click.option(
-    "--all", "all_models", is_flag=True,
+    "--all",
+    "all_models",
+    is_flag=True,
     help="Tune every registered model sequentially.",
 )
 @click.option(
-    "--server", "server_url", default=None,
+    "--server",
+    "server_url",
+    default=None,
     help="Base URL of a running `arc-llama serve` (default: http://HOST:PORT from config).",
 )
 @click.option(
-    "--target", type=click.Choice(["balanced", "generation", "prompt"]),
-    default="balanced", show_default=True,
+    "--target",
+    type=click.Choice(["balanced", "generation", "prompt"]),
+    default="balanced",
+    show_default=True,
     help="What to optimise: generation tok/s, prompt-eval tok/s, or both.",
 )
 @click.option("--prompt-tokens", type=int, default=1024, show_default=True)
 @click.option("--gen-tokens", type=int, default=128, show_default=True)
 @click.option(
-    "--apply/--dry-run", "apply_", default=True,
+    "--apply/--dry-run",
+    "apply_",
+    default=True,
     help="Write the winning config into the model's recipe (default) or restore the original.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables.")
 @click.option(
-    "--status", "status_only", is_flag=True,
+    "--status",
+    "status_only",
+    is_flag=True,
     help="Print the per-model tune state table and exit without measuring.",
 )
 @click.pass_context
@@ -1435,26 +1489,41 @@ def tune_cmd(
             def on_start(name: str, i: int, total: int) -> None:
                 console.print(f"[bold]\\[{i}/{total}] tuning {name}[/bold]")
 
-            reports = asyncio.run(tune_all(
-                url, model_names,
-                target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
-                apply=apply_, cfg=cfg, on_start=on_start,
-            ))
-            for r in reports:
-                if not r.error and not r.aborted:
-                    m = cfg.find_model(r.model)
-                    if m is not None:
-                        gpu = cfg.find_gpu(m.gpu_pci_slot)
-                        from arc_llama import __version__, workload
-                        fp = compute_fingerprint(
-                            m, cfg.paths.llama_server, gpu, __version__,
-                            workload.fingerprint_key(cfg.workload),
-                        )
-                        set_tuned_state(cfg, m, fp)
-            try:
-                cfg.save(ctx.obj["config_path"])
-            except OSError as e:
-                console.print(f"[yellow]Warning: failed to save tune state: {e}[/yellow]")
+            reports = asyncio.run(
+                tune_all(
+                    url,
+                    model_names,
+                    target=target,
+                    prompt_tokens=prompt_tokens,
+                    gen_tokens=gen_tokens,
+                    apply=apply_,
+                    cfg=cfg,
+                    on_start=on_start,
+                )
+            )
+            # Dry-run must leave tune state untouched: recording "tuned" with a
+            # matching fingerprint makes background auto-tune skip the model
+            # forever, turning a look-don't-touch run into a permanent opt-out.
+            if apply_:
+                for r in reports:
+                    if not r.error and not r.aborted:
+                        m = cfg.find_model(r.model)
+                        if m is not None:
+                            gpu = cfg.find_gpu(m.gpu_pci_slot)
+                            from arc_llama import __version__, workload
+
+                            fp = compute_fingerprint(
+                                m,
+                                cfg.paths.llama_server,
+                                gpu,
+                                __version__,
+                                workload.fingerprint_key(cfg.workload),
+                            )
+                            set_tuned_state(cfg, m, fp)
+                try:
+                    cfg.save(ctx.obj["config_path"])
+                except OSError as e:
+                    console.print(f"[yellow]Warning: failed to save tune state: {e}[/yellow]")
             if as_json:
                 click.echo(json.dumps([asdict(r) for r in reports], indent=2, default=str))
             else:
@@ -1464,22 +1533,33 @@ def tune_cmd(
         if cfg.find_model(model) is None:
             console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
             sys.exit(1)
-        report = asyncio.run(tune_model(
-            url, model,
-            target=target, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
-            apply=apply_, cfg=cfg,
-        ))
+        report = asyncio.run(
+            tune_model(
+                url,
+                model,
+                target=target,
+                prompt_tokens=prompt_tokens,
+                gen_tokens=gen_tokens,
+                apply=apply_,
+                cfg=cfg,
+            )
+        )
     except KeyboardInterrupt:
         console.print("[yellow]Tune interrupted.[/yellow]")
         sys.exit(130)
 
-    if not report.error and not report.aborted:
+    # Same dry-run guard as the --all branch above.
+    if apply_ and not report.error and not report.aborted:
         m = cfg.find_model(report.model)
         if m is not None:
             gpu = cfg.find_gpu(m.gpu_pci_slot)
             from arc_llama import __version__, workload
+
             fp = compute_fingerprint(
-                m, cfg.paths.llama_server, gpu, __version__,
+                m,
+                cfg.paths.llama_server,
+                gpu,
+                __version__,
                 workload.fingerprint_key(cfg.workload),
             )
             set_tuned_state(cfg, m, fp)
@@ -1498,6 +1578,7 @@ def tune_cmd(
 # ===========================================================================
 # install-runtime
 # ===========================================================================
+
 
 @cli.command("install-runtime")
 @click.option(
@@ -1555,10 +1636,7 @@ def install_runtime_cmd(ctx, backend, runtime_version, dest, set_default, force)
     from arc_llama.runtime import RuntimeInstallError, install_runtime
 
     cfg = load_config(ctx.obj["config_path"])
-    console.print(
-        f"[bold]Fetching {backend} llama-server[/bold] "
-        f"(llama.cpp {runtime_version}) ..."
-    )
+    console.print(f"[bold]Fetching {backend} llama-server[/bold] (llama.cpp {runtime_version}) ...")
 
     progress = Progress(
         TextColumn("[bold blue]Downloading"),
@@ -1614,11 +1692,13 @@ def install_runtime_cmd(ctx, backend, runtime_version, dest, set_default, force)
 # mtp-info
 # ===========================================================================
 
+
 @cli.command("mtp-info")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 def mtp_info_cmd(path: Path) -> None:
     """Inspect a GGUF file for MTP-relevant metadata."""
     from arc_llama.gguf_meta import mtp_info
+
     info = mtp_info(path)
     console.print(f"[bold]GGUF:[/bold] {info['path']}")
     console.print(f"  architecture:          {info['architecture']}")
@@ -1631,6 +1711,7 @@ def mtp_info_cmd(path: Path) -> None:
 # ===========================================================================
 # systemd
 # ===========================================================================
+
 
 @cli.command("systemd")
 @click.option("--service-name", default="arc-llama.service")
@@ -1674,6 +1755,7 @@ WantedBy=default.target
 # upstream
 # ===========================================================================
 
+
 @cli.group("upstream")
 def upstream_group() -> None:
     """Manage upstream OpenAI-compatible endpoints."""
@@ -1698,6 +1780,7 @@ def upstream_add(ctx: click.Context, name: str, url: str) -> None:
         console.print(f"[yellow]Upstream '{name}' already exists. Remove it first.[/yellow]")
         sys.exit(1)
     from arc_llama.config import UpstreamConfig
+
     cfg.upstreams.append(UpstreamConfig(name=name, url=url.rstrip("/")))
     _save_or_die(cfg, cfg_path)
     console.print(f"[green]Added upstream '{name}' at {url}[/green]")
@@ -1738,6 +1821,7 @@ def upstream_remove(ctx: click.Context, name: str) -> None:
 # ===========================================================================
 # agent
 # ===========================================================================
+
 
 def _state_dir_from_config(cfg: Config) -> Path | None:
     if cfg.paths.state_dir:
@@ -1854,9 +1938,7 @@ def agent_cmd(
 
     root_path = Path(root or cfg.agent.root).expanduser().resolve()
     state_dir = _state_dir_from_config(cfg)
-    chat_store = ChatStore(
-        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
-    )
+    chat_store = ChatStore(state_dir / "chats" if state_dir else Path(".arc_llama_chats"))
     checkpoint_store = CheckpointStore(
         state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
     )
@@ -1901,7 +1983,9 @@ def agent_cmd(
             if chat is not None:
                 chat.messages.extend(transcript)
                 chat_store.save(chat)
-                console.print(f"[dim]Transcript saved: chat {agent_chat.id} in folder '{folder or 'default'}'[/dim]")
+                console.print(
+                    f"[dim]Transcript saved: chat {agent_chat.id} in folder '{folder or 'default'}'[/dim]"
+                )
 
     try:
         asyncio.run(run())
@@ -1913,12 +1997,17 @@ def agent_cmd(
 # code (interactive agent REPL)
 # ===========================================================================
 
+
 @cli.command("code")
 @click.option("--model", "-m", required=True, help="Model id to use.")
 @click.option("--root", "-r", default=None, help="Project root (default: agent.root from config).")
 @click.option("--auto-confirm", is_flag=True, help="Do not prompt for tool confirmation.")
-@click.option("--plan-mode", is_flag=True, help="Generate a plan first and ask for approval each turn.")
-@click.option("--max-turns", type=int, default=30, help="Maximum agent turns per user message (default: 30).")
+@click.option(
+    "--plan-mode", is_flag=True, help="Generate a plan first and ask for approval each turn."
+)
+@click.option(
+    "--max-turns", type=int, default=30, help="Maximum agent turns per user message (default: 30)."
+)
 @click.option("--folder", "-f", default="", help="Folder to save the session transcript chat.")
 @click.option(
     "--profile",
@@ -1961,9 +2050,7 @@ def code_cmd(
 
     root_path = Path(root or cfg.agent.root).expanduser().resolve()
     state_dir = _state_dir_from_config(cfg)
-    chat_store = ChatStore(
-        state_dir / "chats" if state_dir else Path(".arc_llama_chats")
-    )
+    chat_store = ChatStore(state_dir / "chats" if state_dir else Path(".arc_llama_chats"))
     checkpoint_store = CheckpointStore(
         state_dir / "checkpoints" if state_dir else Path(".arc_llama_checkpoints")
     )
@@ -2057,7 +2144,9 @@ def code_cmd(
                         continue
                     if command == "clear":
                         await agent.close()
-                        session_chat = chat_store.create(str(uuid.uuid4()), "CLI session", folder=folder)
+                        session_chat = chat_store.create(
+                            str(uuid.uuid4()), "CLI session", folder=folder
+                        )
                         agent = InteractiveAgent(
                             model=agent.model,
                             base_url=base_url,
@@ -2106,11 +2195,15 @@ def code_cmd(
                 ):
                     _render_agent_event(event)
                     if event.get("type") == "assistant" and event.get("content"):
-                        turn_messages.append(ChatMessage(role="assistant", content=event["content"]))
+                        turn_messages.append(
+                            ChatMessage(role="assistant", content=event["content"])
+                        )
                     elif event.get("type") == "tool_result":
                         name = event.get("name", "tool")
                         content = event.get("content", "")
-                        turn_messages.append(ChatMessage(role="tool", content=f"{name}:\n{content}"))
+                        turn_messages.append(
+                            ChatMessage(role="tool", content=f"{name}:\n{content}")
+                        )
 
                 await save_transcript(turn_messages)
 
@@ -2125,6 +2218,7 @@ def code_cmd(
 # ===========================================================================
 # agent-tui (arcllama)
 # ===========================================================================
+
 
 @cli.command("agent-tui")
 @click.option("--model", "-m", default=None, help="Model id to use (default: first available).")
@@ -2219,9 +2313,11 @@ def arcllama_main(
 # tui
 # ===========================================================================
 
+
 @cli.command("tui")
 @click.option(
-    "--server", "server_url",
+    "--server",
+    "server_url",
     default=None,
     help="Base URL of an arc-llama serve instance (default: http://HOST:PORT from config).",
 )

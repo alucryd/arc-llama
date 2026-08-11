@@ -12,6 +12,7 @@ do not duplicate the staged sweep logic. A fingerprint helper here ties the
 validity of a saved recipe to the exact binary, GPU, and arc-llama version
 that measured it.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -38,7 +39,6 @@ log = logging.getLogger("arc_llama.autotune")
 TUNE_SCHEMA_VERSION = 3
 
 LOOP_INTERVAL_SECONDS = 15
-
 
 
 def _file_fingerprint(path: str) -> str:
@@ -134,7 +134,10 @@ def reset_tuned_state_if_stale(
 
     gpu = cfg.find_gpu(model.gpu_pci_slot)
     fp = compute_fingerprint(
-        model, cfg.paths.llama_server, gpu, arc_llama_version,
+        model,
+        cfg.paths.llama_server,
+        gpu,
+        arc_llama_version,
         workload.fingerprint_key(cfg.workload),
     )
     if model.tune_state == "tuned" and not fingerprint_matches(model, fp):
@@ -197,26 +200,25 @@ class Autotuner:
     def is_sweep_running(self) -> bool:
         return self.running_model is not None
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Start the background loop.
 
-        Not lock-guarded, unlike stop(): start() and stop() must not be
-        interleaved. The server calls start() once from lifespan startup and
-        stop() once from lifespan shutdown, strictly in that order, and nothing
-        restarts a tuner in place. If a restart path is ever added, this needs
-        to become async and take self._lock, because a start() racing an
-        in-flight stop() would see the old task, no-op, and leave _stopping set
-        with no loop running.
+        Serialized with stop() through the same lock: a start() that races an
+        in-flight stop() used to see the old (about-to-be-reaped) task, no-op,
+        and could leave _stopping set with no loop running, or orphan a new
+        task when stop() then set _task = None. Now start() waits for stop()
+        to finish reaping before deciding, so exactly one of them wins.
         """
         if not self.cfg.tune.auto:
             log.debug("autotune: disabled by config")
             return
-        if self._task is not None and not self._task.done():
-            return
-        self._abort_event.clear()
-        self._stopping = False
-        self._task = asyncio.create_task(self._loop())
-        log.info("autotune: started background loop")
+        async with self._lock:
+            if self._task is not None and not self._task.done():
+                return
+            self._abort_event.clear()
+            self._stopping = False
+            self._task = asyncio.create_task(self._loop())
+            log.info("autotune: started background loop")
 
     async def stop(self) -> None:
         async with self._lock:
@@ -368,18 +370,19 @@ class Autotuner:
 
         gpu = self.cfg.find_gpu(model.gpu_pci_slot)
         fp = compute_fingerprint(
-            model, self.cfg.paths.llama_server, gpu, self.version,
+            model,
+            self.cfg.paths.llama_server,
+            gpu,
+            self.version,
             workload.fingerprint_key(self.cfg.workload),
         )
         return not fingerprint_matches(model, fp)
 
     def _other_model_running(self, candidate_name: str) -> bool:
-        for name, srv in self.router._servers.items():
-            if name == candidate_name:
-                continue
-            if srv is not None and srv.is_running:
-                return True
-        return False
+        # Router.running_models() is a lock-free snapshot (no await inside,
+        # live subprocess probes); the decision it feeds is re-validated by
+        # the sweep's should_abort hook if a load starts right after.
+        return any(n != candidate_name for n in self.router.running_models())
 
     def _mark_skipped(self, name: str) -> None:
         m = self.cfg.find_model(name)
@@ -426,15 +429,16 @@ class Autotuner:
             a recipe (i.e., when no user request is holding the backend).
             """
             deadline = _now() + 30.0
-            # `not self._stopping` keeps this from spinning during shutdown:
-            # once stop() has set the abort event for good, _wait_for_abort
-            # returns instantly every time round.
+            # Plain sleep, deliberately not _wait_for_abort. The old wait
+            # cleared _abort_event each lap to stop the set event turning the
+            # 0.2s waits into a spin — but that consumed abort signals that
+            # belong to the outer loop and abort_sweep() callers, so an abort
+            # posted during this drain silently vanished. The event is not
+            # this coroutine's to clear. Responsiveness is unharmed: stop()
+            # cancels the enclosing task, which interrupts the sleep, and
+            # _stopping is checked every lap.
             while self.router.inflight > 0 and _now() < deadline and not self._stopping:
-                await self._wait_for_abort(0.2)
-                # A fresh abort signal during the wait should restart the
-                # bounded wait rather than give up early.
-                if self._abort_event.is_set() and not self._stopping:
-                    self._abort_event.clear()
+                await asyncio.sleep(0.2)
             if self._stopping:
                 # Don't start a recipe write we cannot finish. The enclosing
                 # task is already cancelled, so the POST below would be torn
@@ -488,7 +492,10 @@ class Autotuner:
             else:
                 gpu = self.cfg.find_gpu(model.gpu_pci_slot)
                 fp = compute_fingerprint(
-                    model, self.cfg.paths.llama_server, gpu, self.version,
+                    model,
+                    self.cfg.paths.llama_server,
+                    gpu,
+                    self.version,
                     workload.fingerprint_key(self.cfg.workload),
                 )
                 set_tuned_state(self.cfg, model, fp)
@@ -512,7 +519,7 @@ class Autotuner:
                     log.warning("autotune: save after sweep failed: %s", exc)
 
 
-def start_autotuner(
+async def start_autotuner(
     cfg: Config,
     router: Router,
     *,
@@ -521,5 +528,5 @@ def start_autotuner(
 ) -> Autotuner:
     """Create and start the autotuner for this server instance."""
     tuner = Autotuner(cfg, router, version=version, on_save=on_save)
-    tuner.start()
+    await tuner.start()
     return tuner
