@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.6.1] - 2026-08-11
+
+Bugfix release clearing the remaining concurrency and leak findings from the full-source audit. No new features, no config or API changes.
+
+### Fixed
+- A streamed request whose BackgroundTask never ran (mid-stream upstream death, shutdown with an open stream) leaked the global in-flight counter permanently — and since the auto-tuner gates every sweep on that counter, one leaked stream silently disabled background tuning until restart. The decrement now runs from the body generator's `finally`, is idempotent, and floors at zero. (#27)
+- Model eviction no longer kills an incumbent's generation mid-stream: `_evict_for` waits (bounded) for the incumbent's per-model in-flight count to drain, and `rebuild_model` does the same before applying a recipe edit to a running model. (#28, #31)
+- The lock-free fast path in `ensure_active` could hand out a server that an eviction was about to stop, or be missed by the drain because the request hadn't been counted yet. Acquisition is now atomic with the readiness check, and a `_stopping` mark closes the teardown window. (#29)
+- The auto-tuner could start a benchmark load that evicted a just-arrived real request; `measure()` now re-checks the abort hook after the edit POST, the only window where that request can register. (#30)
+- The end-of-sweep recipe restore no longer leaves the last candidate persisted when the edit endpoint fails: it retries, then falls back to a direct config write. (#37)
+- Upstream proxying leaked the `httpx.AsyncClient` connection pool on every call, and the response too on mid-stream failure; both are now closed exactly once. (#38)
+- `Autotuner.start()` is serialized with `stop()`, so a racing start/stop can no longer kill the loop or orphan a task. (#34)
+- The autotuner reads running models via `Router.running_models()` instead of poking `router._servers` directly. (#33)
+- `tune --dry-run` no longer marks the model as tuned (#22); draft-MTP is no longer auto-enabled on hybrid SSM models (#23); health/admin endpoints report a model as loaded only once its health check passed (#40); the deferred restore no longer consumes shared abort signals (#32); config writes are atomic (#36).
+
+## [0.6.0] - 2026-07-30
+
 ### Added
 - Background auto-tuner. Once a model has been used and the router is idle, `arc-llama serve` runs the same staged KV/ubatch/flash-attention sweep that `arc-llama tune` uses, over loopback HTTP, aborting instantly when a real request arrives. The tuned recipe is written via the existing `/admin/models/{name}/edit` endpoint.
 - `[tune]` config section (`auto`, `idle_seconds`, `target`, `prompt_tokens`, `gen_tokens`, `min_uses`, `retune_on_fingerprint_change`) and per-model tune state ([`tune_state`, `tuned_at`, `tune_fingerprint`, `tune_error`]) persisted in the existing config.
