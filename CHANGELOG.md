@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.6.2] - 2026-08-11
+
+Identical code to 0.6.1; packaging fix only. The 0.6.1 sdist accidentally included a local virtualenv (`.venv-test/`), whose absolute symlinks broke the wheel build, so 0.6.1 shipped no wheel and a 62 MB sdist. The sdist now explicitly excludes local virtualenvs and scratch files. If you pinned 0.6.1, move to 0.6.2.
+
 ## [0.6.1] - 2026-08-11
 
 Bugfix release clearing the remaining concurrency and leak findings from the full-source audit. No new features, no config or API changes.
