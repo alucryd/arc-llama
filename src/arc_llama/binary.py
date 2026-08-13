@@ -86,16 +86,21 @@ def detect_backends(binary_path: str | Path) -> set[Backend]:
     """Return the set of compute backends embedded in a ``llama-server`` binary.
 
     Modern official llama.cpp release builds are modular: the compute backend
-    lives in sibling shared libraries next to the executable (e.g.
-    ``libggml-vulkan.so`` holds the Vulkan markers, ``libggml-sycl.so`` holds
-    the SYCL markers). This function scans the target file AND its sibling
+    lives in sibling shared libraries next to the executable or in system paths
+    (e.g. ``libggml-vulkan.so`` holds the Vulkan markers, ``libggml-sycl.so``
+    holds the SYCL markers). This function scans the target file AND its sibling
     ``libggml*.so*`` files, unioning the results. It never executes the binary.
     """
     path = Path(binary_path)
     if not path.exists() or not path.is_file():
         return set()
     found = _scan_file(path)
-    for sibling in sorted(path.parent.glob("libggml*.so*")):
+    siblings = sorted(path.parent.glob("libggml*.so*"))
+    if path.parent.name == "bin":
+        siblings += sorted(path.parent.parent.glob("lib/libggml*.so*")) + sorted(
+            path.parent.parent.glob("lib/*/libggml-*.so*")
+        )
+    for sibling in siblings:
         if not sibling.is_file() or sibling == path:
             continue
         try:
