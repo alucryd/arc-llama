@@ -16,6 +16,7 @@ from arc_llama.binary import (
 
 def _make_fake_binary(tmp_path: Path, content: bytes) -> Path:
     path = tmp_path / "llama-server"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
 
@@ -115,6 +116,25 @@ def test_vulkan_build_not_misdetected_as_sycl(tmp_path):
     )
     assert detect_backends(binary) == {Backend.VULKAN}
     assert detect_llama_server_backend(binary) == Backend.VULKAN
+
+
+def test_detects_vulkan_from_system_lib_dir(tmp_path):
+    binary = _make_fake_binary(tmp_path / "bin", b"cpu only exe")
+    lib = tmp_path / "lib" / "libggml-vulkan.so"
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    lib.write_bytes(b"libvulkan.so.1 vkGetInstanceProcAddr")
+    assert detect_backends(binary) == {Backend.VULKAN}
+    assert detect_llama_server_backend(binary) == Backend.VULKAN
+
+
+def test_detects_sycl_from_system_lib_triplet_dir(tmp_path):
+    binary = _make_fake_binary(tmp_path / "bin", b"cpu only exe")
+    triplet_dir = tmp_path / "lib" / "x86_64-linux-gnu"
+    triplet_dir.mkdir(parents=True)
+    lib = triplet_dir / "libggml-sycl.so"
+    lib.write_bytes(b"ggml_backend_sycl")
+    assert detect_backends(binary) == {Backend.SYCL}
+    assert detect_llama_server_backend(binary) == Backend.SYCL
 
 
 class TestVulkanDeviceResolution:
