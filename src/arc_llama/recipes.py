@@ -7,6 +7,7 @@ crank context up than have a first-run experience that OOMs.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -279,6 +280,17 @@ def default_recipe(
     # Bump ubatch above llama.cpp's stock 512 when the card can absorb the
     # bigger compute buffer; budget the larger buffer into the ctx suggestion.
     perf_batching = vram_mb >= PERF_UBATCH_MIN_VRAM_MB
+    # Allow users to cap auto-suggested context length via an env var. This is
+    # a global ceiling, applied before the trained-context clamp, so it can be
+    # used to keep configs portable across cards with different VRAM.
+    env_max_ctx = os.environ.get("ARC_LLAMA_MAX_CTX")
+    if env_max_ctx:
+        try:
+            ctx_cap = min(DEFAULT_CTX_CAP, max(4096, int(env_max_ctx)))
+        except ValueError:
+            ctx_cap = DEFAULT_CTX_CAP
+    else:
+        ctx_cap = DEFAULT_CTX_CAP
     ctx = suggest_ctx(
         vram_mb=vram_mb,
         model_file_mb=model_file_mb,
@@ -287,6 +299,7 @@ def default_recipe(
         compute_buffer_mb=PERF_COMPUTE_BUFFER_MB if perf_batching else 768,
         trained_ctx=trained_ctx,
         parallel=parallel,
+        ctx_cap=ctx_cap,
     )
     return LaunchRecipe(
         n_gpu_layers=999,

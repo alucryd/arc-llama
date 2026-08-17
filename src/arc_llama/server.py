@@ -658,7 +658,7 @@ def create_app(cfg: Config | None = None, config_path: Path | None = None) -> Fa
             srv = rt._servers.get(m.name)
             r = m.recipe or {}
             running = bool(srv and srv.is_running)
-            loaded = bool(running and srv.ready)
+            loaded = bool(srv and srv.is_running and srv.ready)
             models.append(
                 {
                     "name": m.name,

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+- Memory-aware context/batch defaults now respect `ARC_LLAMA_MAX_CTX` as a global ceiling on auto-suggested context length. (#55)
+- `arc-llama add` gained `--batch-size` to complement `--ubatch-size` and prints the chosen `ctx`/`ub`/`b` values after registration. (#55)
+- SYCL launches now auto-detect and source Intel oneAPI `setvars.sh` when the runtime libraries are not visible, supporting non-standard install prefixes such as `/mnt/storage/opt/intel/oneapi`. Set `paths.oneapi_setvars` in the config to override the auto-detected path. (#56)
+- Added an opt-in inference smoke test (`tests/test_smoke.py`). Set `ARC_LLAMA_SMOKE_MODEL` to run it locally on a machine with a model and Intel Arc GPU.
+
+### Changed
+- Dockerfile now pins llama.cpp to `b10280` (was `b9946`). (#54)
+- CI now runs `mypy src/arc_llama` and builds the Dockerfile on every PR.
+
+### Fixed
+- `.dockerignore` no longer excludes `docker-entrypoint.sh`, so the Dockerfile can build again.
+- Cleaned up mypy errors in `detect.py`, `runtime.py`, `server.py`, and `cli.py`.
+
 ## [0.6.2] - 2026-08-11
 
 Identical code to 0.6.1; packaging fix only. The 0.6.1 sdist accidentally included a local virtualenv (`.venv-test/`), whose absolute symlinks broke the wheel build, so 0.6.1 shipped no wheel and a 62 MB sdist. The sdist now explicitly excludes local virtualenvs and scratch files. If you pinned 0.6.1, move to 0.6.2.

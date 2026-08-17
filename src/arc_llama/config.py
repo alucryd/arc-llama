@@ -140,6 +140,11 @@ class PathsConfig:
     scan_paths: list[str] = field(default_factory=list)
     """Extra directories `arc-llama scan` walks looking for GGUFs. The
     `models_dir` is always scanned in addition to these."""
+    oneapi_setvars: str = ""
+    """Path to Intel oneAPI's setvars script. When set and a SYCL llama-server
+    is launched in an environment that lacks the oneAPI runtime libraries,
+    arc-llama sources this script and merges the resulting variables into the
+    subprocess environment. Leave empty to auto-detect."""
 
 
 @dataclass

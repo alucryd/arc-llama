@@ -9,8 +9,11 @@ import pytest
 from arc_llama.platform_checks import (
     format_bytes,
     max_memory_bar_bytes,
+    oneapi_runtime_env_needed,
+    oneapi_setvars_path,
     parse_kernel_version,
     rebar_likely_enabled,
+    source_setvars,
 )
 
 _skip_on_windows = pytest.mark.skipif(
@@ -89,3 +92,74 @@ class TestHelpers:
         assert parse_kernel_version("6.14.0-generic") == (6, 14)
         assert parse_kernel_version("5.15.0") == (5, 15)
         assert parse_kernel_version("bogus") is None
+
+
+class TestOneapiSetvarsPath:
+    def test_finds_env_oneapi_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path / "oneapi"))
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        setvars = tmp_path / "oneapi" / "setvars.sh"
+        setvars.parent.mkdir(parents=True)
+        setvars.write_text("# fake")
+        assert oneapi_setvars_path() == setvars
+
+    def test_finds_cmplr_relative_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        oneapi_root = tmp_path / "oneapi"
+        setvars = oneapi_root / "setvars.sh"
+        setvars.parent.mkdir(parents=True)
+        setvars.write_text("# fake")
+        cmplr = oneapi_root / "compiler" / "2026.1"
+        cmplr.mkdir(parents=True)
+        monkeypatch.setenv("CMPLR_ROOT", str(cmplr))
+        monkeypatch.setenv("ONEAPI_ROOT", "")
+        assert oneapi_setvars_path() == setvars
+
+    def test_prefers_env_over_standard_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        env_root = tmp_path / "env-oneapi"
+        env_setvars = env_root / "setvars.sh"
+        env_setvars.parent.mkdir(parents=True)
+        env_setvars.write_text("# fake")
+        monkeypatch.setenv("ONEAPI_ROOT", str(env_root))
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        result = oneapi_setvars_path()
+        assert result is not None
+        assert result == env_setvars
+
+
+class TestOneapiRuntimeEnvNeeded:
+    def test_no_oneapi_dirs_returns_true(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path / "no-such-oneapi"))
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        # Ensure ldconfig doesn't accidentally find libs on this test runner.
+        monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
+        assert oneapi_runtime_env_needed() is True
+
+    def test_finds_lib_in_oneapi_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        lib_dir = tmp_path / "lib" / "intel64"
+        lib_dir.mkdir(parents=True)
+        (lib_dir / "libsvml.so").write_text("")
+        monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
+        assert oneapi_runtime_env_needed() is False
+
+
+class TestSourceSetvars:
+    def test_parses_sourced_env(self, tmp_path: Path):
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text(
+            "export ONEAPI_ROOT=/opt/intel/oneapi\n"
+            "export LD_LIBRARY_PATH=/opt/intel/oneapi/lib/intel64\n"
+            "export PATH=/opt/intel/oneapi/bin:$PATH\n"
+        )
+        env = source_setvars(setvars)
+        assert env["ONEAPI_ROOT"] == "/opt/intel/oneapi"
+        assert env["LD_LIBRARY_PATH"] == "/opt/intel/oneapi/lib/intel64"
+        # PATH should reflect expansion of the (empty) inherited PATH.
+        assert "/opt/intel/oneapi/bin" in env["PATH"]
+        # Bash bookkeeping variables should be stripped.
+        assert "PWD" not in env
+        assert "SHLVL" not in env
+
+    def test_missing_script_returns_empty(self, tmp_path: Path):
+        assert source_setvars(tmp_path / "no-such-setvars.sh") == {}

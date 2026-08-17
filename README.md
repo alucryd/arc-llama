@@ -124,6 +124,16 @@ curl http://127.0.0.1:11437/v1/chat/completions \
   cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
   cmake --build build --config Release -j
   ```
+  If you installed oneAPI to a non-standard prefix (tarball install, relocated
+  `/opt/intel`, etc.), arc-llama detects `setvars.sh` from `$ONEAPI_ROOT`,
+  `$CMPLR_ROOT`, `/opt/intel/oneapi`, `/usr/local/intel/oneapi`, and
+  `/mnt/storage/opt/intel/oneapi`, and sources it automatically when the runtime
+  libraries are not visible to the system loader. You can also pin the path in
+  `config.toml`:
+  ```toml
+  [paths]
+  oneapi_setvars = "/your/prefix/oneapi/setvars.sh"
+  ```
 - User in the `render` and `video` groups (`arc-llama doctor` will tell you).
 
 ## Benchmark & autotune
@@ -257,6 +267,13 @@ pick a context length. Currently:
 | `qwen3_27b_dense` | ~70 KiB          | Qwen 3 27B dense                             |
 | `moe_a3b`         | ~24 KiB          | Qwen 3 30B/35B-A3B MoE                       |
 | `gemma_swa`       | ~16 KiB          | Gemma 3/4 (interleaved sliding-window attn)  |
+
+`arc-llama add` sizes the context length to the detected GPU's VRAM and the
+model's file size. You can cap the auto-suggested value with the environment
+variable `ARC_LLAMA_MAX_CTX` (e.g. `ARC_LLAMA_MAX_CTX=8192`), or override per
+model with `--ctx N`. Use `--ubatch-size N` and `--batch-size N` to override
+the prompt-processing batch defaults on cards where the auto-selected values
+do not fit your workload.
 
 ## Architecture
 

@@ -29,6 +29,11 @@ from arc_llama.arch import Arch, ArchProfile, Backend, profile_for
 from arc_llama.binary import list_vulkan_devices, resolve_vulkan_index
 from arc_llama.config import Config, GPUConfig, ModelConfig
 from arc_llama.gguf_meta import has_mtp_heads
+from arc_llama.platform_checks import (
+    oneapi_runtime_env_needed,
+    oneapi_setvars_path,
+    source_setvars,
+)
 from arc_llama.policy import apply_launch_policy
 from arc_llama.server_caps import probe_server_caps
 
@@ -189,7 +194,10 @@ def _vulkan_index_for(gpu: GPUConfig, llama_server: str | Path | None) -> int | 
 
 
 def build_env(
-    profile: ArchProfile, gpu: GPUConfig, llama_server: str | Path | None = None
+    profile: ArchProfile,
+    gpu: GPUConfig,
+    llama_server: str | Path | None = None,
+    oneapi_setvars: str | None = None,
 ) -> dict[str, str]:
     """Compose the environment for llama-server based on backend and arch."""
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
@@ -218,6 +226,38 @@ def build_env(
         env.pop(k, None)
     env.update(profile.sycl_env)
     env["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{gpu.sycl_index}"
+
+    # If the current environment is missing the oneAPI runtime libraries, try to
+    # source a setvars.sh automatically. This helps tarball/custom-prefix installs
+    # that the system loader doesn't know about.
+    if oneapi_runtime_env_needed():
+        setvars: Path | None = None
+        if oneapi_setvars:
+            candidate = Path(oneapi_setvars).expanduser()
+            if candidate.exists():
+                setvars = candidate
+        if setvars is None:
+            setvars = oneapi_setvars_path()
+        if setvars is not None:
+            log.info(
+                "SYCL environment missing oneAPI runtime libs; sourcing %s",
+                setvars,
+            )
+            sourced = source_setvars(setvars)
+            # Merge sourced env, but never overwrite the device selector we just
+            # set or any user-provided SYCL-only overrides.
+            for k, v in sourced.items():
+                if k == "ONEAPI_DEVICE_SELECTOR":
+                    continue
+                if k in _SYCL_ONLY_ENVS and k in env:
+                    continue
+                env[k] = v
+        else:
+            log.warning(
+                "SYCL environment missing oneAPI runtime libs and no setvars.sh "
+                "found. If llama-server fails to start, source your oneAPI "
+                "setvars.sh before running arc-llama."
+            )
     return env
 
 
@@ -227,7 +267,12 @@ def build_plan(
     arch = Arch(gpu.arch) if gpu.arch else Arch.UNKNOWN
     profile = profile_for(arch)
     backend = Backend(gpu.backend) if gpu.backend else Backend.SYCL
-    env = build_env(profile, gpu, cfg.paths.llama_server)
+    env = build_env(
+        profile,
+        gpu,
+        llama_server=cfg.paths.llama_server,
+        oneapi_setvars=getattr(cfg.paths, "oneapi_setvars", None),
+    )
     recipe = model.launch_recipe()
 
     # --- MTP head detection & safety wiring ---

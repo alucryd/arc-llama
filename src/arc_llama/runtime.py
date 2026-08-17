@@ -232,6 +232,7 @@ def install_runtime(
         client = httpx.Client(
             follow_redirects=True, timeout=300.0, headers=_auth_headers()
         )
+    assert client is not None
     try:
         release = resolve_release(client, version)
         asset = select_asset(release, os_name, arch, backend)

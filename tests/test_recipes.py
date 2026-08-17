@@ -222,6 +222,34 @@ class TestDefaultRecipe:
         )
         assert r.ctx == 32768
 
+    def test_env_max_ctx_caps_recipe_ctx(self, monkeypatch):
+        # ARC_LLAMA_MAX_CTX should clamp the auto-suggested context length.
+        monkeypatch.setenv("ARC_LLAMA_MAX_CTX", "8192")
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert r.ctx == 8192
+
+    def test_env_max_ctx_ignores_invalid_value(self, monkeypatch):
+        monkeypatch.setenv("ARC_LLAMA_MAX_CTX", "not-a-number")
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert r.ctx > 8192
+
+    def test_env_max_ctx_below_floor_clamps_to_floor(self, monkeypatch):
+        monkeypatch.setenv("ARC_LLAMA_MAX_CTX", "1000")
+        r = default_recipe(
+            Arch.BATTLEMAGE,
+            vram_mb=24 * 1024,
+            model_file_mb=4 * 1024,
+        )
+        assert r.ctx == 4096
+
     def test_no_prefer_q8_gives_f16(self):
         r = default_recipe(
             Arch.BATTLEMAGE,

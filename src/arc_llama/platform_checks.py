@@ -193,12 +193,150 @@ def level_zero_loader_present() -> tuple[bool, str]:
 
 
 def oneapi_setvars_path() -> Path | None:
+    """Return the path to Intel oneAPI's setvars script, if found.
+
+    Searches, in order:
+      - ``$ONEAPI_ROOT/setvars.sh`` (or ``.bat`` on Windows)
+      - ``$CMPLR_ROOT/../setvars.sh`` (common when only the compiler module is active)
+      - ``/opt/intel/oneapi/setvars.sh`` (standard apt install)
+      - ``/usr/local/intel/oneapi/setvars.sh`` (common tarball/custom prefix)
+      - ``/mnt/storage/opt/intel/oneapi/setvars.sh`` (known dev-box prefix)
+    """
     if sys.platform == "win32":
         base = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        for env_key in ("ONEAPI_ROOT", "CMPLR_ROOT"):
+            env_val = os.environ.get(env_key)
+            if env_val:
+                p = Path(env_val) / "setvars.bat"
+                if p.exists():
+                    return p
         p = base / "Intel" / "oneAPI" / "setvars.bat"
         return p if p.exists() else None
-    p = Path("/opt/intel/oneapi/setvars.sh")
-    return p if p.exists() else None
+
+    candidates: list[Path] = []
+    oneapi_root = os.environ.get("ONEAPI_ROOT")
+    if oneapi_root:
+        candidates.append(Path(oneapi_root) / "setvars.sh")
+    cmplr_root = os.environ.get("CMPLR_ROOT")
+    if cmplr_root:
+        # CMPLR_ROOT points at e.g. .../oneapi/compiler/2026.1; setvars.sh is two
+        # levels above, at the oneapi root.
+        candidates.append(Path(cmplr_root).parent.parent / "setvars.sh")
+    candidates.extend([
+        Path("/opt/intel/oneapi/setvars.sh"),
+        Path("/usr/local/intel/oneapi/setvars.sh"),
+        Path("/mnt/storage/opt/intel/oneapi/setvars.sh"),
+    ])
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def oneapi_runtime_env_needed() -> bool:
+    """Heuristic: does the current process environment lack oneAPI runtime libs?
+
+    Returns True when neither the Level Zero loader nor the SVML/compiler runtime
+    can be found via ldconfig or common oneAPI paths. In that state a SYCL
+    llama-server binary is likely to fail at startup with missing-library errors
+    or "No device of requested type available".
+    """
+    names = (
+        "libsvml.so",
+        "libsvml.so.2",
+        "libze_loader.so.1",
+        "libze_loader.so",
+    )
+    search_dirs: list[Path] = [
+        Path("/opt/intel/oneapi/lib"),
+        Path("/opt/intel/oneapi/lib/intel64"),
+        Path("/usr/local/intel/oneapi/lib"),
+        Path("/usr/local/intel/oneapi/lib/intel64"),
+        Path("/mnt/storage/opt/intel/oneapi/lib"),
+        Path("/mnt/storage/opt/intel/oneapi/lib/intel64"),
+    ]
+    oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
+    if oneapi_root:
+        p = Path(oneapi_root)
+        search_dirs.extend([p, p / "lib", p / "lib" / "intel64"])
+
+    # If ldconfig can resolve any of the runtime libs, the env/system is fine.
+    ldconfig = shutil.which("ldconfig")
+    if ldconfig:
+        try:
+            out = subprocess.run(
+                [ldconfig, "-p"], capture_output=True, text=True, timeout=5, check=False,
+            )
+            for name in names:
+                if name in out.stdout:
+                    return False
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    # Check common oneAPI prefixes directly.
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for name in names:
+            if (d / name).exists():
+                return False
+            try:
+                for child in d.iterdir():
+                    if child.is_dir() and (child / name).exists():
+                        return False
+            except OSError:
+                pass
+
+    return True
+
+
+def source_setvars(setvars_path: Path | str) -> dict[str, str]:
+    """Source a oneAPI setvars script and return the resulting environment diff.
+
+    Runs the script in a bash subprocess, then strips bash-only bookkeeping
+    variables so the returned dict contains the additions/changes setvars
+    introduced. If the script does not exist or fails, returns an empty dict.
+    """
+    setvars_path = Path(setvars_path)
+    if not setvars_path.exists():
+        return {}
+    if sys.platform == "win32":
+        # Windows setvars.bat is not sourced the same way; callers should handle it.
+        return {}
+
+    # Use bash to source the script and dump the environment. setvars.sh is
+    # a bash script, so this is the most reliable way to capture its effects.
+    script = (
+        f"source '{setvars_path}' > /dev/null 2>&1; "
+        "env -0 | sort -z"
+    )
+    try:
+        out = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=False,
+            timeout=60,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+
+    if out.returncode != 0:
+        return {}
+
+    # Parse null-delimited env output.
+    sourced: dict[str, str] = {}
+    for item in out.stdout.split(b"\x00"):
+        if b"=" not in item:
+            continue
+        key, _, value = item.partition(b"=")
+        key_str = key.decode(errors="replace")
+        # Skip bash-only bookkeeping variables.
+        if key_str in ("PWD", "SHLVL", "_", "SHELLOPTS"):
+            continue
+        sourced[key_str] = value.decode(errors="replace")
+
+    return sourced
 
 
 def kernel_module_loaded(name: str) -> bool:

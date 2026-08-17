@@ -54,7 +54,7 @@ from arc_llama.config import (
     init_config_from_detection,
     load_config,
 )
-from arc_llama.detect import detect_gpus, lspci_intel_gpus
+from arc_llama.detect import DetectedGPU, detect_gpus, lspci_intel_gpus
 from arc_llama.models import (
     add_local_model,
     discover_ggufs,
@@ -813,6 +813,13 @@ def list_models(ctx: click.Context) -> None:
     help="Ubatch size (-ub). Left unset by default; llama.cpp picks its own.",
 )
 @click.option(
+    "--batch-size",
+    "batch_size",
+    type=int,
+    default=None,
+    help="Logical batch size (-b). Must be >= ubatch-size if both are set.",
+)
+@click.option(
     "--from-hf",
     is_flag=True,
     help="Treat SOURCE as a Hugging Face spec (`org/repo` or `org/repo:Q4_K_M`).",
@@ -835,6 +842,7 @@ def add(
     spec_draft_model: str | None,
     spec_draft_ngl: int | None,
     ubatch_size: int | None,
+    batch_size: int | None,
     from_hf: bool,
     hf_token: str | None,
 ) -> None:
@@ -913,6 +921,8 @@ def add(
         overrides["spec_draft_ngl"] = spec_draft_ngl
     if ubatch_size is not None:
         overrides["ubatch_size"] = ubatch_size
+    if batch_size is not None:
+        overrides["batch_size"] = batch_size
 
     try:
         mc = add_local_model(
@@ -931,7 +941,17 @@ def add(
         sys.exit(1)
 
     _save_or_die(cfg, cfg_path)
-    console.print(f"[green]Registered {mc.name}[/green] on {gpu_pci_slot}, port {mc.port}")
+    recipe = mc.launch_recipe()
+    ctx_info = f"ctx={recipe.ctx}"
+    batch_info = ""
+    if recipe.ubatch_size is not None:
+        batch_info += f" ub={recipe.ubatch_size}"
+    if recipe.batch_size is not None:
+        batch_info += f" b={recipe.batch_size}"
+    console.print(
+        f"[green]Registered {mc.name}[/green] on {gpu_pci_slot}, port {mc.port} "
+        f"({ctx_info}{batch_info})"
+    )
 
 
 def _slugify_for_name(parent: str, file: str) -> str:
@@ -1089,7 +1109,7 @@ def _print_serve_banner(cfg: Config) -> None:
     """
     console.print("[bold]arc-llama serve[/bold] — applied Arc profiles:")
     # Re-detect so we can show live ReBAR + the exact device ID for AOT hints.
-    live: dict[str, object] = {}
+    live: dict[str, DetectedGPU] = {}
     if not _IS_WINDOWS:
         try:
             live = {g.pci_slot: g for g in detect_gpus(enrich=False)}
@@ -1101,8 +1121,8 @@ def _print_serve_banner(cfg: Config) -> None:
         backend = gpu.backend or Backend.SYCL.value
         vram = f"{gpu.vram_mb} MB" if gpu.vram_mb else "VRAM unknown"
         parts = [f"GPU {gpu.pci_slot}: {gpu.arch} ({backend}) · {vram}"]
-        det = live.get(gpu.pci_slot)
-        if det is not None and getattr(det, "sysfs_path", ""):
+        det: DetectedGPU | None = live.get(gpu.pci_slot)
+        if det is not None and det.sysfs_path:
             r = rebar_likely_enabled(det.sysfs_path, det.vram_mb)
             parts.append("ReBAR on" if r else ("ReBAR OFF" if r is False else "ReBAR ?"))
         if backend == Backend.SYCL.value:
@@ -1125,10 +1145,10 @@ def _print_serve_banner(cfg: Config) -> None:
                 parts.append("JIT cold-start")
         console.print("  " + " · ".join(parts))
     for m in cfg.models:
-        r = m.recipe or {}
-        ctx = r.get("ctx", "?")
-        kv_k = r.get("cache_type_k", "f16")
-        kv_v = r.get("cache_type_v", "f16")
+        recipe = m.recipe or {}
+        ctx = recipe.get("ctx", "?")
+        kv_k = recipe.get("cache_type_k", "f16")
+        kv_v = recipe.get("cache_type_v", "f16")
         kv_txt = kv_k if kv_k == kv_v else f"{kv_k}/{kv_v}"
         console.print(f"  model {m.name}: ctx={ctx} · KV {kv_txt} · port {m.port}")
     if not cfg.models:
@@ -1530,6 +1550,7 @@ def tune_cmd(
                 print_multi_summary(reports)
             sys.exit(1 if any(r.error for r in reports) else 0)
 
+        assert model is not None
         if cfg.find_model(model) is None:
             console.print(f"[red]Model '{model}' is not registered in the config.[/red]")
             sys.exit(1)

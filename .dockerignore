@@ -16,5 +16,4 @@ env
 .github
 tests
 Dockerfile
-docker-entrypoint.sh
 .dockerignore

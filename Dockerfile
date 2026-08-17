@@ -47,7 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin to a known-good llama.cpp release. The SYCL backend improves fast
 # (flash attention, MMVQ/reorder, graph support all post-date old pins) —
 # bump this deliberately and retest, don't let it rot.
-ARG LLAMA_CPP_REF=b9946
+ARG LLAMA_CPP_REF=b10280
 RUN git clone --depth 1 --branch ${LLAMA_CPP_REF} \
     https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
 

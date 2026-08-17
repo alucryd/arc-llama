@@ -130,15 +130,14 @@ def _scan_pci() -> list[DetectedGPU]:
         driver = _driver_name(slot_dir)
         card, render = _drm_nodes(slot_dir)
         vram = _vram_mib(slot_dir)
-        vram_from_table = False
+        vram_from_table_mb: int | None = None
         if vram is None:
             # Driver didn't expose VRAM via sysfs (common on older i915 and some
             # early xe releases). Fall back to the known-size table keyed by
             # PCI device ID so context sizing still works without clinfo.
-            known = known_vram_mib(device_id)
-            if known is not None:
-                vram = known
-                vram_from_table = True
+            vram_from_table_mb = known_vram_mib(device_id)
+            if vram_from_table_mb is not None:
+                vram = vram_from_table_mb
         gpu = DetectedGPU(
             pci_slot=slot_dir.name,
             device_id=device_id,
@@ -150,9 +149,9 @@ def _scan_pci() -> list[DetectedGPU]:
             drm_render=render,
             sysfs_path=str(slot_dir),
         )
-        if vram_from_table:
+        if vram_from_table_mb is not None:
             gpu.notes.append(
-                f"VRAM {vram // 1024} GB from device-ID fallback table "
+                f"VRAM {vram_from_table_mb // 1024} GB from device-ID fallback table "
                 f"(driver exposed no mem_info_vram_total)."
             )
         if driver is None:

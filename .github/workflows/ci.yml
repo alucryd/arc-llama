@@ -97,3 +97,44 @@ jobs:
           arc-llama init --help
           arc-llama install-runtime --help
           arc-llama scan --help
+
+  type-check:
+    name: Type check with mypy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run mypy
+        run: mypy src/arc_llama
+
+  docker-build:
+    # The Dockerfile builds llama-server from source with SYCL. This catches
+    # regressions in the Dockerfile, .dockerignore, and pinned llama.cpp ref
+    # that the Python-only jobs cannot see.
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: arc-llama:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

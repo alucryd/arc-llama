@@ -90,6 +90,50 @@ class TestBuildEnv:
         assert "SYCL_CACHE_PERSISTENT" not in env
         assert "ZES_ENABLE_SYSMAN" not in env
 
+    def test_sycl_sources_setvars_when_runtime_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text("export ONEAPI_ROOT=/fake/oneapi\nexport LD_LIBRARY_PATH=/fake/lib\n")
+
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+
+        # Force the missing-runtime path and point it at our fake script.
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_runtime_env_needed", lambda: True
+        )
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_setvars_path", lambda: setvars
+        )
+
+        env = build_env(profile, _gpu(sycl_index=0))
+        assert env["ONEAPI_ROOT"] == "/fake/oneapi"
+        assert env["LD_LIBRARY_PATH"] == "/fake/lib"
+        # Our device selector must still win.
+        assert env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:0"
+
+    def test_sycl_does_not_source_when_runtime_present(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ):
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text("export ONEAPI_ROOT=/should-not-apply\n")
+
+        from arc_llama.arch import profile_for
+        profile = profile_for(Arch.BATTLEMAGE)
+
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_runtime_env_needed", lambda: False
+        )
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_setvars_path", lambda: setvars
+        )
+
+        env = build_env(profile, _gpu(sycl_index=0))
+        assert "ONEAPI_ROOT" not in env
+
 
 class TestBuildPlan:
     def test_includes_model_and_port(self):

@@ -130,6 +130,11 @@ def test_cli_add_from_hf_with_name_override(monkeypatch, tmp_path, cli_runner):
         mock_mc = MagicMock()
         mock_mc.name = kwargs.get("name", "unknown")
         mock_mc.port = 18080
+        mock_recipe = MagicMock()
+        mock_recipe.ctx = 8192
+        mock_recipe.ubatch_size = None
+        mock_recipe.batch_size = None
+        mock_mc.launch_recipe.return_value = mock_recipe
         return mock_mc
 
     monkeypatch.setattr("arc_llama.cli.add_local_model", capture_add_local_model)
@@ -151,6 +156,58 @@ def test_cli_add_from_hf_with_name_override(monkeypatch, tmp_path, cli_runner):
     assert result.exit_code == 0, result.output
     assert captured.get("name") == "my-custom-name"
     assert "Registered my-custom-name" in result.output
+
+
+def test_cli_add_from_hf_with_batch_size_override(monkeypatch, tmp_path, cli_runner):
+    """--batch-size should be passed as a recipe override."""
+    cfg = _make_test_config(tmp_path)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("")
+
+    monkeypatch.setattr("arc_llama.cli.load_config", lambda path: cfg)
+
+    fake_model = tmp_path / "models" / "repo" / "model.gguf"
+    fake_model.parent.mkdir(parents=True)
+    fake_model.write_bytes(b"fake")
+
+    monkeypatch.setattr(
+        "arc_llama.cli.download_from_hf",
+        lambda spec, *, target_dir, token=None, progress=True: fake_model,
+    )
+
+    captured = {}
+
+    def capture_add_local_model(*args, **kwargs):
+        captured.update(kwargs)
+        mock_mc = MagicMock()
+        mock_mc.name = "repo"
+        mock_mc.port = 18080
+        mock_recipe = MagicMock()
+        mock_recipe.ctx = 8192
+        mock_recipe.ubatch_size = None
+        mock_recipe.batch_size = kwargs.get("recipe_overrides", {}).get("batch_size")
+        mock_mc.launch_recipe.return_value = mock_recipe
+        return mock_mc
+
+    monkeypatch.setattr("arc_llama.cli.add_local_model", capture_add_local_model)
+    monkeypatch.setattr("arc_llama.cli._save_or_die", lambda c, p: None)
+
+    result = cli_runner.invoke(
+        cli,
+        [
+            "-c",
+            str(config_file),
+            "add",
+            "--from-hf",
+            "org/repo",
+            "--batch-size",
+            "4096",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("recipe_overrides", {}).get("batch_size") == 4096
+    assert "b=4096" in result.output
 
 
 def test_cli_add_from_hf_file_not_found_after_download(monkeypatch, tmp_path, cli_runner):
