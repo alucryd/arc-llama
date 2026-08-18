@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from arc_llama.arch import Backend
+
+_IS_WINDOWS = sys.platform == "win32"
 
 # Byte signatures that reliably appear in llama.cpp binaries built with the
 # corresponding backend enabled.  We search for these instead of relying on
@@ -38,9 +41,15 @@ _BACKEND_MARKERS: dict[Backend, list[bytes]] = {
 
 def _scan_with_strings(path: Path) -> set[Backend]:
     """Use the system ``strings`` utility when available; much faster than a
-    pure-Python scan on multi-hundred-megabyte binaries."""
+    pure-Python scan on multi-hundred-megabyte binaries.
+
+    On Windows ``strings`` is not installed by default, so this immediately
+    falls back to the pure-Python scanner rather than raising.
+    """
     strings_bin = shutil.which("strings")
     if strings_bin is None:
+        if _IS_WINDOWS:
+            return _scan_with_python(path)
         raise FileNotFoundError("strings")
 
     proc = subprocess.run(
@@ -50,12 +59,14 @@ def _scan_with_strings(path: Path) -> set[Backend]:
         check=False,
     )
     if proc.returncode != 0:
+        if _IS_WINDOWS:
+            return _scan_with_python(path)
         raise RuntimeError(proc.stderr.strip() or "strings failed")
 
     text = proc.stdout
     found: set[Backend] = set()
+    lowered = text.lower()
     for backend, markers in _BACKEND_MARKERS.items():
-        lowered = text.lower()
         if any(marker.decode().lower() in lowered for marker in markers):
             found.add(backend)
     return found
@@ -95,11 +106,18 @@ def detect_backends(binary_path: str | Path) -> set[Backend]:
     if not path.exists() or not path.is_file():
         return set()
     found = _scan_file(path)
-    siblings = sorted(path.parent.glob("libggml*.so*"))
-    if path.parent.name == "bin":
-        siblings += sorted(path.parent.parent.glob("lib/libggml*.so*")) + sorted(
-            path.parent.parent.glob("lib/*/libggml-*.so*")
-        )
+    if _IS_WINDOWS:
+        siblings = sorted(path.parent.glob("ggml*.dll")) + sorted(path.parent.glob("libggml*.dll"))
+        if path.parent.name == "bin":
+            siblings += sorted(path.parent.parent.glob("lib/ggml*.dll"))
+            siblings += sorted(path.parent.parent.glob("lib/libggml*.dll"))
+            siblings += sorted(path.parent.parent.glob("lib/*/ggml-*.dll"))
+    else:
+        siblings = sorted(path.parent.glob("libggml*.so*"))
+        if path.parent.name == "bin":
+            siblings += sorted(path.parent.parent.glob("lib/libggml*.so*")) + sorted(
+                path.parent.parent.glob("lib/*/libggml-*.so*")
+            )
     for sibling in siblings:
         if not sibling.is_file() or sibling == path:
             continue

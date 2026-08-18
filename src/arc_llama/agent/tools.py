@@ -191,6 +191,8 @@ def _resolve_path(path: str, root: Path) -> Path:
     """Resolve *path* under *root*, rejecting directory traversal.
 
     Accepts both relative paths and absolute paths that point inside *root*.
+    Uses ``os.path.commonpath`` so drive-letter differences on Windows don't
+    accidentally pass the ``relative_to`` check.
     """
     root = root.resolve()
     candidate = Path(path)
@@ -200,11 +202,12 @@ def _resolve_path(path: str, root: Path) -> Path:
         resolved = (root / candidate).resolve()
 
     try:
-        resolved.relative_to(root)
+        common = Path(os.path.commonpath([resolved, root]))
     except ValueError as e:
-        raise ToolError(
-            f"Path escapes project root: {path}"
-        ) from e
+        # Different drives on Windows.
+        raise ToolError(f"Path escapes project root: {path}") from e
+    if common != root:
+        raise ToolError(f"Path escapes project root: {path}")
     return resolved
 
 

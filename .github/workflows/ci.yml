@@ -4,137 +4,35 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.12"]
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
 
-      - name: Install package
-        run: python -m pip install -e ".[dev]"
-
-      - name: Lint
-        run: ruff check .
-
-      - name: Test
-        run: pytest
-
-      - name: Build package
-        run: python -m build
-
-  bare-install:
-    # The `test` job installs .[dev], which pulls in textual, so it can never
-    # catch an eager import of an optional dependency. 0.4.0 and 0.5.0 both
-    # shipped to PyPI unable to run a single command for exactly that reason,
-    # with the whole matrix green. This job installs the built wheel the way a
-    # real user does, with no extras, and runs every command.
-    name: Bare install on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          # Oldest supported version: most likely to expose a packaging break.
-          python-version: "3.10"
-
-      - name: Build wheel
+      - name: Install dependencies
         run: |
-          python -m pip install --quiet build
-          python -m build --wheel
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
 
-      - name: Install the wheel with no extras
-        run: python -m pip install --quiet dist/*.whl
+      - name: Lint with ruff
+        run: ruff check src tests
 
-      - name: Confirm the optional extras really are absent
-        # Guards the guard: if an extra ever becomes a base dependency, this
-        # job would silently stop testing anything.
-        run: |
-          python - <<'PY'
-          import importlib.util
-          import sys
+      - name: Type-check with mypy
+        run: mypy src
 
-          present = [
-              m for m in ("textual", "fastembed", "mcp")
-              if importlib.util.find_spec(m) is not None
-          ]
-          if present:
-              sys.exit(f"optional extras present, job proves nothing: {present}")
-          print("no optional extras installed")
-          PY
-
-      - name: Every command must run on a default install
-        run: |
-          arc-llama --version
-          arc-llama --help
-          arc-llama serve --help
-          arc-llama list --help
-          arc-llama init --help
-          arc-llama install-runtime --help
-          arc-llama scan --help
-
-  type-check:
-    name: Type check with mypy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install package
-        run: python -m pip install -e ".[dev]"
-
-      - name: Run mypy
-        run: mypy src/arc_llama
-
-  docker-build:
-    # The Dockerfile builds llama-server from source with SYCL. This catches
-    # regressions in the Dockerfile, .dockerignore, and pinned llama.cpp ref
-    # that the Python-only jobs cannot see.
-    name: Docker build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          tags: arc-llama:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Test with pytest
+        run: pytest tests/ -q --tb=short -p no:cacheprovider

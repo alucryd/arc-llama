@@ -115,6 +115,10 @@ class TestLspciIntelGpus:
         assert lspci_intel_gpus() == ""
 
     def test_filters_intel_display(self, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        if sys.platform == "win32":
+            pytest.skip("lspci is not available on Windows")
         fake_out = """
 00:02.0 VGA compatible controller [0300]: Intel Corporation Device [8086:E211] (rev 01)
 01:00.0 VGA compatible controller [0300]: NVIDIA Corporation Device [10de:1234]
@@ -125,3 +129,102 @@ class TestLspciIntelGpus:
         result = lspci_intel_gpus()
         assert "8086:E211" in result
         assert "10de:1234" not in result
+
+
+class TestScanPciWindows:
+    def test_detects_intel_arc_b60(self, monkeypatch: pytest.MonkeyPatch):
+        from arc_llama.arch import Arch
+        from arc_llama.detect import _scan_pci_windows
+
+        fake_wmic = """
+Name=Intel(R) Arc(TM) Pro B60 Graphics
+PNPDeviceID=PCI\\VEN_8086&DEV_E211&SUBSYS_00000000&REV_00\\4&1A24F4D7&0&0008
+AdapterRAM=25769803776
+
+Name=NVIDIA GeForce RTX 4090
+PNPDeviceID=PCI\\VEN_10DE&DEV_2684&SUBSYS_00000000&REV_00\\4&12345678&0&0008
+AdapterRAM=25769803776
+"""
+
+        def _fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=fake_wmic, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        gpus = _scan_pci_windows()
+        assert len(gpus) == 1
+        assert gpus[0].device_id == 0xE211
+        assert gpus[0].arch == Arch.BATTLEMAGE
+        assert gpus[0].vram_mb == 24576
+
+    def test_returns_empty_on_wmic_failure(self, monkeypatch: pytest.MonkeyPatch):
+        from arc_llama.detect import _scan_pci_windows
+
+        def _fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        assert _scan_pci_windows() == []
+
+    def test_uses_table_vram_when_adapter_ram_missing(self, monkeypatch: pytest.MonkeyPatch):
+        from arc_llama.detect import _scan_pci_windows
+
+        fake_wmic = """
+Name=Intel(R) Arc(TM) A770 Graphics
+PNPDeviceID=PCI\\VEN_8086&DEV_56A0&SUBSYS_00000000&REV_00\\4&12345678&0&0008
+AdapterRAM=
+"""
+
+        def _fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=fake_wmic, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        gpus = _scan_pci_windows()
+        assert len(gpus) == 1
+        assert gpus[0].vram_mb == 16384
+
+    def test_prefers_table_vram_when_adapter_ram_saturates(self, monkeypatch: pytest.MonkeyPatch):
+        from arc_llama.detect import _scan_pci_windows
+
+        # Win32_VideoController.AdapterRAM saturates at ~2 GiB for cards with
+        # more memory; the known-size table should override it.
+        fake_wmic = """
+Name=Intel(R) Arc(TM) Pro B60 Graphics
+PNPDeviceID=PCI\\VEN_8086&DEV_E211&SUBSYS_00000000&REV_00\\4&12345678&0&0008
+AdapterRAM=2147479552
+"""
+
+        def _fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=fake_wmic, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        gpus = _scan_pci_windows()
+        assert len(gpus) == 1
+        assert gpus[0].vram_mb == 24576
+
+    def test_powershell_format_fallback(self, monkeypatch: pytest.MonkeyPatch):
+        from arc_llama.detect import _scan_pci_windows
+
+        # First call (wmic) fails; second call (powershell) returns Format-List output.
+        calls: list[list[str]] = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "wmic":
+                return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+            # powershell.exe output
+            stdout = (
+                "\n"
+                "Name        : Intel(R) Arc(TM) A770 Graphics\n"
+                "PNPDeviceID : PCI\\VEN_8086&DEV_56A0&SUBSYS_00000000&REV_00\\4&12345678&0&0008\n"
+                "AdapterRAM  : 4294967296\n"
+                "\n"
+            )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        gpus = _scan_pci_windows()
+        assert len(gpus) == 1
+        assert gpus[0].device_id == 0x56A0
+        # The known-size table (16 GiB) overrides the parsed AdapterRAM.
+        assert gpus[0].vram_mb == 16384
+        assert any(c[0] == "powershell.exe" for c in calls)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,25 @@ def _make_fake_binary(tmp_path: Path, content: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def _sibling_lib(name: str) -> str:
+    """Return the platform-appropriate shared-library filename for ggml backends."""
+    # Windows official builds ship `ggml-vulkan.dll`; Linux ships `libggml-vulkan.so`.
+    if sys.platform == "win32":
+        return f"{name}.dll"
+    return f"{name}.so"
+
+
+def _system_lib_dir(tmp_path: Path) -> Path:
+    """Return the platform-appropriate library directory under *tmp_path*."""
+    lib_dir = tmp_path / "lib"
+    if sys.platform == "win32":
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        return lib_dir
+    triplet_dir = lib_dir / "x86_64-linux-gnu"
+    triplet_dir.mkdir(parents=True, exist_ok=True)
+    return triplet_dir
 
 
 class TestDetectBackends:
@@ -66,21 +86,21 @@ class TestDetectBackends:
 
 def test_detects_vulkan_from_sibling_lib(tmp_path):
     binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
-    (tmp_path / "libggml-vulkan.so").write_bytes(b"ggml_backend_vulkan")
+    (tmp_path / _sibling_lib("ggml-vulkan")).write_bytes(b"ggml_backend_vulkan")
     assert Backend.VULKAN in detect_backends(binary)
     assert detect_llama_server_backend(binary) == Backend.VULKAN
 
 
 def test_detects_sycl_from_sibling_lib(tmp_path):
     binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
-    (tmp_path / "libggml-sycl.so").write_bytes(b"ggml_backend_sycl")
+    (tmp_path / _sibling_lib("ggml-sycl")).write_bytes(b"ggml_backend_sycl")
     assert detect_llama_server_backend(binary) == Backend.SYCL
 
 
 def test_prefers_sycl_across_sibling_libs(tmp_path):
     binary = _make_fake_binary(tmp_path, b"cpu only exe no gpu markers")
-    (tmp_path / "libggml-sycl.so").write_bytes(b"ggml_backend_sycl")
-    (tmp_path / "libggml-vulkan.so").write_bytes(b"ggml_backend_vulkan")
+    (tmp_path / _sibling_lib("ggml-sycl")).write_bytes(b"ggml_backend_sycl")
+    (tmp_path / _sibling_lib("ggml-vulkan")).write_bytes(b"ggml_backend_vulkan")
     assert detect_backends(binary) == {Backend.SYCL, Backend.VULKAN}
     assert detect_llama_server_backend(binary) == Backend.SYCL
 
@@ -102,7 +122,7 @@ def test_backend_name_enumeration_is_not_detected(tmp_path):
 
 def test_strong_vulkan_markers_still_detect_in_sibling(tmp_path):
     binary = _make_fake_binary(tmp_path, b"cpu only exe")
-    (tmp_path / "libggml-vulkan.so").write_bytes(
+    (tmp_path / _sibling_lib("ggml-vulkan")).write_bytes(
         b"libvulkan.so.1 and vkGetInstanceProcAddr symbol"
     )
     assert detect_llama_server_backend(binary) == Backend.VULKAN
@@ -111,7 +131,7 @@ def test_strong_vulkan_markers_still_detect_in_sibling(tmp_path):
 def test_vulkan_build_not_misdetected_as_sycl(tmp_path):
     binary = _make_fake_binary(tmp_path, b"cpu only exe")
     (tmp_path / "libggml.so").write_bytes(b"cpu sycl vulkan cuda")
-    (tmp_path / "libggml-vulkan.so").write_bytes(
+    (tmp_path / _sibling_lib("ggml-vulkan")).write_bytes(
         b"libvulkan.so.1 vkGetInstanceProcAddr"
     )
     assert detect_backends(binary) == {Backend.VULKAN}
@@ -120,8 +140,7 @@ def test_vulkan_build_not_misdetected_as_sycl(tmp_path):
 
 def test_detects_vulkan_from_system_lib_dir(tmp_path):
     binary = _make_fake_binary(tmp_path / "bin", b"cpu only exe")
-    lib = tmp_path / "lib" / "libggml-vulkan.so"
-    lib.parent.mkdir(parents=True, exist_ok=True)
+    lib = _system_lib_dir(tmp_path) / _sibling_lib("ggml-vulkan")
     lib.write_bytes(b"libvulkan.so.1 vkGetInstanceProcAddr")
     assert detect_backends(binary) == {Backend.VULKAN}
     assert detect_llama_server_backend(binary) == Backend.VULKAN
@@ -129,9 +148,7 @@ def test_detects_vulkan_from_system_lib_dir(tmp_path):
 
 def test_detects_sycl_from_system_lib_triplet_dir(tmp_path):
     binary = _make_fake_binary(tmp_path / "bin", b"cpu only exe")
-    triplet_dir = tmp_path / "lib" / "x86_64-linux-gnu"
-    triplet_dir.mkdir(parents=True)
-    lib = triplet_dir / "libggml-sycl.so"
+    lib = _system_lib_dir(tmp_path) / _sibling_lib("ggml-sycl")
     lib.write_bytes(b"ggml_backend_sycl")
     assert detect_backends(binary) == {Backend.SYCL}
     assert detect_llama_server_backend(binary) == Backend.SYCL

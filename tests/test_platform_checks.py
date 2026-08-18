@@ -94,18 +94,22 @@ class TestHelpers:
         assert parse_kernel_version("bogus") is None
 
 
+def _setvars_name() -> str:
+    return "setvars.bat" if sys.platform == "win32" else "setvars.sh"
+
+
 class TestOneapiSetvarsPath:
     def test_finds_env_oneapi_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path / "oneapi"))
         monkeypatch.setenv("CMPLR_ROOT", "")
-        setvars = tmp_path / "oneapi" / "setvars.sh"
+        setvars = tmp_path / "oneapi" / _setvars_name()
         setvars.parent.mkdir(parents=True)
         setvars.write_text("# fake")
         assert oneapi_setvars_path() == setvars
 
     def test_finds_cmplr_relative_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         oneapi_root = tmp_path / "oneapi"
-        setvars = oneapi_root / "setvars.sh"
+        setvars = oneapi_root / _setvars_name()
         setvars.parent.mkdir(parents=True)
         setvars.write_text("# fake")
         cmplr = oneapi_root / "compiler" / "2026.1"
@@ -116,7 +120,7 @@ class TestOneapiSetvarsPath:
 
     def test_prefers_env_over_standard_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         env_root = tmp_path / "env-oneapi"
-        env_setvars = env_root / "setvars.sh"
+        env_setvars = env_root / _setvars_name()
         env_setvars.parent.mkdir(parents=True)
         env_setvars.write_text("# fake")
         monkeypatch.setenv("ONEAPI_ROOT", str(env_root))
@@ -126,10 +130,16 @@ class TestOneapiSetvarsPath:
         assert result == env_setvars
 
 
+def _runtime_lib_name() -> str:
+    return "libsvml.dll" if sys.platform == "win32" else "libsvml.so"
+
+
 class TestOneapiRuntimeEnvNeeded:
     def test_no_oneapi_dirs_returns_true(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path / "no-such-oneapi"))
         monkeypatch.setenv("CMPLR_ROOT", "")
+        # Ensure PATH doesn't accidentally find libs on this test runner.
+        monkeypatch.setenv("PATH", "")
         # Ensure ldconfig doesn't accidentally find libs on this test runner.
         monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
         assert oneapi_runtime_env_needed() is True
@@ -137,7 +147,7 @@ class TestOneapiRuntimeEnvNeeded:
     def test_finds_lib_in_oneapi_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         lib_dir = tmp_path / "lib" / "intel64"
         lib_dir.mkdir(parents=True)
-        (lib_dir / "libsvml.so").write_text("")
+        (lib_dir / _runtime_lib_name()).write_text("")
         monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
         monkeypatch.setenv("CMPLR_ROOT", "")
         monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
@@ -146,20 +156,36 @@ class TestOneapiRuntimeEnvNeeded:
 
 class TestSourceSetvars:
     def test_parses_sourced_env(self, tmp_path: Path):
-        setvars = tmp_path / "setvars.sh"
-        setvars.write_text(
-            "export ONEAPI_ROOT=/opt/intel/oneapi\n"
-            "export LD_LIBRARY_PATH=/opt/intel/oneapi/lib/intel64\n"
-            "export PATH=/opt/intel/oneapi/bin:$PATH\n"
-        )
-        env = source_setvars(setvars)
-        assert env["ONEAPI_ROOT"] == "/opt/intel/oneapi"
-        assert env["LD_LIBRARY_PATH"] == "/opt/intel/oneapi/lib/intel64"
-        # PATH should reflect expansion of the (empty) inherited PATH.
-        assert "/opt/intel/oneapi/bin" in env["PATH"]
-        # Bash bookkeeping variables should be stripped.
-        assert "PWD" not in env
-        assert "SHLVL" not in env
+        if sys.platform == "win32":
+            setvars = tmp_path / "setvars.bat"
+            setvars.write_text(
+                r"@echo off" + "\n"
+                r"set ONEAPI_ROOT=C:\Intel\oneAPI" + "\n"
+                r"set LD_LIBRARY_PATH=C:\Intel\oneAPI\lib" + "\n"
+                r"set PATH=C:\Intel\oneAPI\bin;%PATH%" + "\n"
+            )
+            env = source_setvars(setvars)
+            assert env["ONEAPI_ROOT"] == r"C:\Intel\oneAPI"
+            assert env["LD_LIBRARY_PATH"] == r"C:\Intel\oneAPI\lib"
+            assert r"C:\Intel\oneAPI\bin" in env["PATH"]
+        else:
+            setvars = tmp_path / "setvars.sh"
+            setvars.write_text(
+                "export ONEAPI_ROOT=/opt/intel/oneapi\n"
+                "export LD_LIBRARY_PATH=/opt/intel/oneapi/lib/intel64\n"
+                "export PATH=/opt/intel/oneapi/bin:$PATH\n"
+            )
+            env = source_setvars(setvars)
+            assert env["ONEAPI_ROOT"] == "/opt/intel/oneapi"
+            assert env["LD_LIBRARY_PATH"] == "/opt/intel/oneapi/lib/intel64"
+            # PATH should reflect expansion of the (empty) inherited PATH.
+            assert "/opt/intel/oneapi/bin" in env["PATH"]
+            # Bash bookkeeping variables should be stripped.
+            assert "PWD" not in env
+            assert "SHLVL" not in env
 
     def test_missing_script_returns_empty(self, tmp_path: Path):
-        assert source_setvars(tmp_path / "no-such-setvars.sh") == {}
+        if sys.platform == "win32":
+            assert source_setvars(tmp_path / "no-such-setvars.bat") == {}
+        else:
+            assert source_setvars(tmp_path / "no-such-setvars.sh") == {}

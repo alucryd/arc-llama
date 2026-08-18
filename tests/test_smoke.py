@@ -11,13 +11,12 @@ GitHub Actions has no Intel Arc GPU.
 """
 from __future__ import annotations
 
-import json
 import os
-import pwd
 import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -26,25 +25,26 @@ _SKIP_REASON = "Set ARC_LLAMA_SMOKE_MODEL to run inference smoke test"
 
 def _real_home() -> str:
     """Return the real user's home, ignoring any test-isolated HOME env var."""
+    if sys.platform == "win32":
+        return str(Path.home())
     try:
+        import pwd
+
         return pwd.getpwuid(os.getuid()).pw_dir
-    except KeyError:
+    except (KeyError, ImportError):
         return os.path.expanduser("~")
 
 
 def _wait_for_server(url: str, timeout: float = 60.0) -> None:
+    import httpx
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            result = subprocess.run(
-                ["curl", "-fsS", f"{url}/v1/models"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
+            r = httpx.get(f"{url}/v1/models", timeout=5)
+            if r.status_code == 200:
                 return
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except Exception:
             pass
         time.sleep(1)
     raise RuntimeError(f"arc-llama serve did not become ready at {url}")
@@ -89,32 +89,27 @@ def test_inference_smoke() -> None:
     try:
         _wait_for_server(server_url)
 
-        result = subprocess.run(
-            [
-                "curl",
-                "-fsS",
-                f"{server_url}/v1/chat/completions",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                json.dumps(
-                    {
-                        "model": model,
-                        "messages": [{"role": "user", "content": "Say hello"}],
-                        "max_tokens": 16,
-                    }
-                ),
-            ],
-            capture_output=True,
-            text=True,
+        import httpx
+
+        r = httpx.post(
+            f"{server_url}/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "Say hello"}],
+                "max_tokens": 16,
+            },
             timeout=120,
         )
-        assert result.returncode == 0, result.stderr
-        data = json.loads(result.stdout)
+        r.raise_for_status()
+        data = r.json()
         content = data["choices"][0]["message"]["content"]
         assert content and isinstance(content, str)
     finally:
-        proc.send_signal(signal.SIGTERM)
+        if sys.platform == "win32":
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:

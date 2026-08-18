@@ -43,6 +43,8 @@ import logging
 import os
 import secrets
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,8 @@ from arc_llama.arch import Arch, Backend
 from arc_llama.recipes import KVCacheType, LaunchRecipe
 
 CONFIG_VERSION = 1
+
+_save_locks: dict[str, threading.Lock] = {}
 
 
 def _xdg_config_home() -> Path:
@@ -422,7 +426,9 @@ class Config:
 
         Write to a temporary file beside the target, fsync it, then rename
         over the original. Rename is atomic, so a reader either sees the whole
-        old file or the whole new one and never a partial write.
+        old file or the whole new one and never a partial write. On Windows
+        concurrent renames of the same target can collide; a per-path lock
+        plus a small retry loop keeps multi-threaded saves reliable.
 
         The file carries ``server.admin_token``, so it is created 0600 and
         chmod'ed before the rename rather than after: it must never be
@@ -446,25 +452,46 @@ class Config:
         # name; pid alone is not enough, since a single process can save from
         # more than one thread.
         tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            with open(tmp, "wb") as f:
-                tomli_w.dump(self.to_toml_dict(), f)
-                f.flush()
-                os.fsync(f.fileno())
+
+        # Serialize concurrent saves targeting the same path. On Windows the
+        # atomic-rename collision is visible as PermissionError; on POSIX it
+        # is harmless but the lock still prevents temp-name starvation.
+        key = str(path.resolve())
+        lock = _save_locks.setdefault(key, threading.Lock())
+        with lock:
             try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                # Windows and some filesystems have limited chmod. Not fatal.
-                logging.getLogger("arc_llama.config").debug(
-                    "could not chmod config temp file", exc_info=True
-                )
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with open(tmp, "wb") as f:
+                    tomli_w.dump(self.to_toml_dict(), f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    # Windows and some filesystems have limited chmod. Not fatal.
+                    logging.getLogger("arc_llama.config").debug(
+                        "could not chmod config temp file", exc_info=True
+                    )
+                # Windows can briefly deny the rename when another handle is
+                # closing; a short retry absorbs the race without weakening
+                # atomicity.
+                if os.name == "nt":
+                    deadline = time.monotonic() + 0.5
+                    while True:
+                        try:
+                            os.replace(tmp, path)
+                            break
+                        except PermissionError:
+                            if time.monotonic() > deadline:
+                                raise
+                            time.sleep(0.01)
+                else:
+                    os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
         # Best-effort durability for the rename itself. POSIX only: opening a
         # directory for fsync is not permitted on Windows.
