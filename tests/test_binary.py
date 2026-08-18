@@ -23,11 +23,14 @@ def _make_fake_binary(tmp_path: Path, content: bytes) -> Path:
 
 
 def _sibling_lib(name: str) -> str:
-    """Return the platform-appropriate shared-library filename for ggml backends."""
-    # Windows official builds ship `ggml-vulkan.dll`; Linux ships `libggml-vulkan.so`.
+    """Return the platform-appropriate shared-library filename for ggml backends.
+
+    *name* is the bare backend name, e.g. ``vulkan`` or ``sycl``.  Windows
+    official builds ship ``ggml-vulkan.dll``; Linux ships ``libggml-vulkan.so``.
+    """
     if sys.platform == "win32":
-        return f"{name}.dll"
-    return f"{name}.so"
+        return f"ggml-{name}.dll"
+    return f"libggml-{name}.so"
 
 
 def _system_lib_dir(tmp_path: Path) -> Path:
