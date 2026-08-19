@@ -5,21 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.7.0] - 2026-08-19
 
 ### Added
 - Memory-aware context/batch defaults now respect `ARC_LLAMA_MAX_CTX` as a global ceiling on auto-suggested context length. (#55)
 - `arc-llama add` gained `--batch-size` to complement `--ubatch-size` and prints the chosen `ctx`/`ub`/`b` values after registration. (#55)
 - SYCL launches now auto-detect and source Intel oneAPI `setvars.sh` when the runtime libraries are not visible, supporting non-standard install prefixes such as `/mnt/storage/opt/intel/oneapi`. Set `paths.oneapi_setvars` in the config to override the auto-detected path. (#56)
 - Added an opt-in inference smoke test (`tests/test_smoke.py`). Set `ARC_LLAMA_SMOKE_MODEL` to run it locally on a machine with a model and Intel Arc GPU.
+- Windows GPU detection via WMIC with PowerShell fallback.
+- Windows ggml backend sibling discovery (`ggml*.dll`).
+- Windows oneAPI `.bat` setvars sourcing and Level Zero DLL discovery.
+- GitHub Actions CI matrix for Ubuntu and Windows.
 
 ### Changed
 - Dockerfile now pins llama.cpp to `b10280` (was `b9946`). (#54)
 - CI now runs `mypy src/arc_llama` and builds the Dockerfile on every PR.
+- README updated with Windows-specific setup instructions.
 
 ### Fixed
 - `.dockerignore` no longer excludes `docker-entrypoint.sh`, so the Dockerfile can build again.
 - Cleaned up mypy errors in `detect.py`, `runtime.py`, `server.py`, and `cli.py`.
+- Hardened `Config.save()` for concurrent Windows renames.
+- Strengthened agent tool path traversal check for Windows drives.
+- Tests now pass on Windows (library prefixes, `.dll`/`.bat` detection, symlinks, `pwd`, `curl`).
 
 ## [0.6.2] - 2026-08-11
 
