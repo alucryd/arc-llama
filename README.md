@@ -12,6 +12,8 @@ have to discover them the hard way.
 It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
+> ⭐ If this saved you a few hours, a star on this repo keeps me building.
+
 > [!NOTE]
 > **Status: 0.6.2.** Tested end-to-end on Battlemage B60 on Linux and Windows:
 > `arc-llama install-runtime` fetches a portable Vulkan `llama-server` and
