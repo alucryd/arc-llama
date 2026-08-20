@@ -619,11 +619,31 @@ async def tune_model(
                 error="aborted before measurement",
             )
             return res, None, "aborted before measurement"
-        res = await benchmark_model(
-            server_url, model_name,
-            prompt_tokens=pt, gen_tokens=gen_tokens,
-            load=True, cfg=cfg,
-        )
+        try:
+            res = await benchmark_model(
+                server_url, model_name,
+                prompt_tokens=pt, gen_tokens=gen_tokens,
+                load=True, cfg=cfg,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # A candidate that crashes the backend (OOM, SIGSEGV, hung health
+            # check, etc.) must lose the stage rather than aborting the whole
+            # sweep. Record the failure and let the tuner move on.
+            log.warning(
+                "tune %s: measurement failed for %s at %d tokens: %s",
+                model_name, _state_key(state), pt, exc,
+            )
+            res = BenchmarkResult(
+                model=model_name,
+                ctx=int(state.get("ctx", 0)),
+                cache_type_k=str(state.get("cache_type_k", "?")),
+                cache_type_v=str(state.get("cache_type_v", "?")),
+                prompt_tokens=pt,
+                gen_tokens=gen_tokens,
+                error=f"measurement failed: {exc}",
+            )
         sc = score_result(res, target, priority)
         measured[key] = (res, sc)
         return res, sc, None

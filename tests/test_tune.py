@@ -245,6 +245,32 @@ async def test_tune_failing_candidate_loses(cfg, monkeypatch):
     assert "ubatch_size" not in report.best_edits
 
 
+async def test_tune_raising_candidate_loses(cfg, monkeypatch):
+    # f16 KV crashes the backend (exception) — tuner must not abort.
+    table = {
+        ("q8_0", 512, None): (800.0, 30.0),
+    }
+    fake = FakeMeasurements(table, cfg)
+
+    async def bench(server_url, model_name, **kw):
+        if fake.state.get("cache_type_k") == "f16":
+            raise RuntimeError("llama-server exited with SIGSEGV")
+        return await FakeMeasurements.bench(fake, server_url, model_name, **kw)
+
+    monkeypatch.setattr("arc_llama.tune._apply_edits", fake.apply)
+    monkeypatch.setattr("arc_llama.tune.benchmark_model", bench)
+
+    report = await tune_model("http://127.0.0.1:11437", "m", cfg=cfg)
+    assert report.error is None
+    # No KV candidate beat the baseline, so best_edits stays empty and the
+    # baseline recipe (q8_0) is restored.
+    assert report.best_edits == {}
+    assert report.baseline.cache_type_k == "q8_0"
+    failed = [s for s in report.steps if s.edits.get("cache_type_k") == "f16"]
+    assert failed
+    assert all(s.result is not None and s.result.error and not s.chosen for s in failed)
+
+
 async def test_tune_unknown_model(cfg):
     report = await tune_model("http://127.0.0.1:11437", "nope", cfg=cfg)
     assert report.error is not None
