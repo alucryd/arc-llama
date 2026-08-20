@@ -28,6 +28,11 @@ class FakeRouter:
     def all_models(self):
         return list(self.cfg.models)
 
+    def all_audio_models(self):
+        # /v1/models lists speech backends beside the LLMs, so a router stub
+        # has to answer for both registries.
+        return list(self.cfg.audio_models)
+
     async def shutdown(self):
         return None
 
