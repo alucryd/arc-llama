@@ -1333,6 +1333,20 @@ async def _forward_audio(
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
         acquired_model = resolved.name
+        if not isinstance(resolved, AudioModelConfig):
+            # ensure_active resolves by name across both registries, and
+            # find_any_model tries LLMs first. Registration refuses a name
+            # that is already taken, so this needs a hand-edited config —
+            # in which case an audio request is about to be answered by a
+            # chat model, and saying so beats transcribing gibberish.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{resolved.name!r} is registered in both [[models]] and "
+                    "[[audio_models]]; rename one so audio requests reach the "
+                    "audio backend."
+                ),
+            )
         target_url = f"{srv.plan.backend_url}{target_path}"
         request_kwargs = build_kwargs(resolved)
 

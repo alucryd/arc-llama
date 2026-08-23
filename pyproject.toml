@@ -168,6 +168,24 @@ target-version = "py310"
 select = ["E", "F", "W", "I", "B", "UP", "N"]
 ignore = ["E501"]
 
+[tool.mypy]
+# Deliberately no global strictness change here: this section exists only to
+# teach mypy about imports it cannot possibly resolve.
+
+# The TTS sidecars under src/arc_llama/tts/sidecars/ are not run by arc-llama's
+# interpreter. They are standalone scripts executed by whatever virtualenv has
+# the model framework installed, precisely so arc-llama itself never depends on
+# torch and friends. Their logic is still worth type-checking, so ignore the
+# missing stubs rather than excluding the files.
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torchao.*",
+    "omnivoice.*",
+    "soundfile",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
