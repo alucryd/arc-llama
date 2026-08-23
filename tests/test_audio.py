@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -145,7 +148,19 @@ def _fake_hf_cache(tmp_path, repo_id, *, blob_bytes, stale_revision_bytes=0):
 
 
 def _fake_binary(tmp_path, name, help_text=""):
-    """An executable file, so resolve_binary() finds something real."""
+    """An executable file, so resolve_binary() finds something real.
+
+    Windows has no executable bit and does not run extensionless files: a
+    PATH lookup there only considers names ending in a PATHEXT suffix, so a
+    bare `llama-server` is invisible to `shutil.which` no matter where it
+    sits. Give it a real extension on Windows and a shebang on POSIX, so the
+    helper models an actual install on both.
+    """
+    if sys.platform == "win32":
+        p = tmp_path / f"{name}.cmd"
+        body = "\r\n".join(f"echo {line}" for line in (help_text.splitlines() or [""]))
+        p.write_text(f"@echo off\r\n{body}\r\n")
+        return p
     p = tmp_path / name
     p.write_text(f"#!/bin/sh\ncat <<'EOF'\n{help_text}\nEOF\n")
     p.chmod(0o755)
@@ -528,7 +543,7 @@ class TestBuildLlamacppAudioPlan:
         model = _audio_model(tmp_path, recipe={"ctx": 8192})
         plan = build_audio_plan(cfg, model, cfg.gpus[0])
 
-        assert plan.argv[0].endswith("llama-server")
+        assert Path(plan.argv[0]).stem == "llama-server"
         assert "--mmproj" in plan.argv
         assert plan.argv[plan.argv.index("--mmproj") + 1].endswith(
             "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf"
@@ -641,7 +656,7 @@ class TestBuildOmniVoicePlan:
         cfg = self._cfg(tmp_path)
         plan = build_audio_plan(cfg, _tts_model(tmp_path), cfg.gpus[0])
 
-        assert plan.argv[0].endswith("python3-tts")
+        assert Path(plan.argv[0]).stem == "python3-tts"
         assert plan.argv[1].endswith("omnivoice_server.py")
         assert plan.argv[plan.argv.index("--port") + 1] == "18091"
         assert plan.health_url == "http://127.0.0.1:18091/health"
@@ -994,7 +1009,7 @@ class TestResidencyPolicy:
     def test_audio_backends_are_registered_in_the_server_map(self, tmp_path):
         rt = self._router(tmp_path)
         assert "qwen3-asr" in rt._servers
-        assert rt._servers["qwen3-asr"].plan.argv[0].endswith("llama-server")
+        assert Path(rt._servers["qwen3-asr"].plan.argv[0]).stem == "llama-server"
 
     def test_tts_backends_join_the_same_map(self, tmp_path):
         cfg = Config(
@@ -1093,7 +1108,13 @@ class TestResolveBinary:
         """A build dropped on PATH must count as installed."""
         binary = _fake_binary(tmp_path, "llama-server")
         monkeypatch.setenv("PATH", str(tmp_path))
-        assert resolve_binary("llama-server") == str(binary)
+        resolved = resolve_binary("llama-server")
+        assert resolved is not None
+        # Compared by identity, not by string: on Windows the name carries a
+        # PATHEXT suffix and `shutil.which` returns it in whatever case
+        # PATHEXT spells, so the two paths point at one file without
+        # matching character for character.
+        assert os.path.samefile(resolved, binary)
 
     def test_missing_bare_name_is_none(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PATH", str(tmp_path))
