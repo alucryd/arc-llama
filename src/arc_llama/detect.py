@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from arc_llama.arch import Arch, arch_for_device_id, known_vram_mib
 INTEL_VENDOR_ID = 0x8086
 PCI_CLASS_VGA = 0x030000      # 0x03_00_00 — VGA-compatible controller
 PCI_CLASS_DISPLAY = 0x038000  # 0x03_80_00 — other display controller
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 @dataclass
@@ -110,8 +113,177 @@ def _vram_mib(sysfs: Path) -> int | None:
     return None
 
 
+def _parse_wmic_video_controller(text: str) -> list[dict[str, str]]:
+    """Parse `wmic ... /value` or PowerShell ``Format-List`` output.
+
+    WMIC /value emits ``Key=value``; PowerShell Format-List emits
+    ``Key        : value``. Both use a blank line between objects.
+    """
+    objects: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            if current:
+                objects.append(current)
+                current = {}
+            continue
+        # WMIC /value uses '=', PowerShell Format-List uses ':'.
+        if "=" in line:
+            key, _, value = line.partition("=")
+        elif ":" in line:
+            key, _, value = line.partition(":")
+        else:
+            continue
+        current[key.strip()] = value.strip()
+    if current:
+        objects.append(current)
+    return objects
+
+
+def _device_id_from_pnp(pnp: str) -> int | None:
+    """Extract the PCI device ID from a Windows PNPDeviceID string.
+
+    Example: PCI\\VEN_8086&DEV_56A0&SUBSYS_... -> 0x56A0
+    """
+    m = re.search(r"DEV_([0-9A-Fa-f]{4})", pnp)
+    if m:
+        return int(m.group(1), 16)
+    return None
+
+
+#: Fields we ask WMIC for. *AdapterRAM* is the total adapter memory in bytes.
+_WMIC_FIELDS = ("Name", "PNPDeviceID", "AdapterRAM")
+
+
+def _build_detected_gpu_from_windows_fields(
+    name: str, pnp: str, ram_text: str
+) -> DetectedGPU | None:
+    """Convert one Windows video-controller entry into a DetectedGPU, or None."""
+    if "VEN_8086" not in pnp.upper():
+        return None
+    device_id = _device_id_from_pnp(pnp)
+    if device_id is None:
+        return None
+    arch, detected_name = arch_for_device_id(device_id)
+    # Prefer the marketing name reported by the driver when available.
+    display_name = name if name and "Intel" in name else detected_name
+    vram_mb: int | None = None
+    table_vram_mb = known_vram_mib(device_id)
+    if ram_text.isdigit():
+        parsed_vram_mb = int(ram_text) // (1024 * 1024)
+        # Win32_VideoController.AdapterRAM is a 32-bit signed field and often
+        # saturates at ~2 GiB for cards with much more memory. Prefer the
+        # known-size table whenever it gives a larger, believable value.
+        if table_vram_mb is not None and parsed_vram_mb < table_vram_mb:
+            vram_mb = table_vram_mb
+            display_name = f"{display_name} (VRAM from device-ID table)"
+        else:
+            vram_mb = parsed_vram_mb
+    if vram_mb is None or vram_mb == 0:
+        vram_mb = table_vram_mb
+        if vram_mb is not None:
+            display_name = f"{display_name} (VRAM from device-ID table)"
+    gpu = DetectedGPU(
+        pci_slot=pnp if pnp else "intel-gpu-0",
+        device_id=device_id,
+        arch=arch,
+        name=display_name,
+        driver=None,
+        vram_mb=vram_mb,
+        drm_card=None,
+        drm_render=None,
+        sysfs_path="",
+    )
+    gpu.notes.append(f"Windows: {name}")
+    return gpu
+
+
+def _scan_pci_windows_wmic() -> list[DetectedGPU]:
+    """Enumerate Intel GPUs on Windows using WMIC.
+
+    WMIC is deprecated and removed from some Windows 11 builds; a subprocess
+    failure is not fatal. Callers should fall back to PowerShell if this
+    returns an empty list.
+    """
+    try:
+        out = subprocess.run(
+            ["wmic", "path", "win32_VideoController", "get", ",".join(_WMIC_FIELDS), "/value"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if out.returncode != 0:
+        return []
+
+    found: list[DetectedGPU] = []
+    for obj in _parse_wmic_video_controller(out.stdout):
+        gpu = _build_detected_gpu_from_windows_fields(
+            obj.get("Name", "Intel GPU"),
+            obj.get("PNPDeviceID", ""),
+            obj.get("AdapterRAM", ""),
+        )
+        if gpu is not None:
+            found.append(gpu)
+    return found
+
+
+def _scan_pci_windows_powershell() -> list[DetectedGPU]:
+    """Enumerate Intel GPUs on Windows using PowerShell / Get-CimInstance.
+
+    This is the fallback when ``wmic`` is not installed. PowerShell is present
+    on every modern Windows system, but it is slower to start, so WMIC is
+    preferred when available.
+    """
+    fields = ",".join(_WMIC_FIELDS)
+    cmd = (
+        "Get-CimInstance -ClassName Win32_VideoController | "
+        f"Select-Object {fields} | "
+        "Format-List | "
+        "Out-String -Width 4096"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if out.returncode != 0:
+        return []
+
+    found: list[DetectedGPU] = []
+    for obj in _parse_wmic_video_controller(out.stdout):
+        gpu = _build_detected_gpu_from_windows_fields(
+            obj.get("Name", "Intel GPU"),
+            obj.get("PNPDeviceID", ""),
+            obj.get("AdapterRAM", ""),
+        )
+        if gpu is not None:
+            found.append(gpu)
+    return found
+
+
+def _scan_pci_windows() -> list[DetectedGPU]:
+    """Enumerate Intel GPUs on Windows (WMIC first, PowerShell fallback)."""
+    found = _scan_pci_windows_wmic()
+    if not found:
+        found = _scan_pci_windows_powershell()
+    for i, g in enumerate(found):
+        g._index = i  # type: ignore[attr-defined]
+    return found
+
+
 def _scan_pci() -> list[DetectedGPU]:
     """Walk /sys/bus/pci/devices and collect Intel GPUs."""
+    if _IS_WINDOWS:
+        return _scan_pci_windows()
     pci_root = Path("/sys/bus/pci/devices")
     if not pci_root.exists():
         return []
@@ -244,8 +416,11 @@ def lspci_intel_gpus() -> str:
     """Return raw `lspci -nn` output filtered to Intel display devices.
 
     Useful for `arc-llama doctor` and for issue reports when arc-llama doesn't
-    recognise a card.
+    recognise a card. On Windows this returns an empty string; use the output
+    of `arc-llama gpus` instead.
     """
+    if _IS_WINDOWS:
+        return ""
     try:
         out = subprocess.run(
             ["lspci", "-nn"], capture_output=True, text=True, timeout=5,

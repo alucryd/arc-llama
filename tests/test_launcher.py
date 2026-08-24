@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,8 @@ class TestBuildEnv:
     def test_sycl_sources_setvars_when_runtime_missing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ):
+        if sys.platform == "win32":
+            pytest.skip("bash setvars sourcing is not exercised on Windows")
         monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
         setvars = tmp_path / "setvars.sh"
         setvars.write_text("export ONEAPI_ROOT=/fake/oneapi\nexport LD_LIBRARY_PATH=/fake/lib\n")

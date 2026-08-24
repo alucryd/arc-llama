@@ -12,12 +12,15 @@ have to discover them the hard way.
 It's built for the day you unbox an Arc card, install drivers, and want
 something useful before lunch.
 
+> ⭐ If this saved you a few hours, a star on this repo keeps me building.
+
 > [!NOTE]
-> **Status: 0.5.0.** Tested end-to-end on Battlemage B60: `arc-llama
-> install-runtime` fetches a portable Vulkan `llama-server` and serves real
-> inference with no oneAPI install or source build. HF download, streaming,
-> and the OpenAI-compatible API all pass. Other SKUs (A770, A380, B580) need
-> community confirmation -- open an issue if something breaks on your card.
+> **Status: 0.6.2.** Tested end-to-end on Battlemage B60 on Linux and Windows:
+> `arc-llama install-runtime` fetches a portable Vulkan `llama-server` and
+> serves real inference with no oneAPI install or source build. HF download,
+> streaming, and the OpenAI-compatible API all pass. Other SKUs (A770, A380,
+> B580) need community confirmation -- open an issue if something breaks on
+> your card.
 
 ## What you get
 
@@ -113,28 +116,44 @@ curl http://127.0.0.1:11437/v1/chat/completions \
 
 ## Requirements
 
-- Linux, kernel **6.14+ recommended** for Battlemage (`xe` driver; 6.8 is the
-  minimum where `xe` exists, but 6.14+ is stable for BMG) or 5.17+ for
-  Alchemist (`i915`). This matches the threshold `arc-llama doctor` warns on.
-- ReBAR enabled in BIOS , without it llama.cpp falls back to slow paths on Arc.
-- A `llama-server` built with the SYCL backend. The Intel oneAPI Base Toolkit
-  is the supported build path:
-  ```bash
-  source /opt/intel/oneapi/setvars.sh
-  cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
-  cmake --build build --config Release -j
-  ```
-  If you installed oneAPI to a non-standard prefix (tarball install, relocated
-  `/opt/intel`, etc.), arc-llama detects `setvars.sh` from `$ONEAPI_ROOT`,
-  `$CMPLR_ROOT`, `/opt/intel/oneapi`, `/usr/local/intel/oneapi`, and
-  `/mnt/storage/opt/intel/oneapi`, and sources it automatically when the runtime
-  libraries are not visible to the system loader. You can also pin the path in
-  `config.toml`:
-  ```toml
-  [paths]
-  oneapi_setvars = "/your/prefix/oneapi/setvars.sh"
-  ```
+### Linux
+
+- Kernel **6.14+ recommended** for Battlemage (`xe` driver; 6.8 is the minimum
+  where `xe` exists, but 6.14+ is stable for BMG) or 5.17+ for Alchemist
+  (`i915`). This matches the threshold `arc-llama doctor` warns on.
 - User in the `render` and `video` groups (`arc-llama doctor` will tell you).
+
+### Windows
+
+- Windows 10/11 with Intel Arc graphics drivers installed.
+- For the SYCL backend: Intel oneAPI Base Toolkit installed.
+- `arc-llama doctor` will report which tools and runtime libraries it finds.
+- The `systemd` command is not available on Windows; use Task Scheduler or run
+  `arc-llama serve` manually.
+
+### Both platforms
+
+- ReBAR enabled in BIOS; without it llama.cpp falls back to slow paths on Arc.
+- A `llama-server` built with the SYCL or Vulkan backend.
+
+For a SYCL build on Linux, the supported path is:
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+cmake --build build --config Release -j
+```
+
+If you installed oneAPI to a non-standard prefix (tarball install, relocated
+`/opt/intel`, etc.), arc-llama detects `setvars.sh` (Linux) or `setvars.bat`
+(Windows) from `$ONEAPI_ROOT`, `$CMPLR_ROOT`, and common prefixes, and sources
+it automatically when the runtime libraries are not visible to the system
+loader. You can also pin the path in `config.toml`:
+
+```toml
+[paths]
+oneapi_setvars = "/your/prefix/oneapi/setvars.sh"   # Linux
+# oneapi_setvars = "C:\\Program Files (x86)\\Intel\\oneAPI\\setvars.bat"  # Windows
+```
 
 ## Benchmark & autotune
 
@@ -203,7 +222,9 @@ The model list is cached for 30 seconds and refreshed on demand.
 
 ## Configuration reference
 
-`$XDG_CONFIG_HOME/arc-llama/config.toml`:
+On Linux the config lives at `$XDG_CONFIG_HOME/arc-llama/config.toml` (usually
+`~/.config/arc-llama/config.toml`). On Windows it lives at
+`%APPDATA%\arc-llama\config.toml`.
 
 ```toml
 version = 1
@@ -214,16 +235,16 @@ port = 11437
 single_resident = true
 
 [paths]
-llama_server = "/usr/local/bin/llama-server"
-models_dir   = "~/.local/share/arc-llama/models"
-state_dir    = "~/.local/state/arc-llama"
+llama_server = "/usr/local/bin/llama-server"   # Windows: "C:\\...\\llama-server.exe"
+models_dir   = "~/.local/share/arc-llama/models" # Windows: "%LOCALAPPDATA%\\arc-llama\\models"
+state_dir    = "~/.local/state/arc-llama"        # Windows: "%LOCALAPPDATA%\\arc-llama"
 
 [tune]
 auto         = true      # idle-time background sweeps
 idle_seconds = 120
 
 [[gpus]]
-pci_slot   = "0000:03:00.0"
+pci_slot   = "0000:03:00.0"   # Windows: PNPDeviceID such as "PCI\\VEN_8086&DEV_E211&..."
 sycl_index = 0
 arch       = "battlemage"
 backend    = "sycl"          # or "vulkan" for a Vulkan llama-server build
@@ -234,7 +255,7 @@ name       = "Arc Pro B60"
 [[models]]
 name             = "qwen3-7b"
 display_name     = "Qwen 3 7B"
-path             = "/home/me/models/qwen3-7b-q4_k_m.gguf"
+path             = "/home/me/models/qwen3-7b-q4_k_m.gguf"   # Windows: use double backslashes or forward slashes
 gpu_pci_slot     = "0000:03:00.0"
 port             = 18080
 kv_class         = "default"

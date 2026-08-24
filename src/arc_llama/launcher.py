@@ -90,7 +90,7 @@ def _preexec_isolate_and_pdeathsig() -> None:
     in the main thread, so this is a non-issue today, but a future move to a
     thread-pool launcher would need rework.
     """
-    os.setsid()
+    os.setsid()  # type: ignore[attr-defined]
     libc = _load_libc()
     if libc is None:
         return
@@ -507,7 +507,7 @@ class LlamaServer:
                     pass
         else:
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)  # type: ignore[attr-defined]
             except ProcessLookupError:
                 pass
             try:
@@ -515,7 +515,7 @@ class LlamaServer:
             except subprocess.TimeoutExpired:
                 log.warning("[%s] SIGTERM timed out, sending SIGKILL", self.name)
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
                 except ProcessLookupError:
                     pass
                 try:

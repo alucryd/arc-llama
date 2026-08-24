@@ -19,6 +19,10 @@ venv/
 state/
 models/
 
+# autotune scratch notes
+AUTOTUNE_*.md
+EOF
+
 # IDE
 .vscode/
 .idea/

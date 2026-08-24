@@ -760,6 +760,8 @@ def test_slugify_for_name_empty_parent():
 
 
 def test_discover_and_register_ggufs_skips_hidden_symlink_and_existing_files(tmp_path):
+    import sys
+
     models_dir = tmp_path / "models"
     nested = models_dir / "vendor" / "model"
     nested.mkdir(parents=True)
@@ -769,7 +771,12 @@ def test_discover_and_register_ggufs_skips_hidden_symlink_and_existing_files(tmp
     hidden = models_dir / ".hidden"
     hidden.mkdir()
     (hidden / "ignored.gguf").write_bytes(b"hidden")
-    (models_dir / "link.gguf").symlink_to(first)
+    try:
+        (models_dir / "link.gguf").symlink_to(first)
+    except OSError:
+        if sys.platform == "win32":
+            pytest.skip("Windows symlink creation requires elevated privileges")
+        raise
 
     cfg = Config(
         paths=PathsConfig(models_dir=str(models_dir)),

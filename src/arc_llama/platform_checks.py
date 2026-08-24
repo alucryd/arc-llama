@@ -136,7 +136,42 @@ def user_in_groups(*needed: str) -> dict[str, bool]:
 
 
 def level_zero_loader_present() -> tuple[bool, str]:
-    """Look for Level Zero loader library on common paths / ldconfig."""
+    """Look for Level Zero loader library on common paths / ldconfig (Linux) or PATH / oneAPI roots (Windows)."""
+    if sys.platform == "win32":
+        names = (
+            "libze_loader.dll",
+            "ze_loader.dll",
+        )
+        search_dirs: list[Path] = []
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        search_dirs.append(Path(program_files_x86) / "Intel" / "oneAPI")
+        oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
+        if oneapi_root:
+            p = Path(oneapi_root)
+            search_dirs.extend([p, p / "lib", p / "bin"])
+        # Also check directories on PATH.
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            entry = entry.strip()
+            if entry:
+                search_dirs.append(Path(entry))
+
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for name in names:
+                candidate = d / name
+                if candidate.exists():
+                    return True, str(candidate)
+                try:
+                    for child in d.iterdir():
+                        if child.is_dir():
+                            c2 = child / name
+                            if c2.exists():
+                                return True, str(c2)
+                except OSError:
+                    pass
+        return False, ""
+
     names = (
         "libze_loader.so.1",
         "libze_loader.so",
@@ -204,12 +239,18 @@ def oneapi_setvars_path() -> Path | None:
     """
     if sys.platform == "win32":
         base = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-        for env_key in ("ONEAPI_ROOT", "CMPLR_ROOT"):
-            env_val = os.environ.get(env_key)
-            if env_val:
-                p = Path(env_val) / "setvars.bat"
-                if p.exists():
-                    return p
+        oneapi_root = os.environ.get("ONEAPI_ROOT")
+        if oneapi_root:
+            p = Path(oneapi_root) / "setvars.bat"
+            if p.exists():
+                return p
+        cmplr_root = os.environ.get("CMPLR_ROOT")
+        if cmplr_root:
+            # CMPLR_ROOT points at e.g. ...\oneapi\compiler\2026.1; setvars.bat is two
+            # levels above, at the oneapi root.
+            p = Path(cmplr_root).parent.parent / "setvars.bat"
+            if p.exists():
+                return p
         p = base / "Intel" / "oneAPI" / "setvars.bat"
         return p if p.exists() else None
 
@@ -241,13 +282,45 @@ def oneapi_runtime_env_needed() -> bool:
     llama-server binary is likely to fail at startup with missing-library errors
     or "No device of requested type available".
     """
+    if sys.platform == "win32":
+        names = (
+            "libsvml.dll",
+            "libze_loader.dll",
+            "ze_loader.dll",
+        )
+        search_dirs: list[Path] = []
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        search_dirs.append(Path(program_files_x86) / "Intel" / "oneAPI")
+        oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
+        if oneapi_root:
+            p = Path(oneapi_root)
+            search_dirs.extend([p, p / "lib", p / "bin"])
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            entry = entry.strip()
+            if entry:
+                search_dirs.append(Path(entry))
+
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            for name in names:
+                if (d / name).exists():
+                    return False
+                try:
+                    for child in d.iterdir():
+                        if child.is_dir() and (child / name).exists():
+                            return False
+                except OSError:
+                    pass
+        return True
+
     names = (
         "libsvml.so",
         "libsvml.so.2",
         "libze_loader.so.1",
         "libze_loader.so",
     )
-    search_dirs: list[Path] = [
+    search_dirs = [
         Path("/opt/intel/oneapi/lib"),
         Path("/opt/intel/oneapi/lib/intel64"),
         Path("/usr/local/intel/oneapi/lib"),
@@ -293,16 +366,56 @@ def oneapi_runtime_env_needed() -> bool:
 def source_setvars(setvars_path: Path | str) -> dict[str, str]:
     """Source a oneAPI setvars script and return the resulting environment diff.
 
-    Runs the script in a bash subprocess, then strips bash-only bookkeeping
-    variables so the returned dict contains the additions/changes setvars
-    introduced. If the script does not exist or fails, returns an empty dict.
+    On Linux, runs the script in a bash subprocess and parses null-delimited
+    env output. On Windows, runs the equivalent ``setvars.bat`` in ``cmd.exe``
+    and parses the ``set`` output. If the script does not exist or fails,
+    returns an empty dict.
     """
     setvars_path = Path(setvars_path)
     if not setvars_path.exists():
         return {}
+
     if sys.platform == "win32":
-        # Windows setvars.bat is not sourced the same way; callers should handle it.
-        return {}
+        # setvars.bat must be run from its own directory or it complains.
+        # We run a tiny wrapper batch that calls setvars.bat (using `call` so
+        # control returns to the wrapper) then dumps the environment.
+        import tempfile
+
+        wrapper_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".bat", delete=False, encoding="utf-8"
+            ) as wrapper:
+                wrapper_path = Path(wrapper.name)
+                wrapper.write("@echo off\n")
+                wrapper.write(f'cd /d "{setvars_path.parent}"\n')
+                # `call` is required so cmd resumes the wrapper after the batch.
+                wrapper.write(f'call "{setvars_path}"\n')
+                wrapper.write("set\n")
+            out = subprocess.run(
+                ["cmd", "/C", str(wrapper_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return {}
+        finally:
+            if wrapper_path is not None:
+                try:
+                    os.unlink(wrapper_path)
+                except OSError:
+                    pass
+        if out.returncode != 0:
+            return {}
+        sourced: dict[str, str] = {}
+        for line in out.stdout.splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            sourced[key] = value
+        return sourced
 
     # Use bash to source the script and dump the environment. setvars.sh is
     # a bash script, so this is the most reliable way to capture its effects.
@@ -325,7 +438,7 @@ def source_setvars(setvars_path: Path | str) -> dict[str, str]:
         return {}
 
     # Parse null-delimited env output.
-    sourced: dict[str, str] = {}
+    sourced = {}
     for item in out.stdout.split(b"\x00"):
         if b"=" not in item:
             continue
@@ -340,6 +453,8 @@ def source_setvars(setvars_path: Path | str) -> dict[str, str]:
 
 
 def kernel_module_loaded(name: str) -> bool:
+    if sys.platform == "win32":
+        return False
     return Path(f"/sys/module/{name}").exists()
 
 
