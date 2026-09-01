@@ -33,6 +33,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import click
 import httpx
@@ -1462,6 +1463,13 @@ def benchmark_cmd(
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables.")
 @click.option(
+    "--share",
+    "share",
+    is_flag=True,
+    help="After a successful tune, emit a community-registry submission "
+    "(JSON file + PR link). Opt-in; nothing is uploaded automatically.",
+)
+@click.option(
     "--status",
     "status_only",
     is_flag=True,
@@ -1478,6 +1486,7 @@ def tune_cmd(
     gen_tokens: int,
     apply_: bool,
     as_json: bool,
+    share: bool,
     status_only: bool,
 ) -> None:
     """Find the fastest recipe for MODEL by measuring, then persist it.
@@ -1600,11 +1609,171 @@ def tune_cmd(
             except OSError as e:
                 console.print(f"[yellow]Warning: failed to save tune state: {e}[/yellow]")
 
+    if share and apply_ and not report.error and not report.aborted:
+        _emit_recipe_submission(ctx, cfg, report)
+
     if as_json:
         click.echo(json.dumps(asdict(report), indent=2, default=str))
     else:
         print_report(report)
     sys.exit(1 if report.error else 0)
+
+
+def _emit_recipe_submission(ctx: click.Context, cfg: Any, report: Any) -> None:
+    """Write a community-registry submission file and print the PR link.
+
+    Explicit opt-in (tune --share). Produces a JSON document the registry
+    repo's CI can validate and a pre-filled GitHub PR URL — no token, no
+    network call from here.
+    """
+    from arc_llama import workload as workload_mod
+    from arc_llama.recipe_share import (
+        build_pr_body,
+        share_fingerprint,
+        submission_document,
+        validate_submission,
+    )
+
+    m = cfg.find_model(report.model)
+    if m is None:
+        return
+    gpu = cfg.find_gpu(m.gpu_pci_slot)
+    model_class = getattr(m, "kv_class", "default") or "default"
+    fp = share_fingerprint(
+        gpu_arch=(gpu.arch if gpu else "unknown"),
+        backend=(gpu.backend if gpu else "sycl"),
+        model_class=model_class,
+        workload_key=workload_mod.fingerprint_key(cfg.workload),
+        tune_schema_version=3,
+        vram_mb=(gpu.vram_mb or 0),
+    )
+    best = report.best
+    doc = submission_document(
+        fingerprint=fp,
+        recipe=report.best_edits,
+        prompt_eval_tok_s=(getattr(best, "prompt_eval_tok_s", None) if best else None),
+        generation_tok_s=(getattr(best, "generation_tok_s", None) if best else None),
+        gpu_name=(gpu.name if gpu else ""),
+        arc_llama_version=__version__,
+    )
+    problems = validate_submission(doc)
+    if problems:
+        console.print("[red]Submission failed validation (not shared):[/red]")
+        for p in problems:
+            console.print(f"  - {p}")
+        return
+
+    out_dir = Path(ctx.obj["config_path"]).parent / "shared-recipes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{fp[:16]}.json"
+    out_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+
+    title = f"Recipe: {(gpu.arch if gpu else '?')}/{model_class} ({fp[:12]})"
+    from urllib.parse import quote
+
+    pr_url = (
+        "https://github.com/offbyonebit/arc-llama-recipes/compare/new-recipe..."
+        f"submit-{fp[:12]}?expand=1&title={quote(title)}&body={quote(build_pr_body(doc))}"
+    )
+    console.print("[bold green]Recipe ready to share[/bold green]")
+    console.print(f"  submission file: {out_path}")
+    console.print(f"  open this URL to submit it:\n  {pr_url}")
+    console.print(
+        "[dim]Submission is manual and opt-in. The file stays on disk until you do.[/dim]"
+    )
+
+
+# ===========================================================================
+# recipes (community registry)
+# ===========================================================================
+
+
+@cli.group("recipes")
+def recipes_group() -> None:
+    """Community tune-recipe registry (lookup, update, validate)."""
+
+
+@recipes_group.command("lookup")
+@click.argument("model")
+@click.pass_context
+def recipes_lookup(ctx: click.Context, model: str) -> None:
+    """Show the community recipe registered for MODEL's fingerprint, if any."""
+    from arc_llama import workload as workload_mod
+    from arc_llama.recipe_share import RecipeRegistry, share_fingerprint
+
+    cfg = load_config(ctx.obj["config_path"])
+    m = cfg.find_model(model)
+    if m is None:
+        console.print(f"[red]Model '{model}' is not registered.[/red]")
+        sys.exit(1)
+    gpu = cfg.find_gpu(m.gpu_pci_slot)
+    fp = share_fingerprint(
+        gpu_arch=(gpu.arch if gpu else "unknown"),
+        backend=(gpu.backend if gpu else "sycl"),
+        model_class=(m.kv_class or "default"),
+        workload_key=workload_mod.fingerprint_key(cfg.workload),
+        tune_schema_version=3,
+        vram_mb=(gpu.vram_mb or 0),
+    )
+    entry = RecipeRegistry().lookup(fp)
+    if entry is None:
+        console.print(f"[yellow]No community recipe for {fp[:16]}… — run `arc-llama tune` to measure one.[/yellow]")
+        sys.exit(1)
+    console.print(f"[bold]{entry.submits} measurement(s)[/bold] for {fp[:16]}…")
+    if entry.gpu_name:
+        console.print(f"  gpu: {entry.gpu_name}")
+    if entry.prompt_eval_tok_s or entry.generation_tok_s:
+        console.print(
+            f"  measured: {entry.prompt_eval_tok_s or '?'} pp tok/s · "
+            f"{entry.generation_tok_s or '?'} gen tok/s"
+        )
+    console.print(f"  recipe: [dim]{json.dumps(entry.edits, sort_keys=True)}[/dim]")
+
+
+@recipes_group.command("update")
+@click.option(
+    "--url",
+    default=None,
+    help="Fetch the registry from this URL instead of the default release asset.",
+)
+@click.pass_context
+def recipes_update(ctx: click.Context, url: str | None) -> None:
+    """Refresh the local registry from the community release asset."""
+    import httpx as _httpx
+
+    from arc_llama.recipe_share import DEFAULT_REGISTRY_URL, _user_override_path
+
+    src = url or DEFAULT_REGISTRY_URL
+    dest = _user_override_path()
+    console.print(f"Fetching {src} …")
+    try:
+        resp = _httpx.get(src, follow_redirects=True, timeout=30)
+        resp.raise_for_status()
+        doc = resp.json()
+    except Exception as e:
+        console.print(f"[red]Download failed: {e}[/red]")
+        sys.exit(1)
+    if not isinstance(doc, dict) or not isinstance(doc.get("recipes"), dict):
+        console.print("[red]Downloaded file is not a valid registry.[/red]")
+        sys.exit(1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    n = len(doc["recipes"])
+    console.print(f"[green]Saved {n} recipe(s) to {dest}[/green]")
+
+
+@recipes_group.command("validate")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+def recipes_validate(path: Path) -> None:
+    """Validate a submission JSON file (same checks registry CI runs)."""
+    from arc_llama.recipe_share import validate_submission
+
+    problems = validate_submission(json.loads(path.read_text()))
+    if problems:
+        for p in problems:
+            console.print(f"[red]- {p}[/red]")
+        sys.exit(1)
+    console.print("[green]OK[/green]")
 
 
 # ===========================================================================
