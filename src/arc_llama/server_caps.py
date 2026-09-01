@@ -39,6 +39,19 @@ class ServerCaps:
     supports_ngram: bool = False
 
 
+def format_speculation_capability(caps: ServerCaps) -> str:
+    """Format the actionable speculative-decoding capability result."""
+    if not caps.probed:
+        return "unknown (could not run llama-server --help)"
+    if not caps.supports_speculative:
+        return "unavailable (missing --spec-type)"
+    return (
+        "available "
+        f"(draft-model: {'yes' if caps.supports_draft_model else 'no'}, "
+        f"n-gram: {'yes' if caps.supports_ngram else 'no'})"
+    )
+
+
 #: Assumed when the probe can't run (missing binary, timeout). Modern syntax
 #: is the safe guess: `-fa auto` is also that style's default, so worst case
 #: on an unprobeable old binary we only emit flags the user explicitly set.

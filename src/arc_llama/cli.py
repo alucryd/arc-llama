@@ -1921,7 +1921,7 @@ def speculative_cmd(
     it deliberately does not claim a speedup. Run ``benchmark`` after the
     model is loaded before relying on the result.
     """
-    from arc_llama.server_caps import probe_server_caps
+    from arc_llama.server_caps import format_speculation_capability, probe_server_caps
     from arc_llama.speculation import discover_drafts
 
     cfg_path: Path = ctx.obj["config_path"]
@@ -1935,8 +1935,9 @@ def speculative_cmd(
 
     if show_status or dry_run or not any((turn_off, auto_select, draft_name, use_ngram)):
         console.print(f"[bold]{target.name}[/bold]")
+        console.print(f"  llama-server: {cfg.paths.llama_server}")
         console.print(
-            f"  llama-server speculation: {'available' if caps.supports_speculative else 'unavailable'} "
+            f"  llama-server speculation: {format_speculation_capability(caps)} "
             f"(probed={'yes' if caps.probed else 'no'})"
         )
         console.print(f"  configured: {recipe.get('spec_type', 'off')}")
