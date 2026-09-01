@@ -6,7 +6,6 @@ Full docker compose + Open WebUI UI is manual (see PR test plan).
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,7 +14,8 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from arc_llama.cli import cli, serve as serve_cmd
+from arc_llama.cli import cli
+from arc_llama.cli import serve as serve_cmd
 from arc_llama.config import Config, GPUConfig, ModelConfig, ServerConfig, UpstreamConfig
 from arc_llama.server import create_app
 
