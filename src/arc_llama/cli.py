@@ -1959,7 +1959,7 @@ def speculative_cmd(
     elif use_ngram:
         if not caps.supports_ngram:
             raise click.ClickException("installed llama-server does not advertise n-gram speculation")
-        recipe.update({"spec_type": "ngram", "spec_draft_n_max": draft_tokens})
+        recipe.update({"spec_type": "ngram-simple", "spec_draft_n_max": draft_tokens})
         recipe.pop("spec_draft_name", None)
         recipe.pop("spec_draft_model", None)
         recipe["speculation_result"] = "n-gram selected; benchmark before relying on it"
@@ -1973,7 +1973,7 @@ def speculative_cmd(
             raise click.ClickException("draft must be another registered model")
         if not caps.supports_draft_model:
             raise click.ClickException("installed llama-server does not advertise --spec-draft-model")
-        recipe.update({"spec_type": "draft", "spec_draft_name": chosen.name, "spec_draft_n_max": draft_tokens})
+        recipe.update({"spec_type": "draft-simple", "spec_draft_name": chosen.name, "spec_draft_n_max": draft_tokens})
         recipe.pop("spec_draft_model", None)
         recipe["speculation_result"] = f"draft {chosen.name} selected; benchmark before relying on it"
     _save_or_die(cfg, cfg_path)
