@@ -1645,7 +1645,7 @@ def _emit_recipe_submission(ctx: click.Context, cfg: Any, report: Any) -> None:
         model_class=model_class,
         workload_key=workload_mod.fingerprint_key(cfg.workload),
         tune_schema_version=3,
-        vram_mb=(gpu.vram_mb or 0),
+        vram_mb=(gpu.vram_mb if gpu is not None and gpu.vram_mb is not None else 0),
     )
     best = report.best
     doc = submission_document(
@@ -1713,7 +1713,7 @@ def recipes_lookup(ctx: click.Context, model: str) -> None:
         model_class=(m.kv_class or "default"),
         workload_key=workload_mod.fingerprint_key(cfg.workload),
         tune_schema_version=3,
-        vram_mb=(gpu.vram_mb or 0),
+        vram_mb=(gpu.vram_mb if gpu is not None and gpu.vram_mb is not None else 0),
     )
     entry = RecipeRegistry().lookup(fp)
     if entry is None:
@@ -1887,6 +1887,97 @@ def install_runtime_cmd(ctx, backend, runtime_version, dest, set_default, force)
             "(source setvars.sh). Use --backend vulkan if you don't have oneAPI.[/yellow]"
         )
     console.print("\nNext: [bold]arc-llama serve[/bold]")
+
+
+# ===========================================================================
+# speculative
+# ===========================================================================
+
+
+@cli.command("speculative")
+@click.argument("model")
+@click.option("--status", "show_status", is_flag=True, help="Show support and saved recipe.")
+@click.option("--dry-run", is_flag=True, help="Show safe candidates without changing config.")
+@click.option("--off", "turn_off", is_flag=True, help="Disable speculative decoding.")
+@click.option("--auto", "auto_select", is_flag=True, help="Choose the safest registered draft candidate.")
+@click.option("--draft", "draft_name", default=None, help="Registered model name to use as draft.")
+@click.option("--ngram", "use_ngram", is_flag=True, help="Use llama.cpp n-gram speculation when supported.")
+@click.option("--draft-tokens", default=4, show_default=True, type=click.IntRange(1, 16))
+@click.pass_context
+def speculative_cmd(
+    ctx: click.Context,
+    model: str,
+    show_status: bool,
+    dry_run: bool,
+    turn_off: bool,
+    auto_select: bool,
+    draft_name: str | None,
+    use_ngram: bool,
+    draft_tokens: int,
+) -> None:
+    """Configure safe native llama.cpp speculation for a registered MODEL.
+
+    ``--auto`` only chooses a conservative, compatible-looking local draft;
+    it deliberately does not claim a speedup. Run ``benchmark`` after the
+    model is loaded before relying on the result.
+    """
+    from arc_llama.server_caps import probe_server_caps
+    from arc_llama.speculation import discover_drafts
+
+    cfg_path: Path = ctx.obj["config_path"]
+    cfg = load_config(cfg_path)
+    target = cfg.find_model(model)
+    if target is None:
+        raise click.ClickException(f"unknown model {model!r}")
+    caps = probe_server_caps(cfg.paths.llama_server)
+    candidates = discover_drafts(cfg, target)
+    recipe = target.recipe
+
+    if show_status or dry_run or not any((turn_off, auto_select, draft_name, use_ngram)):
+        console.print(f"[bold]{target.name}[/bold]")
+        console.print(
+            f"  llama-server speculation: {'available' if caps.supports_speculative else 'unavailable'} "
+            f"(probed={'yes' if caps.probed else 'no'})"
+        )
+        console.print(f"  configured: {recipe.get('spec_type', 'off')}")
+        if recipe.get("spec_draft_name"):
+            console.print(f"  draft: {recipe['spec_draft_name']}")
+        if candidates:
+            console.print("  draft candidates:")
+            for c in candidates:
+                marker = "fit" if c.fits else "does not fit"
+                console.print(f"    {c.name}: ~{c.estimated_mb} MiB ({marker}; {c.reason})")
+        else:
+            console.print("  draft candidates: none (only smaller same-family registered models qualify)")
+        if dry_run or show_status or not any((turn_off, auto_select, draft_name, use_ngram)):
+            return
+
+    if turn_off:
+        for key in ("spec_type", "spec_draft_name", "spec_draft_model", "spec_draft_ngl", "spec_draft_n_max"):
+            recipe.pop(key, None)
+        recipe["speculation_result"] = "disabled by user"
+    elif use_ngram:
+        if not caps.supports_ngram:
+            raise click.ClickException("installed llama-server does not advertise n-gram speculation")
+        recipe.update({"spec_type": "ngram", "spec_draft_n_max": draft_tokens})
+        recipe.pop("spec_draft_name", None)
+        recipe.pop("spec_draft_model", None)
+        recipe["speculation_result"] = "n-gram selected; benchmark before relying on it"
+    else:
+        chosen = cfg.find_model(draft_name) if draft_name else next((c for c in candidates if c.fits), None)
+        if chosen is None:
+            raise click.ClickException("no fitting registered draft candidate; add a smaller same-family model or use --ngram")
+        if not isinstance(chosen, type(target)):
+            chosen = cfg.find_model(chosen.name)
+        if chosen is None or chosen.name == target.name:
+            raise click.ClickException("draft must be another registered model")
+        if not caps.supports_draft_model:
+            raise click.ClickException("installed llama-server does not advertise --spec-draft-model")
+        recipe.update({"spec_type": "draft", "spec_draft_name": chosen.name, "spec_draft_n_max": draft_tokens})
+        recipe.pop("spec_draft_model", None)
+        recipe["speculation_result"] = f"draft {chosen.name} selected; benchmark before relying on it"
+    _save_or_die(cfg, cfg_path)
+    console.print(f"[green]Saved speculation recipe for {target.name}.[/green]")
 
 
 # ===========================================================================
