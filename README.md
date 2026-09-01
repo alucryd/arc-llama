@@ -204,7 +204,8 @@ arc-llama speculative qwen3-30b --ngram
 ```
 
 Drafts are stored by registered model name and resolved only when the target
-starts. Arc Llama checks the llama.cpp help surface and falls back to normal
+starts. They must use a tokenizer compatible with the target; using a smaller
+model from the same family is a candidate, not proof. Arc Llama checks the llama.cpp help surface and falls back to normal
 target-only inference if the requested flags are unavailable. Same-GPU drafts
 can be slower or consume too much VRAM, so `--auto` selects a plausible local
 candidate but does not claim a speedup: benchmark it on your own hardware
