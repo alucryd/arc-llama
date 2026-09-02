@@ -102,6 +102,13 @@ class TestProbe:
         assert not caps.probed
 
     @_skip_on_windows
+    def test_failed_help_gives_optimistic_defaults(self, tmp_path):
+        script = tmp_path / "llama-server"
+        script.write_text("#!/bin/sh\necho partial help >&2\nexit 1\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        assert probe_server_caps(str(script)) == DEFAULT_CAPS
+
+    @_skip_on_windows
     def test_cache_invalidated_on_mtime_change(self, tmp_path):
         path = self._fake_server(tmp_path, OLD_STYLE_HELP)
         assert not probe_server_caps(path).flash_attn_takes_value

@@ -110,6 +110,8 @@ def probe_server_caps(llama_server: str) -> ServerCaps:
             text=True,
             timeout=_HELP_TIMEOUT_S,
         )
+        if proc.returncode:
+            raise OSError(f"--help exited with status {proc.returncode}")
         caps = _parse_help(proc.stdout + proc.stderr)
     except (OSError, subprocess.TimeoutExpired) as e:
         log.warning("could not probe %s (%s); assuming modern flag syntax", llama_server, e)
