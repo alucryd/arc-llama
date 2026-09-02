@@ -7,7 +7,13 @@ import sys
 
 import pytest
 
-from arc_llama.server_caps import DEFAULT_CAPS, _parse_help, probe_server_caps
+from arc_llama.server_caps import (
+    DEFAULT_CAPS,
+    ServerCaps,
+    _parse_help,
+    format_speculation_capability,
+    probe_server_caps,
+)
 
 _skip_on_windows = pytest.mark.skipif(
     sys.platform == "win32",
@@ -49,6 +55,27 @@ class TestParseHelp:
         assert not caps.supports_flash_attn
 
 
+class TestFormatSpeculationCapability:
+    def test_supported_lists_modes(self):
+        caps = ServerCaps(probed=True, supports_speculative=True,
+                          supports_draft_model=True, supports_ngram=False)
+        assert format_speculation_capability(caps) == (
+            "available (draft-model: yes, n-gram: no)"
+        )
+
+    def test_unsupported_explains_required_flag(self):
+        caps = ServerCaps(probed=True)
+        assert format_speculation_capability(caps) == "unavailable (missing --spec-type)"
+
+    def test_unprobed_is_unknown(self):
+        assert format_speculation_capability(DEFAULT_CAPS) == (
+            "unknown (could not run llama-server --help)"
+        )
+        assert format_speculation_capability(ServerCaps()) == (
+            "unknown (could not run llama-server --help)"
+        )
+
+
 class TestProbe:
     def _fake_server(self, tmp_path, help_text: str) -> str:
         script = tmp_path / "llama-server"
@@ -73,6 +100,13 @@ class TestProbe:
         caps = probe_server_caps(str(tmp_path / "nope"))
         assert caps == DEFAULT_CAPS
         assert not caps.probed
+
+    @_skip_on_windows
+    def test_failed_help_gives_optimistic_defaults(self, tmp_path):
+        script = tmp_path / "llama-server"
+        script.write_text("#!/bin/sh\necho partial help >&2\nexit 1\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        assert probe_server_caps(str(script)) == DEFAULT_CAPS
 
     @_skip_on_windows
     def test_cache_invalidated_on_mtime_change(self, tmp_path):

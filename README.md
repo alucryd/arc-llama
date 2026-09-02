@@ -189,6 +189,29 @@ pre-b6300 ones), so hand-built and prebuilt binaries both work.
 
 ## Multi-GPU
 
+## Speculative decoding
+
+Arc Llama supports llama.cpp's native speculative-decoding modes when the
+installed `llama-server` advertises them. Existing MTP GGUFs continue to be
+auto-configured. For ordinary models, register a smaller model from the same
+family and let Arc Llama choose it conservatively:
+
+```bash
+arc-llama speculative qwen3-30b --dry-run
+arc-llama speculative qwen3-30b --auto
+# or: arc-llama speculative qwen3-30b --draft qwen3-4b
+arc-llama speculative qwen3-30b --ngram
+```
+
+Drafts are stored by registered model name and resolved only when the target
+starts. They must use a tokenizer compatible with the target; using a smaller
+model from the same family is a candidate, not proof. Arc Llama checks the llama.cpp help surface and falls back to normal
+target-only inference if the requested flags are unavailable. Same-GPU drafts
+can be slower or consume too much VRAM, so `--auto` selects a plausible local
+candidate but does not claim a speedup: benchmark it on your own hardware
+before relying on it. Cross-vendor or cross-GPU draft/target pipelines are not
+implemented; verification remains inside one llama-server process.
+
 `arc-llama init` registers every Intel GPU it finds. Each model in the config
 is bound to a specific PCI slot, and the SYCL device selector
 (`ONEAPI_DEVICE_SELECTOR=level_zero:N`) is set per-model. Add your second card,
@@ -384,6 +407,48 @@ docker run ... \
   -v $PWD/config.toml:/root/.config/arc-llama/config.toml:ro \
   arc-llama:latest
 ```
+
+## Open WebUI
+
+[Open WebUI](https://github.com/open-webui/open-webui) is a self-hosted ChatGPT-style interface. arc-llama speaks the OpenAI API, so they wire together directly.
+
+### One command with docker compose
+
+```bash
+# GGUF models from $HOME/models; Open WebUI at http://localhost:3000
+docker compose up
+
+# Or point at a different model directory
+MODELS_DIR=/mnt/data/models docker compose up
+```
+
+The first time you open `http://localhost:3000` you'll create a local admin account. arc-llama's models appear automatically in the model picker.
+
+### Manual (bare-metal `arc-llama serve`)
+
+1. Run `arc-llama serve` (listening on `127.0.0.1:11437` by default)
+2. In Open WebUI → **Settings → Admin Panel → Connections**, add an OpenAI connection:
+   - **Base URL:** `http://127.0.0.1:11437/v1`
+   - **API Key:** any non-empty string (arc-llama does not validate keys)
+3. Models appear immediately in the chat model picker.
+
+If Open WebUI and arc-llama are on different machines, replace `127.0.0.1` with the host IP and run `arc-llama serve --host 0.0.0.0` (or set `ARC_LLAMA_HOST=0.0.0.0`).
+
+## LMStudio
+
+LMStudio's local server (port 1234 by default) exposes an OpenAI-compatible API. Add it as an arc-llama upstream and its models appear alongside your local Arc models in a single endpoint — useful for running a second model on a CPU or a different GPU while your Arc card handles local GGUF inference.
+
+```bash
+# LMStudio running on the same machine
+arc-llama upstream add lmstudio http://127.0.0.1:1234
+
+# LMStudio on the host from inside a Docker container
+docker compose exec arc-llama arc-llama upstream add lmstudio http://host.docker.internal:1234
+```
+
+LMStudio models appear in `/v1/models` with `owned_by: "upstream:lmstudio"` and requests are proxied transparently — no local llama-server is started for them.
+
+To point Open WebUI (or any other client) at arc-llama only, and let it discover both local Arc models and LMStudio models through the same `/v1` endpoint, no extra configuration is needed — the model list is already merged.
 
 ## Roadmap
 
