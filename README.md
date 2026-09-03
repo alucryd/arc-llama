@@ -330,8 +330,22 @@ pip install "arc-llama[tts]" \
 > a local version tag (`2.11.0+xpu`) and by which index serves them, never by
 > package name — so a plain `pip install torch` on an Arc box pulls the CUDA
 > build: several GB of NVIDIA runtime that can never touch your GPU. Working
-> in this repo instead? `uv sync --extra tts` already routes torch, torchao
-> and Triton to Intel's index via `tool.uv.sources`.
+> in this repo instead? `uv sync --extra tts` already routes torch, torchao,
+> torchaudio and Triton to Intel's index via `tool.uv.sources`.
+>
+> `torchaudio` is the one that actually breaks rather than merely wasting
+> space: the PyPI build has `libcudart.so` in its NEEDED list, an XPU torch
+> never installs it, and OmniVoice imports torchaudio at module scope — so the
+> backend dies at startup with a dlopen error naming a CUDA library. If you
+> ever see that, check which torchaudio you got:
+>
+> ```bash
+> ~/venvs/omnivoice/bin/pip show torchaudio | grep -i version   # want +xpu
+> ```
+>
+> `--extra-index-url` merges the two indexes and picks the highest version,
+> which is `+xpu` today. Should a PyPI release ever get ahead of Intel's, pin
+> it explicitly with `--index-url https://download.pytorch.org/whl/xpu`.
 
 Then register the model. The Hugging Face repo id is fine — the engine
 resolves and downloads it itself:
@@ -394,6 +408,64 @@ curl http://127.0.0.1:11437/v1/audio/speech \
 `pcm` are written from the standard library and always work; the compressed
 formats go through libsndfile and fall back to `ffmpeg`, so install ffmpeg if
 you want `mp3` (the OpenAI default) to be available.
+
+#### Latency
+
+OmniVoice is an LLM plus a flow-matching decoder, so it is structurally slower
+than a small single-pass model like Piper — expect to tune it into "faster than
+real time", not into "instant". Every request logs what it actually cost:
+
+```
+speech done: 2.14 s audio in 1.62 s (RTF 0.76x) — generate 1.51 s, encode 0.11 s, num_step=16
+```
+
+**RTF** is generate-time ÷ audio-length. Below 1.0 means synthesis outruns
+playback, which is the line between an assistant that answers and one that
+pauses. Sweep the dominant knob on your own card:
+
+```bash
+arc-llama audio bench glados-tts --text "Turn off the kitchen lights."
+```
+
+That loads the model exactly as `serve` does — same device, dtype, quantized
+weights, voices — and prints an RTF per `num_step`. Quality falls off a cliff
+rather than degrading smoothly, so listen to the results; then pin the winner:
+
+```bash
+arc-llama audio add ... --option num_step=16
+```
+
+Things worth knowing before you reach for anything else:
+
+- **`num_step` is the dominant cost** and it is linear: halving the steps
+  roughly halves generation time. It is the first and usually the last knob
+  you need.
+- **int8 without `compile=true` is the slowest combination available.**
+  torchao's weight-only quantization swaps Linear weights for tensor
+  subclasses that dequantize at matmul time, and those kernels are written to
+  be fused by Inductor. Uncompiled, you pay the dequantization and get none of
+  the fusion — quite possibly slower than just running `bfloat16`. Benchmark
+  the quantized directory against the base repo before assuming int8 is a win.
+- **`compile=true` compiles `llm` and `audio_heads`, not the whole model.**
+  `torch.compile(model)` would be a no-op here: it compiles `forward`, and
+  synthesis goes through `generate()`, which runs on the original uncompiled
+  module. Override with `--option compile_targets=llm,audio_heads,...` if your
+  fine-tune's hot path lives elsewhere.
+- **A wall of `Constructing input/output tensor meta failed for Extern Choice`**
+  means shapes are symbolic. Inductor cannot turn a symbolic size into the
+  concrete one it needs to benchmark a library (oneDNN/ATen) kernel, so it
+  warns per op and continues with empty metadata. The default
+  `--option compile_dynamic=auto` avoids it by specialising on the first shape
+  and only re-tracing as dynamic once a second appears; set it to `true` if
+  your utterance lengths vary enough that recompiles cost more than
+  specialisation wins, or `false` to forbid dynamic shapes entirely. The
+  warnings are not fatal either way.
+- **The backend warms itself up** before reporting healthy, so the first
+  utterance after a restart is not also the one that pays for lazy kernel
+  init. Disable with `--option warmup=false` if you would rather have the
+  startup time back.
+- **`response_format=wav` skips an encoder.** `mp3` is OpenAI's default and may
+  shell out to ffmpeg per request; on a LAN the bytes are free.
 
 #### Quantized models
 

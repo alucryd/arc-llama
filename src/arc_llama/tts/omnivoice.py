@@ -199,6 +199,18 @@ class OmniVoiceEngine(TTSEngine):
             argv.append("--normalize-text")
         if options.get("compile"):
             argv.append("--compile")
+            if options.get("compile_targets"):
+                argv += ["--compile-targets", str(options["compile_targets"])]
+            if options.get("compile_dynamic"):
+                argv += ["--compile-dynamic", str(options["compile_dynamic"])]
+        # Warmup is on by default in the sidecar: the first synthesis after a
+        # load is far slower than the rest, and on a voice assistant that cost
+        # lands on whoever speaks first. Opt out for a machine where the extra
+        # startup time matters more than the first request's latency.
+        if options.get("warmup") is False:
+            argv.append("--no-warmup")
+        if options.get("warmup_text"):
+            argv += ["--warmup-text", str(options["warmup_text"])]
 
         state_path = quantized_state_path(model.path)
         if state_path is not None:

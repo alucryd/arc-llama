@@ -7,6 +7,7 @@ TTS engine layer, plus the OmniVoice sidecar's own request handling.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -1829,3 +1830,234 @@ class TestSidecarRequestValidation:
         assert captured["language"] == "English"
         assert captured["speed"] == 1.2
         assert captured["num_step"] == 32
+
+
+# ---------------------------------------------------------------------------
+# Sidecar startup: warmup and compile
+# ---------------------------------------------------------------------------
+
+
+def _fake_torch(compiled: list[str] | None = None):
+    """A stand-in for torch, enough to run the sidecar's load path.
+
+    The real thing is not installed here by design — arc-llama does not depend
+    on it — but the ordering and the compile target selection are exactly the
+    parts worth pinning down, and both are pure control flow.
+    """
+    import types
+
+    torch = types.ModuleType("torch")
+
+    class _Dtype:
+        def __init__(self, name):
+            self.name = name
+
+        def __repr__(self):
+            return f"torch.{self.name}"
+
+    torch.dtype = _Dtype
+    torch.float16 = _Dtype("float16")
+    torch.bfloat16 = _Dtype("bfloat16")
+
+    class _Module:
+        pass
+
+    torch.nn = types.SimpleNamespace(Module=_Module)
+    torch.inference_mode = contextlib.nullcontext
+
+    def _compile(target, **kwargs):
+        if compiled is not None:
+            compiled.append(type(target).__name__)
+        return target
+
+    torch.compile = _compile
+    torch.xpu = types.SimpleNamespace(synchronize=lambda: None)
+    return torch
+
+
+class _StubOmniVoice:
+    """A model whose submodules are the ones the sidecar compiles."""
+
+    sampling_rate = 24000
+
+    def __init__(self, torch_mod):
+        class _LLM(torch_mod.nn.Module):
+            pass
+
+        class _Heads(torch_mod.nn.Module):
+            pass
+
+        self.llm = _LLM()
+        self.audio_heads = _Heads()
+        self.generated: list[dict] = []
+
+    def generate(self, **kwargs):
+        self.generated.append(kwargs)
+        return [[0.0] * 2400]
+
+
+def _load_engine(monkeypatch, argv_extra=(), model=None, torch_mod=None):
+    """Run Engine.load() against stubbed torch/omnivoice modules."""
+    import types
+
+    torch_mod = torch_mod or _fake_torch()
+    stub = model if model is not None else _StubOmniVoice(torch_mod)
+    omnivoice = types.ModuleType("omnivoice")
+    omnivoice.OmniVoice = types.SimpleNamespace(from_pretrained=lambda *a, **k: stub)
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "omnivoice", omnivoice)
+
+    args = build_parser().parse_args(
+        ["--model", "k2-fsa/OmniVoice", "--port", "18091", *argv_extra]
+    )
+    engine = Engine(args, VoiceBook(None))
+    engine.load()
+    return engine, stub
+
+
+class TestSidecarWarmup:
+    def test_warmup_runs_before_the_model_is_published(self, monkeypatch):
+        """/health must not go green until the first-call cost has been paid.
+
+        `ready` is `self.model is not None`, and the router forwards as soon as
+        health passes — so publishing the model first would put lazy kernel
+        init back inside a real request, which is what the warmup exists to
+        prevent.
+        """
+        seen_ready: list[bool] = []
+        torch_mod = _fake_torch()
+        stub = _StubOmniVoice(torch_mod)
+        engine_box: list = []
+
+        def _record(**kwargs):
+            seen_ready.append(engine_box[0].ready)
+            return [[0.0] * 2400]
+
+        stub.generate = _record
+        engine, _ = _load_engine(monkeypatch, model=stub, torch_mod=torch_mod)
+        engine_box.append(engine)
+
+        # Re-run the load now that the box is populated: the first pass proved
+        # it loads at all, this one observes `ready` from inside generate().
+        engine.model = None
+        engine.load()
+        assert seen_ready and not any(seen_ready), "warmup ran after health went green"
+        assert engine.ready
+
+    def test_warmup_can_be_turned_off(self, monkeypatch):
+        engine, stub = _load_engine(monkeypatch, ["--no-warmup"])
+        assert stub.generated == []
+        assert engine.ready
+
+    def test_a_failing_warmup_still_serves(self, monkeypatch):
+        """A generate() signature we guessed wrong must not cost the backend."""
+        torch_mod = _fake_torch()
+        stub = _StubOmniVoice(torch_mod)
+
+        def _boom(**kwargs):
+            raise TypeError("generate() got an unexpected keyword argument")
+
+        stub.generate = _boom
+        engine, _ = _load_engine(monkeypatch, model=stub, torch_mod=torch_mod)
+        assert engine.ready
+
+
+class TestSidecarCompile:
+    def test_compiles_submodules_not_the_wrapper(self, monkeypatch):
+        """torch.compile(model) is a no-op here: generate() is not forward().
+
+        Compiling the top-level wrapper leaves `self` inside generate() bound
+        to the original module, so nothing in the hot loop is ever traced.
+        """
+        compiled: list[str] = []
+        torch_mod = _fake_torch(compiled)
+        stub = _StubOmniVoice(torch_mod)
+        _load_engine(monkeypatch, ["--compile"], model=stub, torch_mod=torch_mod)
+        assert compiled == ["_LLM", "_Heads"]
+        assert "_StubOmniVoice" not in compiled
+
+    def test_unknown_targets_are_skipped_not_fatal(self, monkeypatch):
+        compiled: list[str] = []
+        torch_mod = _fake_torch(compiled)
+        stub = _StubOmniVoice(torch_mod)
+        engine, _ = _load_engine(
+            monkeypatch,
+            ["--compile", "--compile-targets", "llm,nope"],
+            model=stub, torch_mod=torch_mod,
+        )
+        assert compiled == ["_LLM"]
+        assert engine.ready
+
+    def test_compile_is_off_by_default(self, monkeypatch):
+        compiled: list[str] = []
+        torch_mod = _fake_torch(compiled)
+        _load_engine(monkeypatch, model=_StubOmniVoice(torch_mod), torch_mod=torch_mod)
+        assert compiled == []
+
+    def test_dynamic_defaults_to_torchs_automatic_mode(self, monkeypatch):
+        """Forcing dynamic=True makes Inductor unable to benchmark extern kernels.
+
+        Symbolic sizes cannot be resolved into the concrete ones a library
+        kernel's benchmark request needs, so Inductor logs "Constructing
+        input/output tensor meta failed for Extern Choice" per op and falls
+        back to empty metadata.
+        """
+        seen: list = []
+        torch_mod = _fake_torch()
+        torch_mod.compile = lambda target, **kw: seen.append(kw.get("dynamic")) or target
+        _load_engine(
+            monkeypatch, ["--compile"], model=_StubOmniVoice(torch_mod), torch_mod=torch_mod
+        )
+        assert seen == [None, None]
+
+    def test_dynamic_can_be_forced(self, monkeypatch):
+        seen: list = []
+        torch_mod = _fake_torch()
+        torch_mod.compile = lambda target, **kw: seen.append(kw.get("dynamic")) or target
+        _load_engine(
+            monkeypatch,
+            ["--compile", "--compile-dynamic", "true"],
+            model=_StubOmniVoice(torch_mod), torch_mod=torch_mod,
+        )
+        assert seen == [True, True]
+
+
+class TestSidecarBench:
+    def test_sweep_reports_a_row_per_step(self, capsys, tmp_path):
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "The lights are on.",
+             "--bench-steps", "8,16", "--bench-runs", "1"]
+        )
+        engine = Engine(args, VoiceBook(None))
+        seen: list[int] = []
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                seen.append(kwargs["num_step"])
+                return [[0.0] * 24000]
+
+        engine.model = FakeModel()
+        engine.sampling_rate = 24000
+
+        assert _SIDECAR.run_bench(engine, args) == 0
+        out = capsys.readouterr().out
+        # One discarded warmup plus one timed run, per step.
+        assert seen == [8, 8, 16, 16]
+        assert "num_step" in out and "RTF" in out
+        for step in ("8", "16"):
+            assert any(line.strip().startswith(step) for line in out.splitlines())
+
+    def test_a_failing_step_does_not_abort_the_sweep(self, capsys):
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "hi",
+             "--bench-steps", "8", "--bench-runs", "1"]
+        )
+        engine = Engine(args, VoiceBook(None))
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                raise RuntimeError("out of memory")
+
+        engine.model = FakeModel()
+        assert _SIDECAR.run_bench(engine, args) == 0
+        assert "failed: RuntimeError: out of memory" in capsys.readouterr().out

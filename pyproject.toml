@@ -128,14 +128,15 @@ torch = [
 torchao = [
     { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-# Windows only. Intel ships XPU torchaudio for Windows tracking current torch,
-# but the Linux XPU builds stop at 2.7.0 — routing Linux here would pin torch
-# back to 2.7.x to match it. On Linux the ordinary PyPI torchaudio is correct:
-# it requires an exact `torch==X.Y.Z`, and PEP 440 matches that against the
-# `X.Y.Z+xpu` wheel above, since a specifier without a local segment ignores
-# one on the candidate.
+# Routed for the same reason as torch, and it is the one that bites hardest:
+# the PyPI torchaudio is the CUDA build, and unlike torch it does not merely
+# waste space. Its extension has `libcudart.so`, `libc10_cuda.so` and
+# `libtorch_cuda.so` in NEEDED, none of which an XPU torch installs, so
+# `import torchaudio` fails at dlopen — and since OmniVoice imports it at
+# module scope, the TTS backend dies at startup naming a CUDA library on a
+# machine with no NVIDIA card.
 torchaudio = [
-    { index = "pytorch-xpu", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 # torch's own Triton dependency, published only on the same index and not on
 # PyPI at all. Without this route the resolver looks it up there, finds

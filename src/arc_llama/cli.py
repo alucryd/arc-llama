@@ -29,6 +29,7 @@ import logging
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -2518,6 +2519,72 @@ def audio_rm(ctx: click.Context, name: str) -> None:
         sys.exit(1)
     _save_or_die(cfg, cfg_path)
     console.print(f"[green]Removed[/green] audio model {name}")
+
+
+@audio_group.command("bench")
+@click.argument("name")
+@click.option(
+    "--text",
+    default="Turn off the kitchen lights.",
+    help="Utterance to synthesize. Use something the length of a real reply.",
+)
+@click.option(
+    "--steps",
+    default="8,16,24,32",
+    help="Comma-separated num_step values to sweep.",
+)
+@click.option("--runs", type=int, default=3, help="Timed runs per step.")
+@click.option("--voice", default="", help="Voice to benchmark (default: the model's).")
+@click.pass_context
+def audio_bench(
+    ctx: click.Context, name: str, text: str, steps: str, runs: int, voice: str
+) -> None:
+    """Measure a TTS model's latency across solver-step counts.
+
+    Loads the model exactly as `serve` would — same device, dtype, quantized
+    weights and voices — and reports the real-time factor per `num_step`, so
+    the trade between latency and quality is one you can see on your own card
+    rather than guess at.
+
+    This starts a second copy of the model, so stop the running one first if
+    the card cannot hold both.
+    """
+    cfg_path: Path = ctx.obj["config_path"]
+    cfg = load_config(cfg_path)
+    model = cfg.find_audio_model(name)
+    if model is None or model.task != "tts":
+        console.print(f"[red]Unknown TTS model: {name}[/red]")
+        sys.exit(1)
+    gpu = cfg.find_gpu(model.gpu_pci_slot)
+    if gpu is None:
+        console.print(f"[red]Model {name} is bound to unknown GPU {model.gpu_pci_slot}[/red]")
+        sys.exit(1)
+
+    engine = get_tts_engine(model.engine)
+    if engine is None:
+        console.print(f"[red]Model {name} names unknown engine {model.engine!r}[/red]")
+        sys.exit(1)
+    try:
+        plan = engine.build_plan(cfg, model, gpu)
+    except (RuntimeError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    argv = [
+        *plan.argv,
+        "--bench", text,
+        "--bench-steps", steps,
+        "--bench-runs", str(runs),
+    ]
+    if voice:
+        argv += ["--bench-voice", voice]
+    console.print(f"[dim]{' '.join(argv)}[/dim]\n")
+    try:
+        completed = subprocess.run(argv, env=plan.env)
+    except OSError as e:
+        console.print(f"[red]could not run the backend: {e}[/red]")
+        sys.exit(1)
+    sys.exit(completed.returncode)
 
 
 @audio_group.group("voice")

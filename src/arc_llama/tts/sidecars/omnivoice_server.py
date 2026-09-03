@@ -25,6 +25,7 @@ nothing for an async server to overlap.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import logging
@@ -33,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,6 +55,67 @@ RESPONSE_FORMATS = ("mp3", "opus", "aac", "flac", "wav", "pcm")
 OPENAI_PCM_RATE = 24000
 
 MAX_INPUT_CHARS = 8192
+
+#: Submodules compiled by `--compile`, in the order they are tried.
+#:
+#: Deliberately *not* the top-level model. `torch.compile(model)` returns a
+#: wrapper whose compiled entry point is `forward`, and this server calls
+#: `model.generate(...)` — which `OptimizedModule.__getattr__` forwards to the
+#: original module, so `self` inside `generate` is the uncompiled model and
+#: every op runs eager. Compiling the modules `generate` actually calls is the
+#: only thing that reaches the hot loop. These two are also exactly what the
+#: int8 path quantizes, which matters because torchao's weight-only kernels are
+#: written to be fused by Inductor: quantized *and* uncompiled is the slowest
+#: combination available, paying dequantization without the fusion that repays
+#: it.
+DEFAULT_COMPILE_TARGETS = "llm,audio_heads"
+
+
+def _inference_context() -> Any:
+    """`torch.inference_mode()` when torch is importable, else a no-op.
+
+    Guarded because this module is unit-tested against a stub model in an
+    environment that has no torch, and because a missing torch here should
+    surface as the model failing to load rather than as an import error from
+    the request path.
+    """
+    try:
+        import torch
+    except Exception:
+        return contextlib.nullcontext()
+    return torch.inference_mode()
+
+
+def _device_sync(device: str) -> None:
+    """Wait for queued device work, so a measured span means what it says.
+
+    XPU and CUDA queues are asynchronous: without this, `generate` appears to
+    return in milliseconds and the cost lands in whatever is timed next.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    backend = getattr(torch, (device or "").split(":", 1)[0], None)
+    sync = getattr(backend, "synchronize", None)
+    if not callable(sync):
+        return
+    try:
+        sync()
+    except Exception:
+        log.debug("could not synchronize device %r", device, exc_info=True)
+
+
+def _audio_seconds(samples: Any, rate: int) -> float:
+    """Duration of a sample buffer, for the real-time factor in the log."""
+    if not rate:
+        return 0.0
+    try:
+        count = len(samples)
+    except TypeError:
+        numel = getattr(samples, "numel", None)
+        count = int(numel()) if callable(numel) else 0
+    return count / rate
 
 
 class VoiceBook:
@@ -176,16 +239,23 @@ class Engine:
         if self.args.asr_device:
             kwargs["asr_device"] = self.args.asr_device
         if self.args.quantize:
-            self.model = self._load_quantized(kwargs)
+            model = self._load_quantized(kwargs)
         else:
-            self.model = OmniVoice.from_pretrained(self.args.model, **kwargs)
+            model = OmniVoice.from_pretrained(self.args.model, **kwargs)
         if self.args.compile:
             # Opt-in: the first request pays the compile, and Inductor on XPU is
             # newer than the eager path, so it is not something to impose by
             # default on a backend whose first call is a user waiting for audio.
-            log.info("compiling the model graph (first request will be slower)")
-            self.model = torch.compile(self.model)
-        self.sampling_rate = int(getattr(self.model, "sampling_rate", None) or OPENAI_PCM_RATE)
+            self._compile(model)
+        # Assigned last, because `ready` is "self.model is not None" and that is
+        # what /health reports. Warming up after publishing the model would put
+        # the first-call cost (lazy kernel init, an Inductor compile, the memory
+        # pool growing) back inside a real request — the thing the warmup exists
+        # to prevent.
+        self.sampling_rate = int(getattr(model, "sampling_rate", None) or OPENAI_PCM_RATE)
+        if self.args.warmup:
+            self._warmup(model)
+        self.model = model
         if self.sampling_rate != OPENAI_PCM_RATE:
             log.warning(
                 "model sampling rate is %d Hz, but OpenAI's `pcm` response format "
@@ -194,6 +264,78 @@ class Engine:
                 self.sampling_rate, OPENAI_PCM_RATE,
             )
         log.info("ready: %s at %d Hz", self.args.model, self.sampling_rate)
+
+    def _compile(self, model: Any) -> None:
+        """Compile the submodules `generate` actually calls.
+
+        See ``DEFAULT_COMPILE_TARGETS`` for why the top-level model is the
+        wrong thing to hand to ``torch.compile``. Failures are logged and
+        skipped: an uncompiled backend is slower, a backend that refuses to
+        start is unusable.
+
+        ``--compile-dynamic`` picks how shapes are treated, and the default is
+        torch's own automatic mode rather than forced dynamic. Forcing it makes
+        every size symbolic from the first trace, and Inductor cannot resolve a
+        symbolic size into the concrete one it needs to build a benchmark
+        request for a library (extern) kernel — so it logs
+
+            Constructing input/output tensor meta failed for Extern Choice
+
+        for every such op and carries on with empty metadata. Automatic mode
+        instead specialises on the first shape and only re-traces as dynamic
+        once it has actually seen a second one, which keeps the oneDNN/ATen
+        matmuls in play for the common case. Force it either way if your
+        utterance lengths vary enough that the recompiles cost more than the
+        specialisation wins.
+        """
+        import torch
+
+        dynamic = {"auto": None, "true": True, "false": False}[self.args.compile_dynamic]
+        targets = [t.strip() for t in (self.args.compile_targets or "").split(",") if t.strip()]
+        compiled: list[str] = []
+        for attr in targets:
+            sub = getattr(model, attr, None)
+            if not isinstance(sub, torch.nn.Module):
+                log.warning("--compile: %r is not a module on this model; skipping", attr)
+                continue
+            try:
+                setattr(model, attr, torch.compile(sub, dynamic=dynamic))
+                compiled.append(attr)
+            except Exception:
+                log.warning("--compile: could not compile %r", attr, exc_info=True)
+        if compiled:
+            log.info(
+                "compiled %s with dynamic=%s (the first request pays for it)",
+                ", ".join(compiled), self.args.compile_dynamic,
+            )
+        else:
+            log.warning(
+                "--compile was requested but nothing was compiled; generation "
+                "will run eager. Set --compile-targets to this model's hot "
+                "submodules."
+            )
+
+    def _warmup(self, model: Any) -> None:
+        """Run one throwaway synthesis so the first real request is not the first.
+
+        A cold torch backend defers a great deal to the first call: kernel
+        loading and autotuning, the allocator's pool, and any Inductor compile.
+        On a voice assistant that cost lands on whoever speaks first after a
+        restart, and it is the one request most likely to be judged.
+        """
+        text = self.args.warmup_text or "Warming up."
+        started = time.perf_counter()
+        try:
+            with _inference_context():
+                model.generate(text=text, num_step=self.args.num_step)
+            _device_sync(self.args.device)
+        except Exception:
+            # Never fatal: a model whose generate() wants arguments this one
+            # does not pass is still perfectly able to serve real requests,
+            # which carry the voice and language the config supplies.
+            log.warning("warmup synthesis failed; first request will be slower", exc_info=True)
+            return
+        log.info("warmup synthesis took %.2f s", time.perf_counter() - started)
 
     def _load_quantized(self, kwargs: dict[str, Any]) -> Any:
         """Load a torchao-quantized checkpoint.
@@ -323,8 +465,15 @@ class Engine:
         self.voices.store_prompt(name, definition, prompt)
         return prompt
 
-    def synthesize(self, body: dict[str, Any]) -> tuple[bytes, str]:
-        """Turn one OpenAI speech request into encoded audio bytes."""
+    def generate_kwargs(self, body: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+        """Translate one OpenAI speech body into generate() kwargs.
+
+        Split out of ``synthesize`` so `--bench` measures the same call the
+        HTTP path makes — a benchmark that skipped the voice resolution would
+        be measuring a different model than the one serving requests.
+
+        Returns (kwargs, response format, resolved voice name).
+        """
         text = body.get("input")
         if not isinstance(text, str) or not text.strip():
             raise BadRequestError("'input' must be a non-empty string")
@@ -390,15 +539,42 @@ class Engine:
         kwargs.setdefault("num_step", self.args.num_step)
         if self.args.normalize_text:
             kwargs.setdefault("normalize_text", True)
+        return kwargs, fmt, voice_name
+
+    def synthesize(self, body: dict[str, Any]) -> tuple[bytes, str]:
+        """Turn one OpenAI speech request into encoded audio bytes."""
+        kwargs, fmt, voice_name = self.generate_kwargs(body)
+        text = str(kwargs.get("text", ""))
 
         log.info(
             "speech: %d chars, voice=%s, format=%s", len(text), voice_name or "(auto)", fmt
         )
+        started = time.perf_counter()
         with self.gpu_lock:
-            audios = self.model.generate(**kwargs)
+            with _inference_context():
+                audios = self.model.generate(**kwargs)
+            # Inside the lock: the sync has to cover this request's work only,
+            # or a second request's queue time is charged to this one.
+            _device_sync(self.args.device)
+        generated = time.perf_counter()
         if not audios:
             raise RuntimeError("OmniVoice returned no audio")
-        return encode_audio(audios[0], self.sampling_rate, fmt)
+        encoded = encode_audio(audios[0], self.sampling_rate, fmt)
+        finished = time.perf_counter()
+
+        # The line that answers "why does this feel slow?". A real-time factor
+        # above 1 means synthesis is slower than playback, which is the whole
+        # difference between a snappy assistant and one that pauses; and the
+        # split says whether to reach for num_step or for the encoder.
+        audio_s = _audio_seconds(audios[0], self.sampling_rate)
+        gen_s = generated - started
+        log.info(
+            "speech done: %.2f s audio in %.2f s (RTF %.2fx) — generate %.2f s, "
+            "encode %.2f s, num_step=%s",
+            audio_s, finished - started, (gen_s / audio_s) if audio_s else 0.0,
+            gen_s, finished - generated, kwargs.get("num_step"),
+        )
+        return encoded
 
 
 class BadRequestError(Exception):
@@ -606,6 +782,61 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, audio, media_type)
 
 
+def run_bench(engine: Engine, args: argparse.Namespace) -> int:
+    """Sweep `num_step` over one utterance and print a real-time-factor table.
+
+    Exists because the settings that matter here — how many solver steps are
+    enough, whether an int8 checkpoint is actually faster than bf16, whether
+    `--compile` repays its warmup — are all properties of one machine's GPU and
+    driver stack, and cannot be answered by reading the code. Run it on the
+    box that serves, against the voice that serves.
+    """
+    steps = [int(s) for s in str(args.bench_steps).split(",") if s.strip()]
+    body: dict[str, Any] = {"input": args.bench, "voice": args.bench_voice}
+    base_kwargs, _fmt, voice_name = engine.generate_kwargs(body)
+
+    print(f"model      : {args.model}")
+    print(f"device     : {args.device}  dtype={args.dtype}  quantize={args.quantize or 'none'}")
+    print(f"compile    : {args.compile_targets if args.compile else 'off'}")
+    print(f"voice      : {voice_name or '(auto)'}")
+    print(f"text       : {args.bench!r}")
+    print(f"runs       : {args.bench_runs} timed (plus one discarded warmup)\n")
+    print(f"{'num_step':>9}  {'audio s':>8}  {'best s':>8}  {'mean s':>8}  {'RTF':>6}")
+
+    for step in steps:
+        kwargs = dict(base_kwargs, num_step=step)
+        times: list[float] = []
+        audio_s = 0.0
+        # The first run of each configuration is discarded: it carries the
+        # shape-specialised compile and any first-touch allocation, neither of
+        # which a warm server pays per request.
+        for run in range(args.bench_runs + 1):
+            started = time.perf_counter()
+            try:
+                with _inference_context():
+                    audios = engine.model.generate(**kwargs)
+                _device_sync(args.device)
+            except Exception as exc:
+                print(f"{step:>9}  failed: {type(exc).__name__}: {exc}")
+                break
+            elapsed = time.perf_counter() - started
+            if run:
+                times.append(elapsed)
+                audio_s = _audio_seconds(audios[0], engine.sampling_rate)
+        if not times:
+            continue
+        best, mean = min(times), sum(times) / len(times)
+        rtf = (best / audio_s) if audio_s else 0.0
+        print(f"{step:>9}  {audio_s:>8.2f}  {best:>8.2f}  {mean:>8.2f}  {rtf:>6.2f}")
+
+    print(
+        "\nRTF is generate-time / audio-length: below 1.0 is faster than real time.\n"
+        "Pick the lowest num_step that still sounds right — quality falls off a\n"
+        "cliff rather than degrading smoothly, so listen, don't just read."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", required=True, help="HF repo id or local model directory.")
@@ -642,8 +873,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--compile", action="store_true",
-        help="torch.compile the model after loading.",
+        help="torch.compile the hot submodules after loading. Needed to get "
+        "torchao's int8 kernels fused; without it a quantized model pays "
+        "dequantization for nothing.",
     )
+    p.add_argument(
+        "--compile-dynamic", default="auto", choices=("auto", "true", "false"),
+        help="How compiled shapes are treated. `auto` (torch's default) "
+        "specialises on the first shape and re-traces as dynamic once a second "
+        "appears; `true` forces symbolic shapes from the start, which makes "
+        "Inductor log 'Constructing input/output tensor meta failed for Extern "
+        "Choice' because a symbolic size cannot be turned into the concrete one "
+        "a library-kernel benchmark needs.",
+    )
+    p.add_argument(
+        "--compile-targets", default=DEFAULT_COMPILE_TARGETS,
+        help="Comma-separated submodules to compile. The top-level model is "
+        "deliberately not one of them: generate() is not forward(), so "
+        "compiling the wrapper has no effect.",
+    )
+    p.add_argument(
+        "--warmup", action=argparse.BooleanOptionalAction, default=True,
+        help="Run one throwaway synthesis before reporting healthy, so the "
+        "first real request does not pay for lazy kernel init.",
+    )
+    p.add_argument(
+        "--warmup-text", default="Warming up.",
+        help="Text used for the warmup synthesis.",
+    )
+    p.add_argument(
+        "--bench", default="",
+        help="Benchmark this text instead of serving, then exit.",
+    )
+    p.add_argument(
+        "--bench-steps", default="8,16,24,32",
+        help="Comma-separated num_step values to sweep in --bench.",
+    )
+    p.add_argument("--bench-runs", type=int, default=3, help="Timed runs per --bench step.")
+    p.add_argument("--bench-voice", default="", help="Voice to use for --bench.")
     return p
 
 
@@ -655,6 +922,12 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
     )
     engine = Engine(args, VoiceBook(args.voices or None))
+
+    if args.bench:
+        # Load in the foreground: there is no health endpoint to answer and
+        # nothing to measure until the weights are resident.
+        engine.load()
+        return run_bench(engine, args)
 
     class BoundHandler(Handler):
         pass

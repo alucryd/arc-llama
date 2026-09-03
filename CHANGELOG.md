@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`arc-llama audio bench`** — sweeps a TTS model's `num_step` and reports the
+  real-time factor per step, loading the model exactly as `serve` would (same
+  device, dtype, quantized weights and voices) so the latency/quality trade is
+  measured on the card that serves rather than guessed at.
+- Every speech request now logs its cost: audio produced, wall time, RTF, and
+  the generate/encode split, so "why does this feel slow" is answerable from
+  the log rather than by bisecting settings.
+- The OmniVoice sidecar warms itself up before reporting healthy, so the first
+  utterance after a restart no longer pays for lazy kernel init, allocator
+  growth and any Inductor compile. `--option warmup=false` opts out.
+
+### Fixed
+- **`compile=true` did nothing.** `torch.compile(model)` compiles `forward`,
+  but synthesis goes through `generate()`, which `OptimizedModule.__getattr__`
+  forwards to the *original* module — so the hot loop always ran eager. It now
+  compiles `llm` and `audio_heads` (the same submodules the int8 path
+  quantizes, and the ones torchao's kernels need fused to pay off), with
+  `dynamic=True` so a new utterance length does not trigger a recompile.
+  Configurable via `--option compile_targets=...`.
+- Compiled shapes now follow torch's automatic mode instead of being forced
+  dynamic. Forcing it made every size symbolic from the first trace, and
+  Inductor cannot resolve a symbolic size into the concrete one a library
+  kernel's benchmark request needs — so it logged `Constructing input/output
+  tensor meta failed for Extern Choice` for every such op and continued with
+  empty metadata. `--option compile_dynamic=auto|true|false` picks.
+- Speech generation runs under `torch.inference_mode()`.
+- Request timings synchronize the device first, so an asynchronous XPU/CUDA
+  queue cannot report a multi-second synthesis as having taken milliseconds.
 - **Speech-to-text.** `POST /v1/audio/transcriptions` is now served alongside
   your LLMs, so one endpoint covers both chat and STT for clients like Home
   Assistant. Accepts multipart uploads (the OpenAI/Whisper convention) and the
