@@ -2270,7 +2270,10 @@ class TestBenchEncodeReport:
                 _SIDECAR.run_bench(engine, args)
         finally:
             _SIDECAR.encode_audio = original
-        return next(l for l in buf.getvalue().splitlines() if l.startswith("encode"))
+        return next(
+            line for line in buf.getvalue().splitlines()
+            if line.startswith("encode")
+        )
 
     def test_a_fast_mp3_encode_is_reported_without_advice(self):
         """~17 ms of libsndfile mp3 is noise, and mp3 is smaller over wifi."""
