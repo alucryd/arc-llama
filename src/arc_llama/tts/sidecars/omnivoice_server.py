@@ -238,10 +238,13 @@ class Engine:
             kwargs["asr_model_name"] = self.args.asr_model
         if self.args.asr_device:
             kwargs["asr_device"] = self.args.asr_device
+        started = time.perf_counter()
         if self.args.quantize:
             model = self._load_quantized(kwargs)
         else:
             model = OmniVoice.from_pretrained(self.args.model, **kwargs)
+        weights_s = time.perf_counter() - started
+        log.info("weights resident after %.1f s", weights_s)
         if self.args.compile:
             # Opt-in: the first request pays the compile, and Inductor on XPU is
             # newer than the eager path, so it is not something to impose by
@@ -253,8 +256,7 @@ class Engine:
         # pool growing) back inside a real request — the thing the warmup exists
         # to prevent.
         self.sampling_rate = int(getattr(model, "sampling_rate", None) or OPENAI_PCM_RATE)
-        if self.args.warmup:
-            self._warmup(model)
+        warmup_s = self._warmup(model) if self.args.warmup else 0.0
         self.model = model
         if self.sampling_rate != OPENAI_PCM_RATE:
             log.warning(
@@ -263,7 +265,18 @@ class Engine:
                 "this back at the wrong speed; use response_format=wav instead.",
                 self.sampling_rate, OPENAI_PCM_RATE,
             )
-        log.info("ready: %s at %d Hz", self.args.model, self.sampling_rate)
+        # Attribute the startup cost, because "it took ten minutes" is not
+        # actionable and its two halves have completely different remedies.
+        # torch.compile() itself returns immediately — it only installs a
+        # wrapper — so an Inductor compile is paid on the first forward, which
+        # is the warmup. A large warmup number with --compile on is that
+        # compile, and it is a once-per-process cost, not a per-utterance one.
+        log.info(
+            "ready: %s at %d Hz — %.1f s total (weights %.1f s, warmup %.1f s%s)",
+            self.args.model, self.sampling_rate,
+            time.perf_counter() - started, weights_s, warmup_s,
+            ", including the torch.compile" if self.args.compile and warmup_s else "",
+        )
 
     def _compile(self, model: Any) -> None:
         """Compile the submodules `generate` actually calls.
@@ -315,15 +328,21 @@ class Engine:
                 "submodules."
             )
 
-    def _warmup(self, model: Any) -> None:
+    def _warmup(self, model: Any) -> float:
         """Run one throwaway synthesis so the first real request is not the first.
 
         A cold torch backend defers a great deal to the first call: kernel
-        loading and autotuning, the allocator's pool, and any Inductor compile.
-        On a voice assistant that cost lands on whoever speaks first after a
-        restart, and it is the one request most likely to be judged.
+        loading and autotuning, the allocator's pool, and — when `--compile` is
+        on — the entire Inductor compile, since `torch.compile` only installs a
+        wrapper and traces on first use. On a voice assistant that cost lands
+        on whoever speaks first after a restart, and it is the one request most
+        likely to be judged.
+
+        Returns the elapsed seconds, or 0.0 if it did not complete.
         """
         text = self.args.warmup_text or "Warming up."
+        if self.args.compile:
+            log.info("warming up; with --compile this is where the graph is built")
         started = time.perf_counter()
         try:
             with _inference_context():
@@ -334,8 +353,10 @@ class Engine:
             # does not pass is still perfectly able to serve real requests,
             # which carry the voice and language the config supplies.
             log.warning("warmup synthesis failed; first request will be slower", exc_info=True)
-            return
-        log.info("warmup synthesis took %.2f s", time.perf_counter() - started)
+            return 0.0
+        elapsed = time.perf_counter() - started
+        log.info("warmup synthesis took %.2f s", elapsed)
+        return elapsed
 
     def _load_quantized(self, kwargs: dict[str, Any]) -> Any:
         """Load a torchao-quantized checkpoint.
@@ -782,7 +803,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, audio, media_type)
 
 
-def run_bench(engine: Engine, args: argparse.Namespace) -> int:
+def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) -> int:
     """Sweep `num_step` over one utterance and print a real-time-factor table.
 
     Exists because the settings that matter here — how many solver steps are
@@ -834,6 +855,15 @@ def run_bench(engine: Engine, args: argparse.Namespace) -> int:
         "Pick the lowest num_step that still sounds right — quality falls off a\n"
         "cliff rather than degrading smoothly, so listen, don't just read."
     )
+    if startup_s:
+        # Said explicitly because the wall-clock of this command is dominated
+        # by startup, and startup is paid once per server, not per utterance.
+        # Reading the total as "how slow synthesis is" is the wrong conclusion.
+        print(
+            f"\nStartup (loading, and any compile) took {startup_s:.0f} s and is not in\n"
+            "the table above: a served backend pays it once, at launch, not per\n"
+            "request. The table is the steady state Home Assistant would see."
+        )
     return 0
 
 
@@ -927,8 +957,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.bench:
         # Load in the foreground: there is no health endpoint to answer and
         # nothing to measure until the weights are resident.
+        started = time.perf_counter()
         engine.load()
-        return run_bench(engine, args)
+        return run_bench(engine, args, startup_s=time.perf_counter() - started)
 
     class BoundHandler(Handler):
         pass
