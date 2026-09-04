@@ -127,6 +127,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-download looks exactly like a backend that never started.
 
 ### Fixed
+- **The TTS sidecar no longer inherits a system oneAPI runtime**, which made it
+  SIGSEGV inside the SYCL device-code build when started from a systemd
+  service while working perfectly by hand. `build_env` sources setvars.sh when
+  the oneAPI libraries look missing — correct for llama-server, which links
+  against the system SYCL runtime, and wrong for a torch XPU process that
+  ships its own libsycl, Unified Runtime adapters and MKL. A service
+  environment is bare enough for that heuristic to answer yes where an
+  interactive shell's does not, so the child got two Intel runtimes on its
+  library path and died in `urProgramBuildExp`, the core dump showing both
+  libccl versions mapped at once. The sidecar now opts out via
+  `build_env(..., source_oneapi=False)` while keeping the arch profile's
+  device selector and `SYCL_CACHE_PERSISTENT=0`, and warns at load if
+  `LD_LIBRARY_PATH` still points at a oneAPI install.
 - **ASR models no longer allocate a context they never use.** `llama-server`
   defaults to `-c 0` ("the GGUF's trained context") and Qwen3-ASR advertises
   65536, so a 1.7B q8 model was reserving several GB of KV cache — more VRAM

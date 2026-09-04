@@ -213,6 +213,7 @@ def build_env(
     llama_server: str | Path | None = None,
     oneapi_setvars: str | None = None,
     backend_override: Backend | None = None,
+    source_oneapi: bool = True,
 ) -> dict[str, str]:
     """Compose the environment for llama-server based on backend and arch.
 
@@ -220,6 +221,14 @@ def build_env(
     whose backend support differs from llama.cpp's — a torch TTS engine reaches
     an Arc card through Level Zero and so wants the SYCL device selector
     whatever the GPU is configured for.
+
+    ``source_oneapi=False`` keeps the system oneAPI runtime out of the child's
+    library path. Sourcing setvars.sh is right for llama-server, which links
+    against the system SYCL runtime and will not start without it. It is wrong
+    for a torch XPU process, which ships its own matching libsycl, Unified
+    Runtime adapters and MKL: putting a second copy of all that ahead of them
+    on LD_LIBRARY_PATH loads two Intel runtimes into one process, and the
+    result is a SIGSEGV inside the SYCL device-code build.
     """
     backend = backend_override or (Backend(gpu.backend) if gpu.backend else Backend.SYCL)
     env = os.environ.copy()
@@ -251,7 +260,7 @@ def build_env(
     # If the current environment is missing the oneAPI runtime libraries, try to
     # source a setvars.sh automatically. This helps tarball/custom-prefix installs
     # that the system loader doesn't know about.
-    if oneapi_runtime_env_needed():
+    if source_oneapi and oneapi_runtime_env_needed():
         setvars: Path | None = None
         if oneapi_setvars:
             candidate = Path(oneapi_setvars).expanduser()

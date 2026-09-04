@@ -337,6 +337,15 @@ def build_env_for(cfg: Config, gpu: GPUConfig, device: str) -> dict[str, str]:
     sets are inert in a torch process. A non-Intel device gets the ambient
     environment, since neither the SYCL selector nor the Vulkan one means
     anything to it.
+
+    Emphatically *without* sourcing oneAPI's setvars.sh. llama-server needs the
+    system SYCL runtime; a torch XPU build carries its own, and prepending
+    oneAPI's lib directory to LD_LIBRARY_PATH puts a second, differently
+    versioned libsycl and Unified Runtime in front of the ones torch was built
+    against. The process then loads both and dies inside the device-code build
+    — visible in the core dump as two libccl versions mapped at once. It bites
+    under systemd rather than in a shell because the service's environment is
+    bare enough for the "are the oneAPI libs missing?" heuristic to answer yes.
     """
     if not device.startswith("xpu"):
         return os.environ.copy()
@@ -347,6 +356,7 @@ def build_env_for(cfg: Config, gpu: GPUConfig, device: str) -> dict[str, str]:
         llama_server=cfg.paths.llama_server,
         oneapi_setvars=getattr(cfg.paths, "oneapi_setvars", None),
         backend_override=Backend.SYCL,
+        source_oneapi=False,
     )
 
 

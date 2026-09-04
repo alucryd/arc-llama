@@ -270,9 +270,34 @@ class Engine:
     def ready(self) -> bool:
         return self.model is not None
 
+    def warn_on_foreign_sycl_runtime(self) -> None:
+        """Warn when a second Intel runtime is on the library path.
+
+        A torch XPU build ships its own libsycl, Unified Runtime adapters and
+        MKL. Putting a system oneAPI installation ahead of them loads two
+        Intel runtimes into one process, and the failure is a SIGSEGV inside
+        the SYCL device-code build rather than anything that names the cause —
+        so say it here, where the environment is still readable.
+        """
+        entries = [
+            part
+            for part in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+            if part and "oneapi" in part.lower()
+        ]
+        if entries:
+            log.warning(
+                "LD_LIBRARY_PATH points at a system oneAPI install (%s). torch "
+                "carries its own SYCL runtime, and loading both into one "
+                "process crashes in the device-code build. Unset it for this "
+                "service if the backend dies during model load.",
+                ", ".join(entries[:2]),
+            )
+
     def load(self) -> None:
         import torch
         from omnivoice import OmniVoice
+
+        self.warn_on_foreign_sycl_runtime()
 
         dtype = getattr(torch, self.args.dtype, None)
         if not isinstance(dtype, torch.dtype):

@@ -2373,3 +2373,73 @@ class TestDynamoRecompileDiagnostic:
         with _contextlib.redirect_stdout(buf):
             _SIDECAR.run_bench(engine, args)
         assert "dynamo" not in buf.getvalue()
+
+
+class TestSidecarSyclRuntimeIsolation:
+    """The sidecar must not inherit a system oneAPI runtime.
+
+    llama-server links against the system SYCL runtime and cannot start
+    without it, so `build_env` sources setvars.sh when the libraries look
+    missing. A torch XPU build ships its own libsycl, Unified Runtime adapters
+    and MKL — prepending oneAPI's lib directory loads two Intel runtimes into
+    one process, which SIGSEGVs inside the SYCL device-code build. It bites
+    under systemd and not in a shell, because a service environment is bare
+    enough for the "are the oneAPI libs missing?" heuristic to answer yes.
+    """
+
+    def _patched(self, monkeypatch):
+        import pathlib
+
+        import arc_llama.launcher as launcher_mod
+
+        monkeypatch.setattr(launcher_mod, "oneapi_runtime_env_needed", lambda: True)
+        monkeypatch.setattr(
+            launcher_mod, "oneapi_setvars_path",
+            lambda: pathlib.Path("/opt/intel/oneapi/setvars.sh"),
+        )
+        monkeypatch.setattr(
+            launcher_mod, "source_setvars",
+            lambda path: {"LD_LIBRARY_PATH": "/opt/intel/oneapi/lib", "CMPLR_ROOT": "/opt"},
+        )
+        return launcher_mod
+
+    def test_the_tts_sidecar_does_not_get_oneapi_on_its_library_path(
+        self, tmp_path, monkeypatch
+    ):
+        from arc_llama.tts.omnivoice import build_env_for
+
+        self._patched(monkeypatch)
+        cfg = Config(paths=PathsConfig(state_dir=str(tmp_path)), gpus=[_gpu()])
+        env = build_env_for(cfg, cfg.gpus[0], "xpu")
+        assert "oneapi" not in env.get("LD_LIBRARY_PATH", "").lower()
+        assert "CMPLR_ROOT" not in env
+        # The parts that matter to a torch process are still applied.
+        assert env["ONEAPI_DEVICE_SELECTOR"] == "level_zero:0"
+        assert env["SYCL_CACHE_PERSISTENT"] == "0"
+
+    def test_llama_server_still_gets_it(self, monkeypatch):
+        """The sourcing exists for a reason; it must not be lost in general."""
+        from arc_llama.arch import Arch, profile_for
+
+        launcher_mod = self._patched(monkeypatch)
+        env = launcher_mod.build_env(
+            profile_for(Arch.BATTLEMAGE), _gpu(), llama_server="/usr/bin/llama-server"
+        )
+        assert env["LD_LIBRARY_PATH"] == "/opt/intel/oneapi/lib"
+        assert env["CMPLR_ROOT"] == "/opt"
+
+    def test_a_foreign_runtime_on_the_path_is_reported(self, monkeypatch, caplog):
+        args = build_parser().parse_args(["--model", "m", "--port", "1"])
+        engine = Engine(args, VoiceBook(None))
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/intel/oneapi/lib:/usr/lib")
+        with caplog.at_level("WARNING"):
+            engine.warn_on_foreign_sycl_runtime()
+        assert "oneapi" in caplog.text.lower()
+
+    def test_a_clean_path_says_nothing(self, monkeypatch, caplog):
+        args = build_parser().parse_args(["--model", "m", "--port", "1"])
+        engine = Engine(args, VoiceBook(None))
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/lib:/usr/local/lib")
+        with caplog.at_level("WARNING"):
+            engine.warn_on_foreign_sycl_runtime()
+        assert caplog.text == ""
