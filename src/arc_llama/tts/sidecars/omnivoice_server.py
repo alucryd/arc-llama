@@ -128,6 +128,29 @@ def _device_sync(device: str) -> None:
         log.debug("could not synchronize device %r", device, exc_info=True)
 
 
+def dynamo_stats() -> dict[str, int]:
+    """Dynamo's compile counters, or {} when torch is absent or has moved them.
+
+    Read defensively: these live under a private module and their key names
+    are not API. A missing counter should cost a diagnostic line, never a
+    benchmark run.
+    """
+    try:
+        from torch._dynamo.utils import counters
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    try:
+        for group in ("frames", "stats", "graph_break"):
+            entries = counters.get(group) or {}
+            for key, value in entries.items():
+                if isinstance(value, int):
+                    out[f"{group}.{key}"] = value
+    except Exception:
+        log.debug("could not read dynamo counters", exc_info=True)
+    return out
+
+
 def _audio_seconds(samples: Any, rate: int) -> float:
     """Duration of a sample buffer, for the real-time factor in the log."""
     if not rate:
@@ -862,6 +885,7 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
     print(f"{'num_step':>9}  {'audio s':>8}  {'best s':>8}  {'mean s':>8}  {'RTF':>6}")
 
     last_audio: Any = None
+    before = dynamo_stats() if args.compile else {}
     for step in steps:
         kwargs = dict(base_kwargs, num_step=step)
         times: list[float] = []
@@ -888,6 +912,24 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
         best, mean = min(times), sum(times) / len(times)
         rtf = (best / audio_s) if audio_s else 0.0
         print(f"{step:>9}  {audio_s:>8.2f}  {best:>8.2f}  {mean:>8.2f}  {rtf:>6.2f}")
+
+        if args.compile:
+            # A compiled module that is *slower* than eager is nearly always
+            # re-tracing rather than running a bad kernel. The decoder is
+            # called once per solver step, so a value that changes each step —
+            # the flow-matching timestep, as a Python float — makes every call
+            # a fresh graph, and Dynamo's tracing lands in the measurement.
+            # Compiles growing with the step count is that, visibly.
+            after = dynamo_stats()
+            grew = {
+                key: after[key] - before.get(key, 0)
+                for key in after
+                if after[key] - before.get(key, 0) > 0
+            }
+            if grew:
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(grew.items())[:4])
+                print(f"{'':>9}  dynamo during this step: {summary}")
+            before = after
 
     # The rows above time generation only, but a client waits for encoded
     # bytes. mp3 is OpenAI's default and may shell out to ffmpeg per request,
@@ -916,6 +958,14 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
         "Pick the lowest num_step that still sounds right — quality falls off a\n"
         "cliff rather than degrading smoothly, so listen, don't just read."
     )
+    if args.compile:
+        print(
+            "\nCompiled and slower than eager? The decoder runs once per solver\n"
+            "step, so anything the tracer specialises on that changes per step —\n"
+            "the flow-matching timestep as a plain Python float is the usual one —\n"
+            "makes every call a new graph, and the re-tracing lands in the\n"
+            "measurement. `TORCH_LOGS=recompiles` names the guard that failed."
+        )
     if startup_s:
         # Said explicitly because the wall-clock of this command is dominated
         # by startup, and startup is paid once per server, not per utterance.

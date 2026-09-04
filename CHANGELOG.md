@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- With `--compile`, the bench reports Dynamo's compile counts per swept step.
+  A compiled module slower than eager is nearly always re-tracing rather than
+  running a bad kernel, and counts that grow with the step count say so
+  directly instead of leaving it to be inferred from timings.
 - `arc-llama audio bench` times the response encode separately from
   generation, because a client waits for encoded bytes and `mp3` — OpenAI's
   default — may spawn ffmpeg per request, which no amount of `num_step` tuning

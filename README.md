@@ -484,14 +484,17 @@ Things worth knowing before you reach for anything else:
   synthesis goes through `generate()`, which runs on the original uncompiled
   module. Override with `--option compile_targets=llm,audio_heads,...` if your
   fine-tune's hot path lives elsewhere.
-- **`compile=true` is measured at ~9.5 minutes per compile on Battlemage**, and
-  you pay it again on every recompile. `num_step` is an ordinary Python int
-  driving the solver loop, so the tracer specialises on it: changing it
-  invalidates the graph. That makes a `num_step` sweep under `--compile` cost
-  one full compile per value, which is why `arc-llama audio bench` warns and
-  why eager is the baseline to get first. Unless a compiled run is
-  *dramatically* faster in steady state, this is a poor trade for a voice
-  assistant that occasionally restarts.
+- **`compile=true` lost on both counts here — leave it off.** Measured on a
+  B50 Pro: compiling `llm` costs ~9.5 minutes and compiling `audio_heads`
+  made generation **3–4× slower** than eager (0.28 s → 0.93 s at
+  `num_step=8`). The slowdown is per solver step, not per request — about
+  +88 ms on every step — which is the signature of re-tracing rather than a
+  bad kernel: the decoder runs once per step, so anything the tracer
+  specialises on that varies per step turns every call into a fresh graph.
+  `num_step` is one such value, being a plain Python int, which is also why a
+  sweep under `--compile` pays one compile per value. The bench prints
+  Dynamo's compile counts per step so you can see it; `TORCH_LOGS=recompiles`
+  names the guard that failed.
 - **A wall of `Constructing input/output tensor meta failed for Extern Choice`**
   is Inductor failing to resolve a symbolic size into the concrete one a
   library (oneDNN/ATen) kernel benchmark needs. It is noise, not failure — the

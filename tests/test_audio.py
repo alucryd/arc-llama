@@ -2293,3 +2293,83 @@ class TestBenchEncodeReport:
     def test_wav_is_never_told_to_use_wav(self):
         line = self._bench_output("wav", lambda s, r, f: (b"x" * 94208, "audio/wav"))
         assert "response_format=wav" not in line
+
+
+class TestDynamoRecompileDiagnostic:
+    """A compiled module slower than eager is usually re-tracing per call.
+
+    The decoder runs once per solver step, so anything the tracer specialises
+    on that varies per step makes every call a fresh graph. Compile counts
+    that grow with the step count are that, and the bench should show them
+    rather than leave it to be inferred from timings.
+    """
+
+    def _fake_torch_with_counters(self, monkeypatch, counters):
+        import types
+
+        torch = types.ModuleType("torch")
+        torch.inference_mode = contextlib.nullcontext
+        torch.xpu = types.SimpleNamespace(synchronize=lambda: None)
+        dynamo = types.ModuleType("torch._dynamo")
+        utils = types.ModuleType("torch._dynamo.utils")
+        utils.counters = counters
+        monkeypatch.setitem(sys.modules, "torch", torch)
+        monkeypatch.setitem(sys.modules, "torch._dynamo", dynamo)
+        monkeypatch.setitem(sys.modules, "torch._dynamo.utils", utils)
+
+    def test_counters_are_read_defensively(self, monkeypatch):
+        """These live under a private module; a rename must not break a run."""
+        import types
+
+        broken = types.ModuleType("torch._dynamo.utils")  # no `counters` at all
+        monkeypatch.setitem(sys.modules, "torch._dynamo.utils", broken)
+        assert _SIDECAR.dynamo_stats() == {}
+
+    def test_growth_per_step_is_reported(self, monkeypatch):
+        import contextlib as _contextlib
+        import io
+
+        counters = {"frames": {"total": 0}, "stats": {"unique_graphs": 0}}
+        self._fake_torch_with_counters(monkeypatch, counters)
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                # One trace per solver step: the failure mode itself.
+                counters["frames"]["total"] += kwargs["num_step"]
+                return [[0.0] * 48000]
+
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "hi", "--bench-steps", "8",
+             "--bench-runs", "1", "--compile", "--default-response-format", "wav"]
+        )
+        engine = Engine(args, VoiceBook(None))
+        engine.model = FakeModel()
+        engine.sampling_rate = 24000
+        buf = io.StringIO()
+        with _contextlib.redirect_stdout(buf):
+            _SIDECAR.run_bench(engine, args)
+        out = buf.getvalue()
+        assert "dynamo during this step" in out
+        assert "frames.total=16" in out  # 8 steps x (1 discarded + 1 timed)
+        assert "TORCH_LOGS=recompiles" in out
+
+    def test_eager_runs_say_nothing_about_dynamo(self):
+        import contextlib as _contextlib
+        import io
+
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "hi", "--bench-steps", "8",
+             "--bench-runs", "1", "--default-response-format", "wav"]
+        )
+        engine = Engine(args, VoiceBook(None))
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                return [[0.0] * 48000]
+
+        engine.model = FakeModel()
+        engine.sampling_rate = 24000
+        buf = io.StringIO()
+        with _contextlib.redirect_stdout(buf):
+            _SIDECAR.run_bench(engine, args)
+        assert "dynamo" not in buf.getvalue()
