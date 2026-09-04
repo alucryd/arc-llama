@@ -506,10 +506,13 @@ Things worth knowing before you reach for anything else:
   Inductor to fuse its kernels, and eager measured the same as fp16 — while
   costing a base-model rebuild at load. Keep it if you need the card back for
   an LLM; drop it otherwise.
-- **`response_format=wav` skips an encoder.** `mp3` is OpenAI's default and may
-  shell out to ffmpeg per request; on a LAN the bytes are free. The bench
-  reports this separately from generation, since no amount of `num_step`
-  tuning recovers a process spawn.
+- **Check the encode before changing it.** The bench reports it separately
+  from generation. Where libsndfile can write mp3 in-process it measures
+  ~17 ms — nothing beside a 300 ms synthesis, and mp3 is both what OpenAI
+  clients expect and far smaller over the air, which matters if your
+  satellites are ESP32s on wifi. Only the ffmpeg fallback, a process spawn
+  per request, is worth switching to `wav` to avoid, and the bench says so
+  only when it is actually slow.
 
 #### Quantized models
 

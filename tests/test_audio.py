@@ -2241,3 +2241,52 @@ class TestInductorNoise:
             assert logger.isEnabledFor(_logging.ERROR)
         finally:
             logger.setLevel(original)
+
+
+class TestBenchEncodeReport:
+    """Encoding is reported, but only nudged about when it is worth avoiding."""
+
+    def _bench_output(self, fmt, encoder):
+        import contextlib
+        import io
+
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "hi", "--bench-steps", "8",
+             "--bench-runs", "1", "--default-response-format", fmt]
+        )
+        engine = Engine(args, VoiceBook(None))
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                return [[0.0] * 48000]
+
+        engine.model = FakeModel()
+        engine.sampling_rate = 24000
+        original = _SIDECAR.encode_audio
+        _SIDECAR.encode_audio = encoder
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                _SIDECAR.run_bench(engine, args)
+        finally:
+            _SIDECAR.encode_audio = original
+        return next(l for l in buf.getvalue().splitlines() if l.startswith("encode"))
+
+    def test_a_fast_mp3_encode_is_reported_without_advice(self):
+        """~17 ms of libsndfile mp3 is noise, and mp3 is smaller over wifi."""
+        line = self._bench_output("mp3", lambda s, r, f: (b"x" * 14336, "audio/mpeg"))
+        assert "encode to mp3" in line
+        assert "response_format=wav" not in line
+
+    def test_a_slow_encode_suggests_wav(self):
+        import time as _time
+
+        def _slow(samples, rate, fmt):
+            _time.sleep(_SIDECAR._SLOW_ENCODE_S * 1.5)
+            return b"x" * 14336, "audio/mpeg"
+
+        assert "response_format=wav" in self._bench_output("mp3", _slow)
+
+    def test_wav_is_never_told_to_use_wav(self):
+        line = self._bench_output("wav", lambda s, r, f: (b"x" * 94208, "audio/wav"))
+        assert "response_format=wav" not in line

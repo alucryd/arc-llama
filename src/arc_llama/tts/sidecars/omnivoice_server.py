@@ -70,6 +70,14 @@ MAX_INPUT_CHARS = 8192
 #: it.
 DEFAULT_COMPILE_TARGETS = "llm,audio_heads"
 
+#: Encode time above which switching container is worth suggesting.
+#:
+#: A libsndfile mp3 encode of a short utterance measures ~17 ms, which is
+#: nothing next to a 300 ms synthesis — and mp3 is both what OpenAI clients
+#: default to and far smaller over the air, which a wifi speaker cares about.
+#: Only the ffmpeg fallback, a process spawn per request, is worth avoiding.
+_SLOW_ENCODE_S = 0.1
+
 
 def quiet_inductor_noise() -> None:
     """Stop Inductor's extern-choice warning from burying everything else.
@@ -889,11 +897,16 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
         try:
             payload, _media = encode_audio(last_audio, engine.sampling_rate, _fmt)
             encode_s = time.perf_counter() - started
+            # Only nudge toward wav when the encode is actually worth
+            # avoiding. libsndfile encodes mp3 in-process in tens of
+            # milliseconds; it is the ffmpeg fallback that costs a process
+            # spawn. Suggesting wav against a 17 ms encode trades a smaller
+            # payload — which matters to a wifi speaker — for nothing.
+            hint = ""
+            if _fmt not in ("wav", "pcm") and encode_s >= _SLOW_ENCODE_S:
+                hint = "  — slow enough to matter; try response_format=wav"
             print(
-                f"\nencode to {_fmt}: {encode_s:.3f} s for {len(payload) / 1024:.0f} KiB"
-                + ("  (wav/pcm are written in-process and always cost ~0)"
-                   if _fmt in ("wav", "pcm") else
-                   "  — try response_format=wav to skip this")
+                f"\nencode to {_fmt}: {encode_s:.3f} s for {len(payload) / 1024:.0f} KiB{hint}"
             )
         except Exception as exc:
             print(f"\nencode to {_fmt} failed: {type(exc).__name__}: {exc}")
