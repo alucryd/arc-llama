@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Inductor's `Constructing input/output tensor meta failed for Extern Choice`
+  warning is silenced by default. It fires once per op — hundreds of identical
+  lines per compile — and buries the load timings and the benchmark table it
+  is printed among. `ARC_LLAMA_TTS_LOG=DEBUG` restores it.
+- A `num_step` sweep under `--compile` now warns that each value is a separate
+  compile: the tracer specialises on `num_step` because it is a plain Python
+  int, so changing it invalidates the graph. On Battlemage that is ~9.5
+  minutes per value. The bench also warms up at the first swept value rather
+  than the configured default, so the compile it pays for is one the sweep
+  can actually use.
 - `arc-llama audio bench` can override the model's compile settings for one
   run (`--no-compile`, `--compile-targets`, `--compile-dynamic`) and bounds
   itself with `--timeout` (15 min by default), so a compile that pegs the GPU

@@ -71,6 +71,20 @@ MAX_INPUT_CHARS = 8192
 DEFAULT_COMPILE_TARGETS = "llm,audio_heads"
 
 
+def quiet_inductor_noise() -> None:
+    """Stop Inductor's extern-choice warning from burying everything else.
+
+    `select_algorithm` logs "Constructing input/output tensor meta failed for
+    Extern Choice" once per op whenever it cannot resolve a size into a
+    concrete one, which on a transformer means hundreds of identical lines in
+    a couple of seconds. It is not a failure — the compile continues, the
+    choice simply carries empty metadata — but it drowns the load timings and
+    the benchmark table, which are the two things anyone is reading this
+    output for. Set ARC_LLAMA_TTS_LOG=DEBUG to see them again.
+    """
+    logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+
+
 def _inference_context() -> Any:
     """`torch.inference_mode()` when torch is importable, else a no-op.
 
@@ -816,6 +830,21 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
     body: dict[str, Any] = {"input": args.bench, "voice": args.bench_voice}
     base_kwargs, _fmt, voice_name = engine.generate_kwargs(body)
 
+    if args.compile and len(steps) > 1:
+        # Dynamo guards on `num_step` because it is an ordinary Python int
+        # driving the solver loop, so each value in the sweep is a different
+        # graph and pays a full compile. At the ~10 minutes an XPU compile
+        # takes, a four-value sweep is most of an hour before the first row.
+        print(
+            f"WARNING: sweeping {len(steps)} step values with --compile means "
+            f"{len(steps)} separate compiles.\n"
+            "         num_step is a Python int the tracer specialises on, so "
+            "changing it invalidates\n"
+            "         the graph. Measure eager first (--no-compile), or pin one "
+            "value (--bench-steps 32)\n"
+            "         to time the compiled path.\n"
+        )
+
     print(f"model      : {args.model}")
     print(f"device     : {args.device}  dtype={args.dtype}  quantize={args.quantize or 'none'}")
     print(f"compile    : {args.compile_targets if args.compile else 'off'}")
@@ -947,14 +976,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    level = os.environ.get("ARC_LLAMA_TTS_LOG", "INFO").upper()
     logging.basicConfig(
-        level=os.environ.get("ARC_LLAMA_TTS_LOG", "INFO").upper(),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    if level != "DEBUG":
+        quiet_inductor_noise()
     engine = Engine(args, VoiceBook(args.voices or None))
 
     if args.bench:
+        # Warm up at the first value the sweep will use, not the configured
+        # default. The warmup is what pays for the compile, and a compile of
+        # num_step=32 is worth nothing to a sweep that starts at 8 — it just
+        # buys a second full compile on the first measured run.
+        first_step = next(
+            (int(s) for s in str(args.bench_steps).split(",") if s.strip()), args.num_step
+        )
+        args.num_step = first_step
         # Load in the foreground: there is no health endpoint to answer and
         # nothing to measure until the weights are resident.
         started = time.perf_counter()

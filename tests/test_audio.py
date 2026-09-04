@@ -2183,3 +2183,61 @@ class TestAudioBenchOverrides:
         assert result.exit_code == 1
         assert "--no-compile" in result.output
         assert "audio_heads" in result.output
+
+
+class TestSidecarCompileSweepGuards:
+    """A num_step sweep under --compile is a trap, and must say so.
+
+    Dynamo guards on `num_step` because it is an ordinary Python int driving
+    the solver loop, so each swept value is a different graph paying a full
+    compile — measured at ~9.5 minutes each on Battlemage.
+    """
+
+    def _bench(self, extra, steps="8,16"):
+        import contextlib
+        import io
+
+        args = build_parser().parse_args(
+            ["--model", "m", "--port", "1", "--bench", "hi",
+             "--bench-steps", steps, "--bench-runs", "1", *extra]
+        )
+        engine = Engine(args, VoiceBook(None))
+
+        class FakeModel:
+            def generate(self, **kwargs):
+                return [[0.0] * 24000]
+
+        engine.model = FakeModel()
+        engine.sampling_rate = 24000
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _SIDECAR.run_bench(engine, args)
+        return buf.getvalue()
+
+    def test_a_multi_step_compiled_sweep_is_flagged(self):
+        out = self._bench(["--compile"])
+        assert "separate compiles" in out
+        assert "--no-compile" in out
+
+    def test_eager_sweeps_say_nothing(self):
+        assert "separate compiles" not in self._bench([])
+
+    def test_a_single_step_compiled_run_is_fine(self):
+        assert "separate compiles" not in self._bench(["--compile"], steps="32")
+
+
+class TestInductorNoise:
+    def test_the_extern_choice_flood_is_silenced(self):
+        """Hundreds of identical lines per compile bury the numbers."""
+        import logging as _logging
+
+        logger = _logging.getLogger("torch._inductor.select_algorithm")
+        original = logger.level
+        try:
+            logger.setLevel(_logging.NOTSET)
+            _SIDECAR.quiet_inductor_noise()
+            assert not logger.isEnabledFor(_logging.WARNING)
+            # Real failures must still get through.
+            assert logger.isEnabledFor(_logging.ERROR)
+        finally:
+            logger.setLevel(original)

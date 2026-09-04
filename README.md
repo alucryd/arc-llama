@@ -470,15 +470,20 @@ Things worth knowing before you reach for anything else:
   synthesis goes through `generate()`, which runs on the original uncompiled
   module. Override with `--option compile_targets=llm,audio_heads,...` if your
   fine-tune's hot path lives elsewhere.
+- **`compile=true` is measured at ~9.5 minutes per compile on Battlemage**, and
+  you pay it again on every recompile. `num_step` is an ordinary Python int
+  driving the solver loop, so the tracer specialises on it: changing it
+  invalidates the graph. That makes a `num_step` sweep under `--compile` cost
+  one full compile per value, which is why `arc-llama audio bench` warns and
+  why eager is the baseline to get first. Unless a compiled run is
+  *dramatically* faster in steady state, this is a poor trade for a voice
+  assistant that occasionally restarts.
 - **A wall of `Constructing input/output tensor meta failed for Extern Choice`**
-  means shapes are symbolic. Inductor cannot turn a symbolic size into the
-  concrete one it needs to benchmark a library (oneDNN/ATen) kernel, so it
-  warns per op and continues with empty metadata. The default
-  `--option compile_dynamic=auto` avoids it by specialising on the first shape
-  and only re-tracing as dynamic once a second appears; set it to `true` if
-  your utterance lengths vary enough that recompiles cost more than
-  specialisation wins, or `false` to forbid dynamic shapes entirely. The
-  warnings are not fatal either way.
+  is Inductor failing to resolve a symbolic size into the concrete one a
+  library (oneDNN/ATen) kernel benchmark needs. It is noise, not failure — the
+  compile continues with empty metadata — and it is silenced by default
+  because hundreds of identical lines bury the timings and the table. Set
+  `ARC_LLAMA_TTS_LOG=DEBUG` to see them.
 - **The backend warms itself up** before reporting healthy, so the first
   utterance after a restart is not also the one that pays for lazy kernel
   init. Disable with `--option warmup=false` if you would rather have the
