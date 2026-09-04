@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `arc-llama audio bench` can override the model's compile settings for one
+  run (`--no-compile`, `--compile-targets`, `--compile-dynamic`) and bounds
+  itself with `--timeout` (15 min by default), so a compile that pegs the GPU
+  and never returns ends in a diagnosis rather than an indefinite wait.
 - **`arc-llama audio bench`** — sweeps a TTS model's `num_step` and reports the
   real-time factor per step, loading the model exactly as `serve` would (same
   device, dtype, quantized weights and voices) so the latency/quality trade is

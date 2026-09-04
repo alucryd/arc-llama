@@ -2535,9 +2535,46 @@ def audio_rm(ctx: click.Context, name: str) -> None:
 )
 @click.option("--runs", type=int, default=3, help="Timed runs per step.")
 @click.option("--voice", default="", help="Voice to benchmark (default: the model's).")
+@click.option(
+    "--compile/--no-compile",
+    "compile_override",
+    default=None,
+    help="Override the model's compile setting for this run. `--no-compile` is "
+    "the first thing to try when a bench produces no output: an Inductor "
+    "compile can peg the GPU for a very long time, and eager numbers are "
+    "worth having either way.",
+)
+@click.option(
+    "--compile-targets",
+    default="",
+    help="Override which submodules are compiled, e.g. `audio_heads` alone. "
+    "Compiling an autoregressive `llm` re-traces as the sequence grows, which "
+    "is the usual reason a compiled run never finishes.",
+)
+@click.option(
+    "--compile-dynamic",
+    type=click.Choice(["auto", "true", "false"]),
+    default=None,
+    help="Override how compiled shapes are treated.",
+)
+@click.option(
+    "--timeout",
+    type=int,
+    default=900,
+    help="Give up after this many seconds and say so. 0 waits forever.",
+)
 @click.pass_context
 def audio_bench(
-    ctx: click.Context, name: str, text: str, steps: str, runs: int, voice: str
+    ctx: click.Context,
+    name: str,
+    text: str,
+    steps: str,
+    runs: int,
+    voice: str,
+    compile_override: bool | None,
+    compile_targets: str,
+    compile_dynamic: str | None,
+    timeout: int,
 ) -> None:
     """Measure a TTS model's latency across solver-step counts.
 
@@ -2578,9 +2615,31 @@ def audio_bench(
     ]
     if voice:
         argv += ["--bench-voice", voice]
+    # Appended after the plan, so argparse's last-wins settles any conflict
+    # with what the model's own options put there.
+    if compile_override is not None:
+        argv.append("--compile" if compile_override else "--no-compile")
+    if compile_targets:
+        argv += ["--compile-targets", compile_targets]
+    if compile_dynamic:
+        argv += ["--compile-dynamic", compile_dynamic]
+
     console.print(f"[dim]{' '.join(argv)}[/dim]\n")
     try:
-        completed = subprocess.run(argv, env=plan.env)
+        completed = subprocess.run(argv, env=plan.env, timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        console.print(
+            f"\n[red]No result after {timeout}s — gave up.[/red]\n"
+            "A bench that pegs the GPU and never prints a row is usually an "
+            "Inductor compile rather than slow synthesis. Things to try, in "
+            "order:\n"
+            "  1. --no-compile          measure eager first; it may already be fine\n"
+            "  2. --compile-targets audio_heads   skip compiling the autoregressive\n"
+            "     llm, which re-traces as the sequence grows\n"
+            "  3. --compile-dynamic false         forbid symbolic shapes entirely\n"
+            "Raise or remove the bound with --timeout if it was genuinely working."
+        )
+        sys.exit(1)
     except OSError as e:
         console.print(f"[red]could not run the backend: {e}[/red]")
         sys.exit(1)

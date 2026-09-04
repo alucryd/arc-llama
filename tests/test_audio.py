@@ -2061,3 +2061,125 @@ class TestSidecarBench:
         engine.model = FakeModel()
         assert _SIDECAR.run_bench(engine, args) == 0
         assert "failed: RuntimeError: out of memory" in capsys.readouterr().out
+
+
+def _toml_inline(options):
+    """Render a dict as a TOML inline table.
+
+    `json.dumps` is right for the *values* (its `true`/`false` and quoted
+    strings are valid TOML) but wrong for the table: TOML wants `key = value`,
+    not `"key": value`.
+    """
+    import json as _json
+
+    return ", ".join(f"{k} = {_json.dumps(v)}" for k, v in options.items())
+
+
+class TestAudioBenchOverrides:
+    """The bench must be able to contradict the model's own compile settings.
+
+    A compiled run that never finishes is the case this exists for: without an
+    override the only way to measure eager is to edit the config, restart, and
+    remember to put it back.
+    """
+
+    def _config(self, tmp_path, options):
+
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            "version = 1\n\n"
+            "[paths]\n"
+            f'state_dir = "{tmp_path / "state"}"\n'
+            'tts_python = "/usr/bin/python3"\n\n'
+            "[[gpus]]\n"
+            'pci_slot = "0000:03:00.0"\n'
+            "sycl_index = 0\n"
+            'arch = "battlemage"\n'
+            "enabled = true\n"
+            'backend = "sycl"\n\n'
+            "[[audio_models]]\n"
+            'name = "glados"\n'
+            'path = "k2-fsa/OmniVoice"\n'
+            "port = 18091\n"
+            'gpu_pci_slot = "0000:03:00.0"\n'
+            'engine = "omnivoice"\n'
+            'task = "tts"\n\n'
+            "[audio_models.recipe]\n"
+            f"options = {{ {_toml_inline(options)} }}\n",
+            encoding="utf-8",
+        )
+        return cfg
+
+    def _bench_argv(self, tmp_path, monkeypatch, extra, options=None):
+        from click.testing import CliRunner
+
+        import arc_llama.cli as cli_mod
+
+        captured: dict = {}
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        real_run = cli_mod.subprocess.run
+
+        def _fake_run(argv, **kwargs):
+            # Patching the subprocess module hits every caller, and building
+            # the plan shells out on its own (device probes, setvars). Only
+            # intercept the bench launch; let the rest run for real.
+            if "--bench" not in list(argv):
+                return real_run(argv, **kwargs)
+            captured["argv"] = list(argv)
+            captured["timeout"] = kwargs.get("timeout")
+            return _Completed()
+
+        monkeypatch.setattr(cli_mod.subprocess, "run", _fake_run)
+        cfg = self._config(tmp_path, options if options is not None else {"compile": True})
+        result = CliRunner().invoke(
+            cli_mod.cli, ["--config", str(cfg), "audio", "bench", "glados", *extra]
+        )
+        assert result.exit_code == 0, result.output
+        return captured
+
+    def test_no_compile_wins_over_the_configured_default(self, tmp_path, monkeypatch):
+        argv = self._bench_argv(tmp_path, monkeypatch, ["--no-compile"])["argv"]
+        # Both appear; argparse takes the last, which is why order matters.
+        assert argv.index("--no-compile") > argv.index("--compile")
+
+    def test_compile_is_inherited_when_not_overridden(self, tmp_path, monkeypatch):
+        argv = self._bench_argv(tmp_path, monkeypatch, [])["argv"]
+        assert "--compile" in argv
+        assert "--no-compile" not in argv
+
+    def test_targets_and_dynamic_are_appended_last(self, tmp_path, monkeypatch):
+        argv = self._bench_argv(
+            tmp_path, monkeypatch,
+            ["--compile-targets", "audio_heads", "--compile-dynamic", "false"],
+            options={"compile": True, "compile_targets": "llm,audio_heads"},
+        )["argv"]
+        assert argv[argv.index("--compile-targets", argv.index("--bench")) + 1] == "audio_heads"
+        assert argv[-1] == "false"
+
+    def test_a_hang_is_bounded_by_default(self, tmp_path, monkeypatch):
+        assert self._bench_argv(tmp_path, monkeypatch, [])["timeout"] == 900
+
+    def test_timeout_zero_waits_forever(self, tmp_path, monkeypatch):
+        assert self._bench_argv(tmp_path, monkeypatch, ["--timeout", "0"])["timeout"] is None
+
+    def test_timing_out_explains_what_to_try(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+
+        import arc_llama.cli as cli_mod
+
+        def _boom(argv, **kwargs):
+            raise cli_mod.subprocess.TimeoutExpired(argv, kwargs.get("timeout") or 0)
+
+        monkeypatch.setattr(cli_mod.subprocess, "run", _boom)
+        cfg = self._config(tmp_path, {"compile": True})
+        result = CliRunner().invoke(
+            cli_mod.cli, ["--config", str(cfg), "audio", "bench", "glados"]
+        )
+        assert result.exit_code == 1
+        assert "--no-compile" in result.output
+        assert "audio_heads" in result.output

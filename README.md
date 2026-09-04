@@ -428,8 +428,27 @@ arc-llama audio bench glados-tts --text "Turn off the kitchen lights."
 ```
 
 That loads the model exactly as `serve` does — same device, dtype, quantized
-weights, voices — and prints an RTF per `num_step`. Quality falls off a cliff
-rather than degrading smoothly, so listen to the results; then pin the winner:
+weights, voices — and prints an RTF per `num_step`.
+
+> [!TIP]
+> **If the bench prints nothing and pegs the GPU, it is compiling, not
+> synthesizing.** An Inductor compile on XPU can run far longer than the
+> synthesis it is meant to speed up, and compiling an autoregressive `llm`
+> re-traces as the sequence grows. The bench can contradict the model's
+> configured settings so you can find out without editing config:
+>
+> ```bash
+> arc-llama audio bench glados-tts --no-compile                     # eager first
+> arc-llama audio bench glados-tts --compile-targets audio_heads    # skip the llm
+> arc-llama audio bench glados-tts --compile-dynamic false          # no symbolic shapes
+> ```
+>
+> It gives up after 15 minutes by default and tells you what to try;
+> `--timeout 0` waits forever. Get eager numbers first — they are the baseline
+> that says whether compiling is worth any of this.
+
+Quality falls off a cliff rather than degrading smoothly, so listen to the
+results; then pin the winner:
 
 ```bash
 arc-llama audio add ... --option num_step=16

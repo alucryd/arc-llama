@@ -872,10 +872,11 @@ def build_parser() -> argparse.ArgumentParser:
         "is rebuilt before the weights are read in.",
     )
     p.add_argument(
-        "--compile", action="store_true",
+        "--compile", action=argparse.BooleanOptionalAction, default=False,
         help="torch.compile the hot submodules after loading. Needed to get "
         "torchao's int8 kernels fused; without it a quantized model pays "
-        "dequantization for nothing.",
+        "dequantization for nothing. `--no-compile` later in the command line "
+        "wins, which is how the bench overrides a model's configured default.",
     )
     p.add_argument(
         "--compile-dynamic", default="auto", choices=("auto", "true", "false"),
