@@ -274,13 +274,41 @@ def oneapi_setvars_path() -> Path | None:
     return None
 
 
-def oneapi_runtime_env_needed() -> bool:
-    """Heuristic: does the current process environment lack oneAPI runtime libs?
+def _any_lib_in(dirs: list[Path], names: tuple[str, ...]) -> bool:
+    """Whether any of *names* sits in one of *dirs*, or one level below.
 
-    Returns True when neither the Level Zero loader nor the SVML/compiler runtime
-    can be found via ldconfig or common oneAPI paths. In that state a SYCL
-    llama-server binary is likely to fail at startup with missing-library errors
-    or "No device of requested type available".
+    The nested pass exists because a oneAPI lib directory often holds the
+    real libraries in an `intel64/` (or equivalent) subdirectory.
+    """
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        for name in names:
+            if (directory / name).exists():
+                return True
+            try:
+                for child in directory.iterdir():
+                    if child.is_dir() and (child / name).exists():
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def oneapi_runtime_env_needed() -> bool:
+    """Can the dynamic loader *not* find the oneAPI runtime libraries?
+
+    True means a SYCL llama-server is likely to fail at startup with a
+    missing-library error or "No device of requested type available", and that
+    sourcing setvars.sh would fix it.
+
+    The question is deliberately about the *loader's* view, not the
+    filesystem's. An installation the loader does not search is exactly the
+    situation setvars.sh exists to repair, so finding libraries under
+    /opt/intel/oneapi is evidence that sourcing is *needed* — not, as this
+    check once concluded, evidence that it is unnecessary. What settles it is
+    the ldconfig cache and LD_LIBRARY_PATH on Linux, and the DLL search path
+    on Windows: the places the loader actually looks.
     """
     if sys.platform == "win32":
         names = (
@@ -288,31 +316,15 @@ def oneapi_runtime_env_needed() -> bool:
             "libze_loader.dll",
             "ze_loader.dll",
         )
-        search_dirs: list[Path] = []
-        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        search_dirs.append(Path(program_files_x86) / "Intel" / "oneAPI")
-        oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
-        if oneapi_root:
-            p = Path(oneapi_root)
-            search_dirs.extend([p, p / "lib", p / "bin"])
-        for entry in os.environ.get("PATH", "").split(os.pathsep):
-            entry = entry.strip()
-            if entry:
-                search_dirs.append(Path(entry))
-
-        for d in search_dirs:
-            if not d.is_dir():
-                continue
-            for name in names:
-                if (d / name).exists():
-                    return False
-                try:
-                    for child in d.iterdir():
-                        if child.is_dir() and (child / name).exists():
-                            return False
-                except OSError:
-                    pass
-        return True
+        # PATH only. A DLL under ONEAPI_ROOT that is not on the search path
+        # cannot be loaded, so its presence says nothing about whether the
+        # environment is usable — which is the whole question here.
+        search_dirs = [
+            Path(entry.strip())
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry.strip()
+        ]
+        return not _any_lib_in(search_dirs, names)
 
     names = (
         "libsvml.so",
@@ -320,20 +332,19 @@ def oneapi_runtime_env_needed() -> bool:
         "libze_loader.so.1",
         "libze_loader.so",
     )
-    search_dirs = [
-        Path("/opt/intel/oneapi/lib"),
-        Path("/opt/intel/oneapi/lib/intel64"),
-        Path("/usr/local/intel/oneapi/lib"),
-        Path("/usr/local/intel/oneapi/lib/intel64"),
-        Path("/mnt/storage/opt/intel/oneapi/lib"),
-        Path("/mnt/storage/opt/intel/oneapi/lib/intel64"),
-    ]
-    oneapi_root = os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT")
-    if oneapi_root:
-        p = Path(oneapi_root)
-        search_dirs.extend([p, p / "lib", p / "lib" / "intel64"])
 
-    # If ldconfig can resolve any of the runtime libs, the env/system is fine.
+    # Already on LD_LIBRARY_PATH: the loader will find them, whoever put them
+    # there. Checked first because it is exact and costs no subprocess.
+    ld_dirs = [
+        Path(entry.strip())
+        for entry in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if entry.strip()
+    ]
+    if _any_lib_in(ld_dirs, names):
+        return False
+
+    # In the ldconfig cache: likewise resolvable, via /etc/ld.so.conf.d or the
+    # default search path. This is how a distro-packaged oneAPI looks.
     ldconfig = shutil.which("ldconfig")
     if ldconfig:
         try:
@@ -346,20 +357,11 @@ def oneapi_runtime_env_needed() -> bool:
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    # Check common oneAPI prefixes directly.
-    for d in search_dirs:
-        if not d.is_dir():
-            continue
-        for name in names:
-            if (d / name).exists():
-                return False
-            try:
-                for child in d.iterdir():
-                    if child.is_dir() and (child / name).exists():
-                        return False
-            except OSError:
-                pass
-
+    # Neither. An installation may well exist under /opt/intel/oneapi, but the
+    # loader cannot see it, so sourcing setvars.sh is precisely what is called
+    # for — this is the tarball/relocated-prefix case the feature exists to
+    # serve. Reporting "fine" here because the files are on disk somewhere is
+    # what made a configured `paths.oneapi_setvars` silently never load.
     return True
 
 

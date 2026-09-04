@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -144,13 +145,67 @@ class TestOneapiRuntimeEnvNeeded:
         monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
         assert oneapi_runtime_env_needed() is True
 
-    def test_finds_lib_in_oneapi_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    def test_installed_but_invisible_to_the_loader_still_needs_sourcing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        """An install the loader cannot see is the case setvars.sh is *for*.
+
+        This once returned False — "found it on disk, nothing to do" — which
+        meant a configured `paths.oneapi_setvars` was silently never sourced
+        on exactly the tarball/relocated-prefix setups the option exists to
+        serve.
+        """
         lib_dir = tmp_path / "lib" / "intel64"
         lib_dir.mkdir(parents=True)
         (lib_dir / _runtime_lib_name()).write_text("")
         monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
         monkeypatch.setenv("CMPLR_ROOT", "")
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "")
         monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
+        assert oneapi_runtime_env_needed() is True
+
+    @_skip_on_windows
+    def test_on_ld_library_path_needs_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        lib_dir = tmp_path / "lib" / "intel64"
+        lib_dir.mkdir(parents=True)
+        (lib_dir / _runtime_lib_name()).write_text("")
+        monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        monkeypatch.setenv("LD_LIBRARY_PATH", str(lib_dir))
+        monkeypatch.setattr("arc_llama.platform_checks.shutil.which", lambda _x: None)
+        assert oneapi_runtime_env_needed() is False
+
+    @_skip_on_windows
+    def test_registered_with_ldconfig_needs_nothing(self, monkeypatch: pytest.MonkeyPatch):
+        """The distro-packaged case: the loader resolves them already."""
+        monkeypatch.setenv("ONEAPI_ROOT", "")
+        monkeypatch.setenv("CMPLR_ROOT", "")
+        monkeypatch.setenv("LD_LIBRARY_PATH", "")
+        monkeypatch.setattr(
+            "arc_llama.platform_checks.shutil.which", lambda _x: "/usr/bin/ldconfig"
+        )
+        monkeypatch.setattr(
+            "arc_llama.platform_checks.subprocess.run",
+            lambda *a, **k: SimpleNamespace(
+                stdout="libsvml.so (libc6,x86-64) => /usr/lib/libsvml.so\n"
+            ),
+        )
+        assert oneapi_runtime_env_needed() is False
+
+    @_skip_on_windows
+    def test_windows_path_only(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        """PATH is the DLL search path; ONEAPI_ROOT alone is not loadable."""
+        lib_dir = tmp_path / "bin"
+        lib_dir.mkdir(parents=True)
+        (lib_dir / "libsvml.dll").write_text("")
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
+        monkeypatch.setenv("PATH", "")
+        assert oneapi_runtime_env_needed() is True
+        monkeypatch.setenv("PATH", str(lib_dir))
         assert oneapi_runtime_env_needed() is False
 
 
