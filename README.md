@@ -454,6 +454,20 @@ results; then pin the winner:
 arc-llama audio add ... --option num_step=16
 ```
 
+Measured on an Arc B50 Pro (Battlemage), OmniVoice fine-tune, ~2 s of audio,
+eager — as a sense of what to expect and what actually moves:
+
+| `num_step` | generate | RTF |
+|---|---|---|
+| 8 | 0.26 s | 0.13 |
+| 16 | 0.49 s | 0.23 |
+| 24 | 0.74 s | 0.36 |
+| 32 (default) | 0.96 s | 0.48 |
+
+Startup on the same box: **6 s** eager, against **575 s** with `compile=true`.
+An int8 checkpoint and an unquantized fp16 one measured the same speed to
+within noise, so int8 is a VRAM decision, not a latency one.
+
 Things worth knowing before you reach for anything else:
 
 - **`num_step` is the dominant cost** and it is linear: halving the steps
@@ -488,8 +502,14 @@ Things worth knowing before you reach for anything else:
   utterance after a restart is not also the one that pays for lazy kernel
   init. Disable with `--option warmup=false` if you would rather have the
   startup time back.
+- **int8 is for VRAM, not speed.** torchao's weight-only quantization wants
+  Inductor to fuse its kernels, and eager measured the same as fp16 — while
+  costing a base-model rebuild at load. Keep it if you need the card back for
+  an LLM; drop it otherwise.
 - **`response_format=wav` skips an encoder.** `mp3` is OpenAI's default and may
-  shell out to ffmpeg per request; on a LAN the bytes are free.
+  shell out to ffmpeg per request; on a LAN the bytes are free. The bench
+  reports this separately from generation, since no amount of `num_step`
+  tuning recovers a process spawn.
 
 #### Quantized models
 

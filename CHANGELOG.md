@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `arc-llama audio bench` times the response encode separately from
+  generation, because a client waits for encoded bytes and `mp3` — OpenAI's
+  default — may spawn ffmpeg per request, which no amount of `num_step` tuning
+  recovers.
 - Inductor's `Constructing input/output tensor meta failed for Extern Choice`
   warning is silenced by default. It fires once per op — hundreds of identical
   lines per compile — and buries the load timings and the benchmark table it

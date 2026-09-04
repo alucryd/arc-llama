@@ -853,6 +853,7 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
     print(f"runs       : {args.bench_runs} timed (plus one discarded warmup)\n")
     print(f"{'num_step':>9}  {'audio s':>8}  {'best s':>8}  {'mean s':>8}  {'RTF':>6}")
 
+    last_audio: Any = None
     for step in steps:
         kwargs = dict(base_kwargs, num_step=step)
         times: list[float] = []
@@ -873,11 +874,29 @@ def run_bench(engine: Engine, args: argparse.Namespace, startup_s: float = 0.0) 
             if run:
                 times.append(elapsed)
                 audio_s = _audio_seconds(audios[0], engine.sampling_rate)
+                last_audio = audios[0]
         if not times:
             continue
         best, mean = min(times), sum(times) / len(times)
         rtf = (best / audio_s) if audio_s else 0.0
         print(f"{step:>9}  {audio_s:>8.2f}  {best:>8.2f}  {mean:>8.2f}  {rtf:>6.2f}")
+
+    # The rows above time generation only, but a client waits for encoded
+    # bytes. mp3 is OpenAI's default and may shell out to ffmpeg per request,
+    # which is a process spawn no amount of num_step tuning will recover.
+    if last_audio is not None:
+        started = time.perf_counter()
+        try:
+            payload, _media = encode_audio(last_audio, engine.sampling_rate, _fmt)
+            encode_s = time.perf_counter() - started
+            print(
+                f"\nencode to {_fmt}: {encode_s:.3f} s for {len(payload) / 1024:.0f} KiB"
+                + ("  (wav/pcm are written in-process and always cost ~0)"
+                   if _fmt in ("wav", "pcm") else
+                   "  — try response_format=wav to skip this")
+            )
+        except Exception as exc:
+            print(f"\nencode to {_fmt} failed: {type(exc).__name__}: {exc}")
 
     print(
         "\nRTF is generate-time / audio-length: below 1.0 is faster than real time.\n"
