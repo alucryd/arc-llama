@@ -66,7 +66,7 @@ DEFAULT_CAPS = ServerCaps(
     supports_ngram=True,
 )
 
-_cache: dict[tuple[str, float], ServerCaps] = {}
+_cache: dict[tuple[str, float, str], ServerCaps] = {}
 
 
 def _parse_help(help_text: str) -> ServerCaps:
@@ -99,15 +99,26 @@ def _parse_help(help_text: str) -> ServerCaps:
     )
 
 
-def probe_server_caps(llama_server: str) -> ServerCaps:
-    """Return the capabilities of the given llama-server binary, cached."""
+def probe_server_caps(
+    llama_server: str, env: dict[str, str] | None = None
+) -> ServerCaps:
+    """Return the capabilities of the given llama-server binary, cached.
+
+    ``env`` should be the environment the binary will actually be launched
+    with. A SYCL build probed under arc-llama's own environment can fail to
+    load its Intel runtime and exit 127, which reads as "unprobeable binary"
+    when it really means "probed with the wrong environment" — and then every
+    flag is chosen from optimistic defaults instead of the real help text.
+    """
     try:
         mtime = Path(llama_server).stat().st_mtime
     except OSError:
         # PATH-relative binary or missing file — probe uncached each call is
         # wasteful, so cache under mtime 0.
         mtime = 0.0
-    key = (llama_server, mtime)
+    # The library path is part of the question: the same binary genuinely has
+    # different answers before and after setvars.sh is sourced.
+    key = (llama_server, mtime, (env or {}).get("LD_LIBRARY_PATH", ""))
     hit = _cache.get(key)
     if hit is not None:
         return hit
@@ -117,6 +128,7 @@ def probe_server_caps(llama_server: str) -> ServerCaps:
             capture_output=True,
             text=True,
             timeout=_HELP_TIMEOUT_S,
+            env=env,
         )
         if proc.returncode:
             raise OSError(f"--help exited with status {proc.returncode}")

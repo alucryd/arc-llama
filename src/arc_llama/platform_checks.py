@@ -274,6 +274,35 @@ def oneapi_setvars_path() -> Path | None:
     return None
 
 
+def binary_runs(binary: str | Path, env: dict[str, str] | None = None) -> bool:
+    """Whether *binary* can actually execute under *env*.
+
+    The authoritative answer to "does this environment have what the binary
+    needs", and the reason it beats inspecting library names: a SYCL
+    llama-server links dozens of Intel libraries (libsycl, libur_loader, the
+    MKL SYCL kernels, libiomp5, TBB), while any name-based heuristic can only
+    check the handful someone thought to list. A host can have `libsvml` and
+    `libze_loader` in its ldconfig cache — so the heuristic says "fine" — and
+    still fail to start llama-server because the oneAPI 2026 stack it was
+    built against is not registered anywhere.
+
+    ``--help`` is used because it touches no GPU and returns immediately. A
+    dynamic-linker failure surfaces as exit 127, which is what makes this a
+    usable signal rather than just a slow way to reach the same guess.
+    """
+    try:
+        proc = subprocess.run(
+            [str(binary), "--help"],
+            capture_output=True,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def _any_lib_in(dirs: list[Path], names: tuple[str, ...]) -> bool:
     """Whether any of *names* sits in one of *dirs*, or one level below.
 

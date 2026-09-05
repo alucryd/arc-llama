@@ -36,6 +36,7 @@ from arc_llama.config import (
 )
 from arc_llama.gguf_meta import has_mtp_heads
 from arc_llama.platform_checks import (
+    binary_runs,
     oneapi_runtime_env_needed,
     oneapi_setvars_path,
     source_setvars,
@@ -257,10 +258,27 @@ def build_env(
     env.update(profile.sycl_env)
     env["ONEAPI_DEVICE_SELECTOR"] = f"level_zero:{gpu.sycl_index}"
 
-    # If the current environment is missing the oneAPI runtime libraries, try to
-    # source a setvars.sh automatically. This helps tarball/custom-prefix installs
-    # that the system loader doesn't know about.
-    if source_oneapi and oneapi_runtime_env_needed():
+    # If the environment is missing what the binary needs, source a setvars.sh
+    # automatically. This helps tarball/custom-prefix installs that the system
+    # loader doesn't know about.
+    #
+    # Ask the binary when there is one to ask. A SYCL llama-server links dozens
+    # of Intel libraries, and checking the four names `oneapi_runtime_env_needed`
+    # knows about answers a different, weaker question: a host can have
+    # libsvml and libze_loader in its ldconfig cache — heuristic satisfied —
+    # while `llama-server --help` still exits 127 because the oneAPI stack it
+    # was built against is registered nowhere. The name check remains the
+    # fallback for when no binary is available to run.
+    if source_oneapi:
+        resolved = shutil.which(str(llama_server)) if llama_server else None
+        if resolved is None and llama_server and Path(llama_server).exists():
+            resolved = str(llama_server)
+        needs_oneapi = (
+            not binary_runs(resolved, env) if resolved else oneapi_runtime_env_needed()
+        )
+    else:
+        needs_oneapi = False
+    if needs_oneapi:
         setvars: Path | None = None
         if oneapi_setvars:
             candidate = Path(oneapi_setvars).expanduser()
@@ -349,7 +367,7 @@ def build_plan(
         model_name=model.name,
     )
 
-    caps = probe_server_caps(cfg.paths.llama_server)
+    caps = probe_server_caps(cfg.paths.llama_server, env)
     if recipe.flash_attn is not None and not caps.supports_flash_attn:
         log.info(
             "[%s] recipe requests flash_attn=%s but %s has no --flash-attn; omitting",
@@ -487,7 +505,7 @@ def build_llamacpp_audio_plan(
         oneapi_setvars=getattr(cfg.paths, "oneapi_setvars", None),
     )
 
-    caps = probe_server_caps(binary)
+    caps = probe_server_caps(binary, env)
     if caps.probed and not caps.supports_mmproj:
         raise RuntimeError(
             f"{binary} has no --mmproj, so it was built without multimodal "

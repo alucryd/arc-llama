@@ -655,7 +655,7 @@ class TestBuildPlanFlashAttn:
     def _plan(self, recipe, caps, monkeypatch):
         from arc_llama.server_caps import ServerCaps
         monkeypatch.setattr(
-            "arc_llama.launcher.probe_server_caps", lambda path: ServerCaps(**caps)
+            "arc_llama.launcher.probe_server_caps", lambda path, env=None: ServerCaps(**caps)
         )
         cfg = Config(paths=type("P", (), {"llama_server": "/bin/llama-server"})())
         model = ModelConfig(
@@ -707,3 +707,72 @@ class TestBuildPlanFlashAttn:
         )
         assert plan.argv[plan.argv.index("-ub") + 1] == "1024"
         assert plan.argv[plan.argv.index("-b") + 1] == "2048"
+
+
+class TestSourcingAsksTheBinary:
+    """Whether setvars is needed is decided by running the binary.
+
+    A name-based check answers a weaker question. A real Battlemage host had
+    libsvml and libze_loader in its ldconfig cache — so every library
+    heuristic said "fine" — while `llama-server --help` exited 127, because
+    the oneAPI 2026 stack it was built against (libsycl.so.9,
+    libmkl_sycl_blas.so.6, libur_loader, libiomp5, TBB) was registered
+    nowhere. Only the binary knows what the binary needs.
+    """
+
+    def _profile(self):
+        from arc_llama.arch import profile_for
+
+        return profile_for(Arch.BATTLEMAGE)
+
+    def test_binary_that_cannot_load_gets_setvars(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        if sys.platform == "win32":
+            pytest.skip("bash setvars sourcing is not exercised on Windows")
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text("export LD_LIBRARY_PATH=/opt/intel/oneapi/lib\n")
+        binary = tmp_path / "llama-server"
+        binary.write_text("#!/bin/sh\nexit 127\n")
+        binary.chmod(0o755)
+        monkeypatch.setattr("arc_llama.launcher.oneapi_setvars_path", lambda: setvars)
+        # The library heuristic would say "nothing to do" — as it did on the
+        # host this reproduces. The binary check must override that.
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_runtime_env_needed", lambda: False
+        )
+        env = build_env(self._profile(), _gpu(), llama_server=str(binary))
+        assert env["LD_LIBRARY_PATH"] == "/opt/intel/oneapi/lib"
+
+    def test_binary_that_runs_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text("export LD_LIBRARY_PATH=/should-not-apply\n")
+        binary = tmp_path / "llama-server"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        monkeypatch.setattr("arc_llama.launcher.oneapi_setvars_path", lambda: setvars)
+        # Even with the heuristic screaming, a binary that runs needs nothing.
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_runtime_env_needed", lambda: True
+        )
+        env = build_env(self._profile(), _gpu(), llama_server=str(binary))
+        assert env.get("LD_LIBRARY_PATH") != "/should-not-apply"
+
+    def test_falls_back_to_the_heuristic_with_no_binary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        if sys.platform == "win32":
+            pytest.skip("bash setvars sourcing is not exercised on Windows")
+        monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin"})
+        setvars = tmp_path / "setvars.sh"
+        setvars.write_text("export LD_LIBRARY_PATH=/fallback\n")
+        monkeypatch.setattr("arc_llama.launcher.oneapi_setvars_path", lambda: setvars)
+        monkeypatch.setattr(
+            "arc_llama.launcher.oneapi_runtime_env_needed", lambda: True
+        )
+        env = build_env(self._profile(), _gpu(), llama_server=None)
+        assert env["LD_LIBRARY_PATH"] == "/fallback"

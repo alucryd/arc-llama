@@ -538,7 +538,7 @@ class TestBuildLlamacppAudioPlan:
     def test_argv_carries_weights_and_projector(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "arc_llama.launcher.probe_server_caps",
-            lambda _p: ServerCaps(supports_mmproj=True, probed=True),
+            lambda _p, _env=None: ServerCaps(supports_mmproj=True, probed=True),
         )
         cfg = self._cfg(tmp_path)
         model = _audio_model(tmp_path, recipe={"ctx": 8192})
@@ -561,7 +561,7 @@ class TestBuildLlamacppAudioPlan:
         """
         monkeypatch.setattr(
             "arc_llama.launcher.probe_server_caps",
-            lambda _p: ServerCaps(supports_mmproj=True, probed=True),
+            lambda _p, _env=None: ServerCaps(supports_mmproj=True, probed=True),
         )
         cfg = self._cfg(tmp_path)
         plan = build_audio_plan(cfg, _audio_model(tmp_path), cfg.gpus[0])
@@ -574,7 +574,7 @@ class TestBuildLlamacppAudioPlan:
         """The reason ASR runs on llama.cpp: it is the only SYCL-capable one."""
         monkeypatch.setattr(
             "arc_llama.launcher.probe_server_caps",
-            lambda _p: ServerCaps(supports_mmproj=True, probed=True),
+            lambda _p, _env=None: ServerCaps(supports_mmproj=True, probed=True),
         )
         cfg = self._cfg(tmp_path)
         plan = build_audio_plan(cfg, _audio_model(tmp_path), cfg.gpus[0])
@@ -595,7 +595,7 @@ class TestBuildLlamacppAudioPlan:
     def test_binary_without_multimodal_support_is_refused(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "arc_llama.launcher.probe_server_caps",
-            lambda _p: ServerCaps(supports_mmproj=False, probed=True),
+            lambda _p, _env=None: ServerCaps(supports_mmproj=False, probed=True),
         )
         cfg = self._cfg(tmp_path)
         with pytest.raises(RuntimeError, match="multimodal"):
@@ -2422,6 +2422,9 @@ class TestSidecarSyclRuntimeIsolation:
         from arc_llama.arch import Arch, profile_for
 
         launcher_mod = self._patched(monkeypatch)
+        # "Needed" is now decided by asking the binary, so say it cannot run:
+        # that is the state a missing Intel runtime actually produces.
+        monkeypatch.setattr(launcher_mod, "binary_runs", lambda _b, _e=None: False)
         env = launcher_mod.build_env(
             profile_for(Arch.BATTLEMAGE), _gpu(), llama_server="/usr/bin/llama-server"
         )

@@ -361,7 +361,7 @@ async def test_tuner_refines_n_cpu_moe_with_override_tensor(tmp_path, monkeypatc
     fake = _MoeMeasurements(cfg, table, perf)
     monkeypatch.setattr("arc_llama.tune._apply_edits", fake.apply)
     monkeypatch.setattr("arc_llama.tune.benchmark_model", fake.bench)
-    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p: _FakeCaps())
+    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p, _env=None: _FakeCaps())
 
     report = await tune_model("http://127.0.0.1", "m", cfg=cfg)
 
@@ -385,7 +385,7 @@ async def test_tuner_keeps_n_cpu_moe_when_ot_does_not_beat(tmp_path, monkeypatch
     fake = _MoeMeasurements(cfg, None, perf)
     monkeypatch.setattr("arc_llama.tune._apply_edits", fake.apply)
     monkeypatch.setattr("arc_llama.tune.benchmark_model", fake.bench)
-    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p: _FakeCaps())
+    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p, _env=None: _FakeCaps())
 
     report = await tune_model("http://127.0.0.1", "m", cfg=cfg)
 
@@ -404,7 +404,7 @@ async def test_override_tensor_skipped_when_no_offload_needed(tmp_path, monkeypa
     fake = _MoeMeasurements(cfg, None, {})
     monkeypatch.setattr("arc_llama.tune._apply_edits", fake.apply)
     monkeypatch.setattr("arc_llama.tune.benchmark_model", fake.bench)
-    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p: _FakeCaps())
+    monkeypatch.setattr(caps_mod, "probe_server_caps", lambda _p, _env=None: _FakeCaps())
 
     report = await tune_model("http://127.0.0.1", "m", cfg=cfg)
 
